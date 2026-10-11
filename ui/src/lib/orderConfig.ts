@@ -9,8 +9,7 @@ export interface OrderConfig {
 	signer: Address
 	store: Address
 	outputToken: Address
-	outputDecimals: number
-	outputVaultId: bigint
+	outputVaultId: Hex
 }
 
 /** The claim order HoloLockVault added, from this build's variables. */
@@ -20,7 +19,6 @@ export const CLAIM_ORDER: OrderConfig = {
 	signer: bridge.claimOrder.signer,
 	store: bridge.claimOrder.store,
 	outputToken: bridge.tokenAddress,
-	outputDecimals: 18,
 	outputVaultId: HOLO_VAULT_ID
 }
 

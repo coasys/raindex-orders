@@ -8,8 +8,8 @@ import {
 	type Hex
 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { asBuild, MAINNET_BUILD, SEPOLIA_BUILD } from '$lib/testing/builds'
-import { SEPOLIA_REDEEMED } from './fixtures'
+import { asBuild, MAINNET_BUILD, BASE_SEPOLIA_BUILD } from '$lib/testing/builds'
+import { TESTNET_COUPONS } from './fixtures'
 import { fakeCache, fakeRpc } from './fakeRpc'
 
 const env = vi.hoisted(() => ({}) as Record<string, string | undefined>)
@@ -30,10 +30,13 @@ type Build = typeof MAINNET_BUILD
 
 let cache: ReturnType<typeof fakeCache>
 
+/** The amount word of one HOT: the wei with exponent -18. */
+const ONE_HOT = ((2n ** 32n - 18n) << 224n) | (10n ** 18n)
+
 function context(build: Build, nonce: bigint): bigint[] {
 	return [
 		0x1111111111111111111111111111111111111111n,
-		10n ** 18n,
+		ONE_HOT,
 		BigInt(NOW + 7 * 24 * 60 * 60),
 		BigInt(build.PUBLIC_CLAIM_ORDER_HASH),
 		BigInt(build.PUBLIC_LOCK_VAULT_ADDRESS),
@@ -151,9 +154,9 @@ describe('a mainnet build', () => {
 		expect(rpc.fetch.mock.calls[0][0]).toBe('https://eth.rpc.test/key')
 	})
 
-	it('refuses the read, and caches nothing, when the RPC answers for Sepolia', async () => {
+	it('refuses the read, and caches nothing, when the RPC answers for Base Sepolia', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
-		chain(MAINNET_BUILD, 11155111n, new Map([[nonceKey(MAINNET_BUILD, 1n), 1n]]))
+		chain(MAINNET_BUILD, 84532n, new Map([[nonceKey(MAINNET_BUILD, 1n), 1n]]))
 
 		const { response } = await post(MAINNET_BUILD, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 1n)])
 
@@ -161,8 +164,8 @@ describe('a mainnet build', () => {
 		expect(cache.store.put).not.toHaveBeenCalled()
 	})
 
-	it('never reads through SEPOLIA_RPC_URL', async () => {
-		env.SEPOLIA_RPC_URL = 'https://sepolia.rpc.test/key'
+	it('never reads through BASE_SEPOLIA_RPC_URL', async () => {
+		env.BASE_SEPOLIA_RPC_URL = 'https://base-sepolia.rpc.test/key'
 		const rpc = chain(MAINNET_BUILD, 1n)
 
 		const { response } = await post(MAINNET_BUILD, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 1n)])
@@ -171,23 +174,23 @@ describe('a mainnet build', () => {
 		expect(rpc.fetch).not.toHaveBeenCalled()
 	})
 
-	it('answers invalid for a Sepolia coupon, with no RPC call', async () => {
+	it('answers invalid for a TestNet coupon, signed by the test signer, with no RPC call', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
 		const rpc = chain(MAINNET_BUILD, 1n)
 
-		const { body } = await post(MAINNET_BUILD, [SEPOLIA_REDEEMED[0].coupon])
+		const { body } = await post(MAINNET_BUILD, [TESTNET_COUPONS[0]])
 
 		expect(statuses(body)).toEqual(['invalid'])
 		expect(rpc.fetch).not.toHaveBeenCalled()
 	})
 })
 
-describe('a sepolia build', () => {
+describe('a base-sepolia build', () => {
 	it('never reads through ETH_RPC_URL', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
-		const rpc = chain(SEPOLIA_BUILD, 11155111n)
+		const rpc = chain(BASE_SEPOLIA_BUILD, 84532n)
 
-		const { response } = await post(SEPOLIA_BUILD, [SEPOLIA_REDEEMED[0].coupon])
+		const { response } = await post(BASE_SEPOLIA_BUILD, [TESTNET_COUPONS[0]])
 
 		expect(response.status).toBe(502)
 		expect(rpc.fetch).not.toHaveBeenCalled()

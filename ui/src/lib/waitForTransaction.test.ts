@@ -11,7 +11,7 @@ const SENT = {
 } as const
 
 /**
- * `waitForTransaction(SENT)` on a Sepolia wallet whose node reports `fate`, with the clock run
+ * `waitForTransaction(SENT)` on a Base Sepolia wallet whose node reports `fate`, with the clock run
  * until it settles. While `away()` the wallet is on a chain 5,000 blocks ahead.
  */
 async function waitFor(fate: Fate, away = () => false) {
@@ -20,12 +20,12 @@ async function waitFor(fate: Fate, away = () => false) {
 	const asked: string[] = []
 	const request = vi.fn(async ({ method, params }: { method: string; params?: unknown[] }) => {
 		asked.push(method)
-		if (method === 'eth_chainId') return away() ? '0x1' : '0xaa36a7'
+		if (method === 'eth_chainId') return away() ? '0x1' : '0x14a34'
 		if (method === 'eth_blockNumber' && away()) return '0x1398'
 		return answer(method, params)
 	})
 	vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
-	const { waitForTransaction } = await asBuild(BUILDS.sepolia, () => import('./ethereum'))
+	const { waitForTransaction } = await asBuild(BUILDS['base-sepolia'], () => import('./ethereum'))
 	const waiting = waitForTransaction(SENT.hash)
 	await settled(
 		waiting.then(

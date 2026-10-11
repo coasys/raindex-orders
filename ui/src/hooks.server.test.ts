@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Handle } from '@sveltejs/kit'
-import { asBuild, BUILDS, MAINNET_BUILD, SEPOLIA_BUILD } from '$lib/testing/builds'
+import { asBuild, BUILDS, MAINNET_BUILD, BASE_SEPOLIA_BUILD } from '$lib/testing/builds'
 import { NOT_PAUSED } from '$lib/testing/pause'
 
 type Route = [string, string | null]
@@ -62,8 +62,8 @@ describe('handle', () => {
 		}
 	)
 
-	it.each(FAUCET_ROUTES)('resolves %s on sepolia', async (path, route) => {
-		expect((await request(SEPOLIA_BUILD, [path, route])).resolved).toBe(true)
+	it.each(FAUCET_ROUTES)('resolves %s on base-sepolia', async (path, route) => {
+		expect((await request(BASE_SEPOLIA_BUILD, [path, route])).resolved).toBe(true)
 	})
 
 	it.each(ROUTES)('resolves %s on mainnet', async (path, route) => {
@@ -72,7 +72,7 @@ describe('handle', () => {
 })
 
 describe.each([
-	['sepolia', [...LOCK_PAGE, ...FAUCET_PAGE]],
+	['base-sepolia', [...LOCK_PAGE, ...FAUCET_PAGE]],
 	['mainnet', LOCK_PAGE]
 ] as const)('while paused, a %s build', (network, stopped) => {
 	const build = BUILDS[network]
@@ -97,9 +97,9 @@ describe.each([
 
 describe('while paused', () => {
 	it.each(FAUCET_API)(
-		'answers %s on sepolia with the stop text as JSON, without resolving it',
+		'answers %s on base-sepolia with the stop text as JSON, without resolving it',
 		async (path, route) => {
-			const { response, resolved } = await paused(SEPOLIA_BUILD, [path, route])
+			const { response, resolved } = await paused(BASE_SEPOLIA_BUILD, [path, route])
 
 			expect(response.status).toBe(503)
 			expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*')
@@ -117,8 +117,8 @@ describe('while paused', () => {
 })
 
 describe.each(NOT_PAUSED)('with %o', env => {
-	it.each([...ROUTES, ...FAUCET_ROUTES])('resolves %s on sepolia', async (path, route) => {
-		expect((await request(SEPOLIA_BUILD, [path, route], env)).resolved).toBe(true)
+	it.each([...ROUTES, ...FAUCET_ROUTES])('resolves %s on base-sepolia', async (path, route) => {
+		expect((await request(BASE_SEPOLIA_BUILD, [path, route], env)).resolved).toBe(true)
 	})
 
 	it.each(ROUTES)('resolves %s on mainnet', async (path, route) => {

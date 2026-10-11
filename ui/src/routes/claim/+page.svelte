@@ -7,7 +7,12 @@
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
-	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
+	import {
+		deserializeSignedContext,
+		floatToWei,
+		parseCoupon,
+		type SignedContextV1Struct
+	} from '$lib/coupon'
 	import { getOrderConfig, type OrderConfig } from '$lib/orderConfig'
 	import { claimCoupon } from '$lib/claim'
 	import { ethereumStore, onWrongNetwork, connectWallet, readContract } from '$lib/ethereum'
@@ -86,13 +91,14 @@
 		if (!orderConfig) return
 
 		try {
+			// Raindex V6 answers a decimal float: the vault's HOT, read back as wei.
 			const balance = await readContract({
 				address: bridge.orderbookAddress,
 				abi: orderbookAbi,
-				functionName: 'vaultBalance',
+				functionName: 'vaultBalance2',
 				args: [orderConfig.owner, orderConfig.outputToken, orderConfig.outputVaultId]
 			})
-			vaultBalance = balance as bigint
+			vaultBalance = floatToWei(BigInt(balance as Hex))
 		} catch (e) {
 			console.error('Failed to get vault balance:', e)
 			vaultBalance = undefined
@@ -150,7 +156,7 @@
 			{#if coupon && orderConfig}
 				<span class="text-gray-600">Amount:</span>
 				<span class="font-semibold">
-					{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+					{formatUnits(coupon.withdrawAmount, 18)}
 					{bridge.tokenName}
 				</span>
 
@@ -219,7 +225,7 @@
 
 							<span class="text-gray-600">Amount:</span>
 							<span class="font-semibold">
-								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+								{formatUnits(coupon.withdrawAmount, 18)}
 								{bridge.tokenName}
 							</span>
 
@@ -234,7 +240,7 @@
 
 					{#if vaultBalance !== undefined}
 						<div class="text-sm text-gray-600">
-							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)}
+							Vault Balance: {formatUnits(vaultBalance, 18)}
 							{bridge.tokenName}
 						</div>
 					{/if}

@@ -16,10 +16,10 @@ afterEach(() => {
 type Rendered = { render: (props?: Record<string, unknown>) => { html: string } }
 
 const NAMES = {
-	sepolia: {
-		network: 'Sepolia Testnet',
+	'base-sepolia': {
+		network: 'Base Sepolia',
 		token: 'mock HOT',
-		explorer: 'https://sepolia.etherscan.io'
+		explorer: 'https://sepolia.basescan.org'
 	},
 	mainnet: { network: 'Ethereum', token: 'HOT', explorer: 'https://etherscan.io' }
 }
@@ -48,7 +48,7 @@ async function render(
 
 const text = (html: string) => html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ')
 
-describe.each(['sepolia', 'mainnet'] as const)('a %s build', network => {
+describe.each(['base-sepolia', 'mainnet'] as const)('a %s build', network => {
 	const names = NAMES[network]
 
 	it.each(['home', 'lock', 'claim'] as const)(
@@ -101,18 +101,18 @@ describe('a mainnet build', () => {
 	it.each(['home', 'lock', 'claim'] as const)('%s names nothing of TestNet', async page => {
 		const html = text(await render('mainnet', page, CHAIN.mainnet)).toLowerCase()
 
-		for (const testnet of ['sepolia', 'mock', 'faucet', 'testnet']) {
+		for (const testnet of ['base-sepolia', 'mock', 'faucet', 'testnet']) {
 			expect(html).not.toContain(testnet)
 		}
 	})
 })
 
 describe('the quick links', () => {
-	it('link both faucets on sepolia', async () => {
-		const html = await render('sepolia', 'footer')
+	it('link both faucets on base-sepolia', async () => {
+		const html = await render('base-sepolia', 'footer')
 
 		expect(html).toContain('href="/faucet"')
-		expect(html).toContain('https://cloud.google.com/application/web3/faucet/ethereum/sepolia')
+		expect(html).toContain('https://docs.base.org/base-chain/tools/network-faucets')
 	})
 
 	it('link no faucet on mainnet', async () => {

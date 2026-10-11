@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 #
 # Workers Builds "Deploy command" (`npm run cf:deploy`) for hot-bridge-ui, built with
-# PUBLIC_NETWORK=sepolia, and hot-bridge-ui-mainnet, built with PUBLIC_NETWORK=mainnet
+# PUBLIC_NETWORK=base-sepolia, and hot-bridge-ui-mainnet, built with PUBLIC_NETWORK=mainnet
 # as the wrangler env `mainnet`. Runs from ui/, after `npm run build`.
 #
 # The server routes read their secrets at runtime, and `wrangler deploy` drops bindings
 # set by hand, so the secrets are kept as build variables and set again on each deploy.
 set -euo pipefail
 
-case "${PUBLIC_NETWORK:-sepolia}" in
-sepolia)
+case "${PUBLIC_NETWORK:-base-sepolia}" in
+base-sepolia)
 	wrangler_env=()
-	secrets=(SEPOLIA_RPC_URL FAUCET_PRIVATE_KEY)
+	secrets=(BASE_SEPOLIA_RPC_URL FAUCET_PRIVATE_KEY)
 	;;
 mainnet)
 	wrangler_env=(--env mainnet)
 	secrets=(ETH_RPC_URL)
 	;;
 *)
-	echo "PUBLIC_NETWORK must be sepolia or mainnet, as a Workers Builds build variable" >&2
+	echo "PUBLIC_NETWORK must be base-sepolia or mainnet, as a Workers Builds build variable" >&2
 	exit 1
 	;;
 esac

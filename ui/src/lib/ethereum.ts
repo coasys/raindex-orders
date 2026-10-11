@@ -161,7 +161,7 @@ export async function connectWallet(): Promise<string | null> {
 	}
 }
 
-/** Asks the wallet to switch to this build's network, adding Sepolia if it lacks it. */
+/** Asks the wallet to switch to this build's network, adding Base Sepolia if it lacks it. */
 export async function switchNetwork(): Promise<boolean> {
 	const eth = getEthereum()
 	if (!eth) return false
