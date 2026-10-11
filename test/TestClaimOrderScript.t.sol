@@ -16,6 +16,10 @@ contract AdminHarness is ClaimOrderScript {
     function sendAsAdmin(HoloLockVault vault, bytes[] memory calls) external {
         asAdmin(vault, calls);
     }
+
+    function acceptSigner(address signer) external view {
+        requireSigner(claimNetwork("mainnet"), signer);
+    }
 }
 
 contract TestClaimOrderScript is Test {
@@ -35,6 +39,20 @@ contract TestClaimOrderScript is Test {
     function testAnyOtherCodeIsAContract() public {
         assertTrue(hasContractCode(abi.encodePacked(hex"600100", address(0xBEEF))));
         assertTrue(hasContractCode(address(harness).code));
+    }
+
+    /// Raindex V6 asks any signer with code through EIP-1271, a delegated key's
+    /// delegate included, so such a key cannot sign coupons.
+    function testAKeyWithAnEip7702DelegationIsRefusedAsTheSigner() public {
+        harness.acceptSigner(ACCOUNT);
+
+        vm.etch(ACCOUNT, abi.encodePacked(hex"ef0100", address(0xBEEF)));
+        vm.expectRevert(
+            bytes(
+                "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
+            )
+        );
+        harness.acceptSigner(ACCOUNT);
     }
 
     /// A vault whose admin is the broadcaster a test sends as, with `adminCode` at it.

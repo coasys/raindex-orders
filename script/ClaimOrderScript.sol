@@ -107,14 +107,20 @@ abstract contract ClaimOrderScript is Script {
         );
     }
 
-    /// An EIP-7702 delegation leaves a key a key.
-    function isContract(address account) internal view returns (bool) {
+    /// A key with an EIP-7702 delegation: its code is the 23-byte designator.
+    function isDelegatedKey(address account) internal view returns (bool) {
         bytes memory code = account.code;
-        bool delegatedKey = code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
-        return code.length > 0 && !delegatedKey;
+        return code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
     }
 
-    /// Refuses the test signer on mainnet, and a contract signer whose signatures the
+    /// An EIP-7702 delegation leaves a key a key, for sending transactions.
+    function isContract(address account) internal view returns (bool) {
+        return account.code.length > 0 && !isDelegatedKey(account);
+    }
+
+    /// Refuses the test signer on mainnet, a key with an EIP-7702 delegation, whose
+    /// coupons Raindex V6 refuses (it asks any account with code through EIP-1271,
+    /// never by the key's signature), and a contract signer whose signatures the
     /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
     /// as a key's.
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
@@ -122,6 +128,10 @@ abstract contract ClaimOrderScript is Script {
         require(
             net.chainId != 1 || signer != TEST_SIGNER_ADDRESS,
             "VALID_SIGNER is the test signer, whose key is public: mainnet refuses it"
+        );
+        require(
+            !isDelegatedKey(signer),
+            "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
         );
         if (isContract(signer)) {
             (bool answered, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));

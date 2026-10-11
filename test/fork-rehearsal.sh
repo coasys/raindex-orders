@@ -63,7 +63,11 @@ keys=(
 	0x2a871d0798f97d79848a013d4936a73bf4ae7b1cfd0dddbdf9ad2d28c75e78c3
 )
 address_of() { cast wallet address --private-key "$1"; }
-deployer_key=${keys[0]} admin_key=${keys[1]} signer_key=${keys[2]}
+# Anvil's accounts carry EIP-7702 delegations on mainnet, which Raindex V6 refuses
+# as coupon signers (it asks a delegated key's delegate through EIP-1271), so the
+# coupon signers are fresh keys.
+fresh_key() { cast wallet new --json | jq -r '.data[0].private_key'; }
+deployer_key=${keys[0]} admin_key=${keys[1]} signer_key=$(fresh_key) other_signer_key=$(fresh_key)
 deployer=$(address_of "$deployer_key")
 admin=$(address_of "$admin_key")
 signer=$(address_of "$signer_key")
@@ -141,16 +145,21 @@ proofs() {
 
 # Starts `bridge-orchestrator run` on the fork with the deploy record in `record`
 # and the key `key`, with no Holochain node: it gets past its startup checks only
-# to stop where it needs the node. Prints what it logged.
+# to stop where it needs the node. The conductor config it is given is durable
+# and names a lair socket that is not there, which is where it stops. Prints
+# what it logged.
 orchestrate() {
 	local record=$1 key=$2 dir
 	dir=$(mktemp -d -p "$work")
+	printf 'keystore:\n  type: lair_server\n  connection_url: unix:///%s/no-lair?k=abc\ndb_sync_level: Full\n' \
+		"$dir" >"$dir/conductor-config.yaml"
 	(
 		cd "$dir"
 		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
 		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" SIGNER_PRIVATE_KEY="$key" \
 			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
-			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/no-conductor.yaml" "$ORCHESTRATOR" run 2>&1 || true
+			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/conductor-config.yaml" \
+			LAIR_PASSPHRASE_FILE="$dir/no-passphrase" "$ORCHESTRATOR" run 2>&1 || true
 	)
 }
 
@@ -161,9 +170,9 @@ grep -qF "startup checks passed" "$work/orchestrator.log" || {
 	fail "the orchestrator did not pass its startup checks with the deploy record and the coupon signer's key"
 }
 echo "passed its startup checks with the record and the coupon signer's key"
-orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "${keys[3]}")/" "$work/deploy.log") "${keys[3]}" \
-	>"$work/orchestrator.log"
-grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "${keys[3]}"): it answered \"Wrong signer\"" \
+orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "$other_signer_key")/" "$work/deploy.log") \
+	"$other_signer_key" >"$work/orchestrator.log"
+grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "$other_signer_key"): it answered \"Wrong signer\"" \
 	"$work/orchestrator.log" || {
 	cat "$work/orchestrator.log"
 	fail "the orchestrator started with a key the claim order does not accept"
@@ -249,6 +258,8 @@ expect_record_refusal() {
 	echo "refused: a record when $reason"
 }
 
+expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
+	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$(address_of "${keys[2]}")" ./deploy-mainnet.sh "${wallet[@]}"
 env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log" ||
 	fail "rotate-claim-signer.sh did not print the calls for a second order"
 mapfile -t rogue < <(safe_calls "$work/rogue.log")

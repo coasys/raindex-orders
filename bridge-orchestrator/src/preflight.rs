@@ -3,7 +3,7 @@ use crate::signer::{ClaimOrder, CouponSigner, SignedCoupon};
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
-use alloy::sol_types::{Revert, SolError, SolValue};
+use alloy::sol_types::{Revert, SolCall, SolError, SolValue};
 use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use anyhow::{anyhow, bail, Result};
 use std::error::Error;
@@ -223,7 +223,13 @@ async fn read_and_compare(
         .get_code_at(order.signer)
         .await
         .map_err(|e| read_failed("eth_getCode(CLAIM_SIGNER)", e))?;
-    if !signer_code.is_empty() && !is_delegated_key(&signer_code) {
+    if is_delegated_key(&signer_code) {
+        bail!(
+            "CLAIM_SIGNER {} has an EIP-7702 delegation: Raindex V6 asks the delegate contract for a coupon's signature in place of the key, so the key's coupons are refused. Use a key with no delegation",
+            order.signer
+        );
+    }
+    if !signer_code.is_empty() {
         bail!(
             "CLAIM_SIGNER {} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it",
             order.signer
@@ -238,8 +244,14 @@ async fn read_and_compare(
     }
 
     let probe = signer.probe_coupon().await?;
+    let call = take_one(order, probe);
+    tracing::debug!(
+        event = "startup.probe",
+        calldata = %Bytes::from(IRaindexV6::takeOrders4Call { config: call.clone() }.abi_encode()),
+        "simulating the claim order probe"
+    );
     let taken = IRaindexV6::new(order.orderbook, &provider)
-        .takeOrders4(take_one(order, probe))
+        .takeOrders4(call)
         .from(order.signer)
         .call()
         .await;
@@ -279,8 +291,10 @@ fn accepts_signer(
     )
 }
 
-/// An EIP-7702 delegation leaves an account a key, which the orderbook checks by its
-/// ECDSA signature before it asks any code.
+/// An account with an EIP-7702 delegation. OrderBookV3 checked such a signer's
+/// coupons by their ECDSA signature; Raindex V6 (OpenZeppelin 5's SignatureChecker)
+/// asks any account with code, a delegation included, through EIP-1271 only, so a
+/// delegated key's coupons are refused.
 fn is_delegated_key(code: &Bytes) -> bool {
     code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x00])
 }
@@ -911,16 +925,22 @@ mod tests {
         );
     }
 
+    /// Anvil's public accounts carry such a delegation on mainnet, which is how
+    /// this was found: Raindex V6 refused their coupons with InvalidSignature.
     #[tokio::test]
-    async fn passes_a_claim_signer_that_is_a_key_with_an_eip_7702_delegation() {
+    async fn refuses_a_claim_signer_that_is_a_key_with_an_eip_7702_delegation() {
         let chain = Chain {
             signer_code: "0xef01001111111111111111111111111111111111111111",
             ..Chain::of(Network::Mainnet)
         };
 
-        check_against(Network::Mainnet, chain, &order())
-            .await
-            .unwrap();
+        assert_eq!(
+            refusal(Network::Mainnet, chain, &order()).await,
+            format!(
+                "CLAIM_SIGNER {} has an EIP-7702 delegation: Raindex V6 asks the delegate contract for a coupon's signature in place of the key, so the key's coupons are refused. Use a key with no delegation",
+                key().address()
+            )
+        );
     }
 
     #[test]
@@ -940,6 +960,52 @@ mod tests {
         assert_eq!(
             CLAIM_IO_RATIO,
             "0xffffffe200000000000000000000000000000000000000000000000000000001"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// The claim calldata test vector: test/TestCouponSignature.t.sol encodes the
+    /// same takeOrders4 call with abi.encodeCall, and ui/src/lib/claim.test.ts sends it.
+    #[test]
+    fn encodes_the_claim_as_forge_does() {
+        let signer = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+        let order = ClaimOrder {
+            order_hash: "0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b"
+                .parse()
+                .unwrap(),
+            signer,
+            ..ClaimOrder::vector()
+        };
+        let words: Vec<B256> = [
+            "0x0000000000000000000000001111111111111111111111111111111111111111",
+            "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+            "0x0000000000000000000000000000000000000000000000000000000068581c00",
+            "0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b",
+            "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
+            "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
+            "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
+            "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+            "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+        ]
+        .iter()
+        .map(|word| word.parse().unwrap())
+        .collect();
+        let signature = hex::decode("f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b").unwrap();
+        let coupon = SignedCoupon {
+            signer,
+            context: words,
+            signature,
+        };
+
+        let calldata = IRaindexV6::takeOrders4Call {
+            config: take_one(&order, coupon),
+        }
+        .abi_encode();
+
+        assert_eq!(
+            keccak256(&calldata),
+            "0x9c90a13c518aa17629ca92bb5947f54e0fcfb1c0ef65376c17d8ea02e7763522"
                 .parse::<B256>()
                 .unwrap()
         );
