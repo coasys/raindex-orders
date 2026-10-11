@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Rehearses the mainnet deploy, then the move of the vault admin and the coupon
-# signer to Safe multisigs, on an anvil fork of Ethereum mainnet:
+# Rehearses the mainnet deploy, with a Safe as the vault admin from the first
+# transaction, then the move of the coupon signer to a Safe, on an anvil fork
+# of Ethereum mainnet:
 #   nix develop -c test/fork-rehearsal.sh
 # FORK_URL is the mainnet RPC anvil forks. Every transaction goes to an anvil
 # this script starts on 127.0.0.1, never to FORK_URL.
@@ -13,7 +14,8 @@ PORT=${REHEARSAL_PORT:-18545}
 fork=http://127.0.0.1:$PORT
 plain=http://127.0.0.1:$((PORT + 1))
 
-unset ETH_RPC_URL SEPOLIA_RPC_URL
+unset ETH_RPC_URL SEPOLIA_RPC_URL ADMIN_ADDRESS VALID_SIGNER ADMIN_SAFE_THRESHOLD ADMIN_SAFE_OWNERS \
+	UNSAFE_ALLOW_SINGLE_KEY_ADMIN
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 work=$(mktemp -d)
@@ -65,7 +67,8 @@ keys=(
 address_of() { cast wallet address --private-key "$1"; }
 # Anvil's accounts carry EIP-7702 delegations on mainnet, which Raindex V6 refuses
 # as coupon signers (it asks a delegated key's delegate through EIP-1271), so the
-# coupon signers are fresh keys.
+# coupon signers are fresh keys. A Safe's owners sign with ecrecover, so anvil's
+# accounts serve as owners.
 fresh_key() { cast wallet new --json | jq -r '.data[0].private_key'; }
 deployer_key=${keys[0]} admin_key=${keys[1]} signer_key=$(fresh_key) other_signer_key=$(fresh_key)
 deployer=$(address_of "$deployer_key")
@@ -80,6 +83,7 @@ wallet=(--keystore "$work/keys/deployer" --password rehearsal)
 
 record_value() { grep -oE "$1=0x[0-9a-fA-F]+" "$2" | tail -1 | cut -d= -f2 || true; }
 nonce() { cast nonce "$deployer" --rpc-url "$1"; }
+next_block() { echo $(($(cast block-number --rpc-url "$fork") + 1)); }
 
 # Runs deploy-mainnet.sh against `url`, which must refuse, naming `reason`, and
 # send nothing.
@@ -108,81 +112,6 @@ start_anvil "$fork" --fork-url "$FORK_URL"
 start_anvil "$plain"
 [[ $(cast chain-id --rpc-url "$fork") == 1 ]] || fail "the fork is not chain 1"
 
-step "The deploy refuses before it sends anything"
-inputs=(ADMIN_ADDRESS="$admin" VALID_SIGNER="$signer")
-expect_refusal "$plain" "the RPC answers for chain 31337, and NETWORK=mainnet is chain 1" \
-	env "${inputs[@]}" ./deploy-mainnet.sh "${wallet[@]}"
-expect_refusal "$fork" "VALID_SIGNER is the test signer" \
-	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$test_signer" ./deploy-mainnet.sh "${wallet[@]}"
-expect_refusal "$fork" "ADMIN_ADDRESS is required" \
-	env -u ADMIN_ADDRESS VALID_SIGNER="$signer" ./deploy-mainnet.sh "${wallet[@]}"
-expect_refusal "$fork" "VALID_SIGNER is required" \
-	env -u VALID_SIGNER ADMIN_ADDRESS="$admin" ./deploy-mainnet.sh "${wallet[@]}"
-expect_refusal "$fork" "ADMIN_ADDRESS is the deployer" \
-	env ADMIN_ADDRESS="$deployer" VALID_SIGNER="$signer" ./deploy-mainnet.sh "${wallet[@]}"
-expect_refusal "$fork" "pass the signer as a forge wallet option" \
-	env "${inputs[@]}" ./deploy-mainnet.sh
-expect_refusal "$fork" "--private-key takes a raw key" \
-	env "${inputs[@]}" ./deploy-mainnet.sh --private-key "$deployer_key"
-
-step "Deploying with an EOA admin and an EOA coupon signer"
-ETH_RPC_URL=$fork ADMIN_ADDRESS=$admin VALID_SIGNER=$signer ./deploy-mainnet.sh "${wallet[@]}" |
-	tee "$work/deploy.log"
-vault=$(record_value MAINNET_LOCK_VAULT_ADDRESS "$work/deploy.log")
-order_hash=$(record_value ORDER_HASH "$work/deploy.log")
-interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/deploy.log")
-store=$(record_value PUBLIC_CLAIM_STORE "$work/deploy.log")
-bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/deploy.log")
-input_token=$(record_value PUBLIC_CLAIM_INPUT_TOKEN "$work/deploy.log")
-[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $bytecode && -n $input_token ]] ||
-	fail "the deploy printed no complete deploy record"
-
-proofs() {
-	REHEARSAL=true REHEARSAL_RPC_URL=$fork MAINNET_LOCK_VAULT_ADDRESS=$vault \
-		ADMIN_ADDRESS=$admin REHEARSAL_DEPLOYER=$deployer REHEARSAL_SIGNER_KEY=$signer_key \
-		forge test --match-path test/rehearsal/MainnetForkRehearsal.t.sol -vv "$@"
-}
-
-# Starts `bridge-orchestrator run` on the fork with the deploy record in `record`
-# and the key `key`, with no Holochain node: it gets past its startup checks only
-# to stop where it needs the node. The conductor config it is given is durable
-# and names a lair socket that is not there, which is where it stops. Prints
-# what it logged.
-orchestrate() {
-	local record=$1 key=$2 dir
-	dir=$(mktemp -d -p "$work")
-	printf 'keystore:\n  type: lair_server\n  connection_url: unix:///%s/no-lair?k=abc\ndb_sync_level: Full\n' \
-		"$dir" >"$dir/conductor-config.yaml"
-	(
-		cd "$dir"
-		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
-		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" SIGNER_PRIVATE_KEY="$key" \
-			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
-			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/conductor-config.yaml" \
-			LAIR_PASSPHRASE_FILE="$dir/no-passphrase" "$ORCHESTRATOR" run 2>&1 || true
-	)
-}
-
-step "Starting the orchestrator against the deployed claim order"
-orchestrate "$work/deploy.log" "$signer_key" >"$work/orchestrator.log"
-grep -qF "startup checks passed" "$work/orchestrator.log" || {
-	cat "$work/orchestrator.log"
-	fail "the orchestrator did not pass its startup checks with the deploy record and the coupon signer's key"
-}
-echo "passed its startup checks with the record and the coupon signer's key"
-orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "$other_signer_key")/" "$work/deploy.log") \
-	"$other_signer_key" >"$work/orchestrator.log"
-grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "$other_signer_key"): it answered \"Wrong signer\"" \
-	"$work/orchestrator.log" || {
-	cat "$work/orchestrator.log"
-	fail "the orchestrator started with a key the claim order does not accept"
-}
-echo "refused: a key the claim order does not accept"
-
-step "Proving the deployed bridge on the fork"
-ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
-	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token proofs --match-contract EoaRehearsal
-
 safe() {
 	forge script test/rehearsal/RehearsalSafe.s.sol:RehearsalSafe --rpc-url "$fork" --broadcast \
 		--private-key "$deployer_key" "$@"
@@ -194,6 +123,12 @@ create_safe() {
 	safe --sig 'create(address[],uint256,uint256)' "[$(IFS=,; echo "${owners[*]}")]" "$threshold" "$salt" |
 		grep -oE 'SAFE=0x[0-9a-fA-F]{40}' | cut -d= -f2 || true
 }
+owners_of() {
+	local owners=() key
+	for key in "$@"; do owners+=("$(address_of "$key")"); done
+	IFS=,
+	echo "${owners[*]}"
+}
 admin_owner_keys=("${keys[4]}" "${keys[5]}" "${keys[6]}")
 signer_owner_keys=("${keys[7]}" "${keys[8]}" "${keys[9]}")
 
@@ -202,10 +137,146 @@ admin_safe=$(create_safe 2 1 "${admin_owner_keys[@]}")
 signer_safe=$(create_safe 2 2 "${signer_owner_keys[@]}")
 single_safe=$(create_safe 1 3 "${signer_owner_keys[@]}")
 [[ -n $admin_safe && -n $signer_safe && -n $single_safe ]] || fail "a Safe was not created"
+admin_owners=$(owners_of "${admin_owner_keys[@]}")
+signer_owners=$(owners_of "${signer_owner_keys[@]}")
 echo "admin Safe $admin_safe, signer Safe $signer_safe"
 
-step "Moving the vault admin to the admin Safe, then acting through it with 2 owner signatures"
-cast send --rpc-url "$fork" --private-key "$admin_key" "$vault" 'setAdmin(address)' "$admin_safe" >/dev/null
+step "The deploy refuses before it sends anything"
+inputs=(ADMIN_ADDRESS="$admin_safe" ADMIN_SAFE_THRESHOLD=2 ADMIN_SAFE_OWNERS="$admin_owners" VALID_SIGNER="$signer")
+deploy=(./deploy-mainnet.sh "${wallet[@]}")
+expect_refusal "$plain" "the RPC answers for chain 31337, and NETWORK=mainnet is chain 1" \
+	env "${inputs[@]}" "${deploy[@]}"
+expect_refusal "$fork" "VALID_SIGNER is the test signer" \
+	env "${inputs[@]}" VALID_SIGNER="$test_signer" "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_ADDRESS is required" \
+	env -u ADMIN_ADDRESS VALID_SIGNER="$signer" "${deploy[@]}"
+expect_refusal "$fork" "VALID_SIGNER is required" \
+	env -u VALID_SIGNER ADMIN_ADDRESS="$admin_safe" "${deploy[@]}"
+expect_refusal "$fork" "pass the signer as a forge wallet option" \
+	env "${inputs[@]}" ./deploy-mainnet.sh
+expect_refusal "$fork" "--private-key takes a raw key" \
+	env "${inputs[@]}" ./deploy-mainnet.sh --private-key "$deployer_key"
+expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
+	env "${inputs[@]}" VALID_SIGNER="$(address_of "${keys[2]}")" "${deploy[@]}"
+echo "-- the vault admin must be a Safe of threshold 2 or more, the one meant"
+expect_refusal "$fork" "ADMIN_ADDRESS $admin is a key, not a Safe" \
+	env "${inputs[@]}" ADMIN_ADDRESS="$admin" "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_ADDRESS $deployer is a key, not a Safe" \
+	env "${inputs[@]}" ADMIN_ADDRESS="$deployer" "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_ADDRESS is the deployer" \
+	env "${inputs[@]}" ADMIN_ADDRESS="$deployer" UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes "${deploy[@]}"
+expect_refusal "$fork" "is a Safe of threshold 1 with 3 owners, which one key controls" \
+	env "${inputs[@]}" ADMIN_ADDRESS="$single_safe" ADMIN_SAFE_THRESHOLD=1 ADMIN_SAFE_OWNERS="$signer_owners" "${deploy[@]}"
+expect_refusal "$fork" "is a contract but not a Safe" \
+	env "${inputs[@]}" ADMIN_ADDRESS=0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20 "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_SAFE_THRESHOLD is required" \
+	env ADMIN_ADDRESS="$admin_safe" ADMIN_SAFE_OWNERS="$admin_owners" VALID_SIGNER="$signer" "${deploy[@]}"
+expect_refusal "$fork" "is a Safe of threshold 2 with 3 owners, not ADMIN_SAFE_THRESHOLD=3" \
+	env "${inputs[@]}" ADMIN_SAFE_THRESHOLD=3 "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_SAFE_OWNERS is required" \
+	env ADMIN_ADDRESS="$admin_safe" ADMIN_SAFE_THRESHOLD=2 VALID_SIGNER="$signer" "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_SAFE_OWNERS does not list the owners of ADMIN_ADDRESS $admin_safe" \
+	env "${inputs[@]}" ADMIN_SAFE_OWNERS="$signer_owners" "${deploy[@]}"
+expect_refusal "$fork" "ADMIN_SAFE_OWNERS does not list the owners of ADMIN_ADDRESS $admin_safe" \
+	env "${inputs[@]}" ADMIN_SAFE_OWNERS="$(owners_of "${admin_owner_keys[0]}" "${admin_owner_keys[1]}")" "${deploy[@]}"
+
+# Reads the deploy record `log` into the variables the proofs and the
+# orchestrator take.
+read_record() {
+	local log=$1
+	vault=$(record_value MAINNET_LOCK_VAULT_ADDRESS "$log")
+	order_hash=$(record_value ORDER_HASH "$log")
+	interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$log")
+	store=$(record_value PUBLIC_CLAIM_STORE "$log")
+	bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$log")
+	input_token=$(record_value PUBLIC_CLAIM_INPUT_TOKEN "$log")
+	bridge_deployer=$(record_value HoloBridgeDeployer "$log")
+	[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $bytecode && -n $input_token &&
+		-n $bridge_deployer ]] || fail "the deploy printed no complete deploy record"
+}
+
+step "Deploying: the admin Safe is the vault admin from the first transaction, a key is the coupon signer"
+deploy_block=$(next_block)
+ETH_RPC_URL=$fork env "${inputs[@]}" ./deploy-mainnet.sh "${wallet[@]}" | tee "$work/deploy.log"
+grep -qF "ADMIN_ADDRESS $admin_safe is a Safe of threshold 2 with 3 owners" "$work/deploy.log" ||
+	fail "the deploy did not print the admin Safe's threshold and owners"
+[[ $(grep -c "succeeded in block" "$work/deploy.log") == 1 ]] || fail "the deploy sent more than one transaction"
+read_record "$work/deploy.log"
+[[ $(cast call --rpc-url "$fork" "$vault" 'admin()(address)') == "$admin_safe" ]] ||
+	fail "the vault's admin is not the admin Safe"
+
+proofs() {
+	REHEARSAL=true REHEARSAL_RPC_URL=$fork MAINNET_LOCK_VAULT_ADDRESS=$vault \
+		REHEARSAL_DEPLOYER=$deployer REHEARSAL_SIGNER_KEY=$signer_key \
+		forge test --match-path test/rehearsal/MainnetForkRehearsal.t.sol -vv "$@"
+}
+
+# Starts `bridge-orchestrator run` on the fork with the deploy record in `record`
+# and the key settings `settings`, with no Holochain node: it gets past its
+# startup checks only to stop where it needs the node. The conductor config it
+# is given is durable and names a lair socket that is not there, which is where
+# it stops. Prints what it logged.
+orchestrate() {
+	local record=$1 dir
+	shift
+	dir=$(mktemp -d -p "$work")
+	printf 'keystore:\n  type: lair_server\n  connection_url: unix:///%s/no-lair?k=abc\ndb_sync_level: Full\n' \
+		"$dir" >"$dir/conductor-config.yaml"
+	(
+		cd "$dir"
+		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
+		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" "$@" \
+			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
+			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/conductor-config.yaml" \
+			LAIR_PASSPHRASE_FILE="$dir/no-passphrase" "$ORCHESTRATOR" run 2>&1 || true
+	)
+}
+# The orchestrator must pass its startup checks with `record` and the key
+# settings that follow.
+expect_startup() {
+	local record=$1 what=$2
+	shift 2
+	orchestrate "$record" "$@" >"$work/orchestrator.log"
+	grep -qF "startup checks passed" "$work/orchestrator.log" || {
+		cat "$work/orchestrator.log"
+		fail "the orchestrator did not pass its startup checks $what"
+	}
+	echo "passed its startup checks $what"
+}
+# The orchestrator must refuse to start, naming `reason`.
+expect_orchestrator_refusal() {
+	local record=$1 reason=$2
+	shift 2
+	orchestrate "$record" "$@" >"$work/orchestrator.log"
+	grep -qF "startup checks passed" "$work/orchestrator.log" && {
+		cat "$work/orchestrator.log"
+		fail "the orchestrator started: $reason"
+	}
+	grep -qF -- "$reason" "$work/orchestrator.log" || {
+		cat "$work/orchestrator.log"
+		fail "the orchestrator refused without naming: $reason"
+	}
+	echo "refused: $reason"
+}
+
+step "Starting the orchestrator against the deployed claim order"
+expect_startup "$work/deploy.log" "with the record and the coupon signer's key" SIGNER_PRIVATE_KEY="$signer_key"
+expect_orchestrator_refusal \
+	<(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "$other_signer_key")/" "$work/deploy.log") \
+	"does not accept coupons from CLAIM_SIGNER $(address_of "$other_signer_key"): it answered \"Wrong signer\"" \
+	SIGNER_PRIVATE_KEY="$other_signer_key"
+expect_orchestrator_refusal "$work/deploy.log" \
+	"CLAIM_SIGNER $signer has no contract, so it is a key, not a Safe, and SAFE_OWNER_KEYS signs for a Safe" \
+	SAFE_OWNER_KEYS="${signer_owner_keys[0]},${signer_owner_keys[1]}"
+
+step "Proving the launched bridge on the fork: the Safe admin and the key coupon signer"
+ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
+	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
+	ADMIN_SAFE=$admin_safe HOLO_BRIDGE_DEPLOYER=$bridge_deployer REHEARSAL_DEPLOY_BLOCK=$deploy_block \
+	REHEARSAL_ADMIN_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[1]}" \
+	proofs --match-contract LaunchRehearsal
+
+step "Acting as the admin Safe on the fork with 2 owner signatures"
 min_lock_amount=2000000000000000000
 REHEARSAL_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[1]}" safe \
 	--sig 'exec(address,address,bytes)' "$admin_safe" "$vault" \
@@ -248,7 +319,7 @@ expect_record_refusal() {
 	local reason=$1 snapshot from_block
 	shift
 	snapshot=$(cast rpc evm_snapshot --rpc-url "$fork" | tr -d '"')
-	from_block=$(($(cast block-number --rpc-url "$fork") + 1))
+	from_block=$(next_block)
 	execute "$@"
 	if env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
 		fail "the record passed: $reason"
@@ -258,8 +329,6 @@ expect_record_refusal() {
 	echo "refused: a record when $reason"
 }
 
-expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
-	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$(address_of "${keys[2]}")" ./deploy-mainnet.sh "${wallet[@]}"
 # A V6 order is its bytecode, so the same signer gives the same order, which the
 # orderbook already holds: the second order is for another signer.
 env "${rotation[@]}" VALID_SIGNER="$(address_of "$other_signer_key")" ./rotate-claim-signer.sh >"$work/rogue.log" ||
@@ -276,7 +345,7 @@ misrun=${calls[0]//$(padded "$interpreter")/$(padded "$other_interpreter")}
 [[ $misrun != "${calls[0]}" ]] || fail "the claim order's call names no interpreter to replace"
 expect_record_refusal "not run by the network's interpreter and store" "$misrun" "${calls[1]}"
 
-from_block=$(($(cast block-number --rpc-url "$fork") + 1))
+from_block=$(next_block)
 execute "${calls[@]}"
 if env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
 	fail "the record named a signer the new claim order does not accept"
@@ -293,21 +362,105 @@ new_bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/rotated.log")
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||
 	fail "the new deploy record does not name the signer Safe"
 
-orchestrate "$work/rotated.log" "$signer_key" >"$work/orchestrator.log"
-grep -qF "CLAIM_SIGNER $signer_safe is a contract, such as a Safe" "$work/orchestrator.log" || {
-	cat "$work/orchestrator.log"
-	fail "the orchestrator started for a Safe coupon signer"
-}
-echo "refused: the orchestrator for a claim order whose signer is a Safe"
+step "Starting the orchestrator for the Safe coupon signer with its owners' keys"
+two_owner_keys="${signer_owner_keys[1]},${signer_owner_keys[2]}"
+expect_startup "$work/rotated.log" "with the keys of 2 of the signer Safe's 3 owners" SAFE_OWNER_KEYS="$two_owner_keys"
+grep -qF "CLAIM_SIGNER is a Safe of threshold 2" "$work/orchestrator.log" ||
+	fail "the orchestrator did not log the Safe's threshold"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"CLAIM_SIGNER $signer_safe is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key" \
+	SIGNER_PRIVATE_KEY="$signer_key"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SAFE_OWNER_KEYS holds 1 keys" \
+	SAFE_OWNER_KEYS="${signer_owner_keys[0]}"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SAFE_OWNER_KEYS holds 3 keys, and CLAIM_SIGNER $signer_safe is a Safe of threshold 2" \
+	SAFE_OWNER_KEYS="$(IFS=,; echo "${signer_owner_keys[*]}")"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SAFE_OWNER_KEYS holds the key of $(address_of "$signer_key"), which is not an owner of CLAIM_SIGNER $signer_safe" \
+	SAFE_OWNER_KEYS="${signer_owner_keys[0]},$signer_key"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SAFE_OWNER_KEYS holds the key of $(address_of "${admin_owner_keys[0]}"), which is not an owner of CLAIM_SIGNER $signer_safe" \
+	SAFE_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[1]}"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SAFE_OWNER_KEYS holds the key of $(address_of "${signer_owner_keys[0]}") twice" \
+	SAFE_OWNER_KEYS="${signer_owner_keys[0]},${signer_owner_keys[0]}"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set" \
+	SIGNER_PRIVATE_KEY="$signer_key" SAFE_OWNER_KEYS="$two_owner_keys"
+
+# The website's claimer: a fresh key anvil gives ETH, which the proofs' coupons
+# for the website pay.
+claimer_key=$(fresh_key)
+claimer=$(address_of "$claimer_key")
+cast rpc anvil_setBalance "$claimer" 0xDE0B6B3A7640000 --rpc-url "$fork" >/dev/null
 
 step "Proving the Safe admin and the Safe coupon signer on the fork"
-ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash \
+ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash REHEARSAL_WEBSITE_CLAIMER=$claimer \
 	PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
 	PUBLIC_CLAIM_BYTECODE=$new_bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
 	ADMIN_SAFE=$admin_safe SIGNER_SAFE=$signer_safe REHEARSAL_MIN_LOCK_AMOUNT=$min_lock_amount \
-	REHEARSAL_SIGNER_OWNER_KEYS="${signer_owner_keys[1]},${signer_owner_keys[2]}" \
+	REHEARSAL_SIGNER_OWNER_KEYS="$two_owner_keys" \
 	REHEARSAL_SIGNER_ONE_OWNER_KEY="${signer_owner_keys[0]}" \
 	REHEARSAL_ADMIN_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[1]}" \
-	proofs --match-contract SafeRehearsal
+	proofs --match-contract SafeSignerRehearsal | tee "$work/safe-proofs.log"
+coupon_value() { grep -oE "$1=[^ ]+" "$work/safe-proofs.log" | head -1 | cut -d= -f2- || true; }
+safe_coupon=$(coupon_value SAFE_COUPON)
+one_owner_coupon=$(coupon_value ONE_OWNER_COUPON)
+non_owner_coupon=$(coupon_value NON_OWNER_COUPON)
+claim_calldata=$(coupon_value CLAIM_CALLDATA)
+[[ -n $safe_coupon && -n $one_owner_coupon && -n $non_owner_coupon && -n $claim_calldata ]] ||
+	fail "the proofs printed no coupons for the website"
+
+step "The website's coupon status reads the Safe-signed coupon on the fork, before and after its claim"
+# The website's build variables are the rotated deploy record's.
+mapfile -t website < <(sed -n '/website:/,$p' "$work/rotated.log" | grep -oE 'PUBLIC_[A-Z_]+=[^ ]+')
+# A lock funds the claim: anvil gives the locker 100 HOT (HOT keeps balances in
+# its storage slot 2).
+locker=$(address_of "${keys[3]}")
+hot=0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
+cast rpc anvil_setStorageAt "$hot" "$(cast index address "$locker" 2)" \
+	"$(cast to-uint256 100000000000000000000)" --rpc-url "$fork" >/dev/null
+[[ $(cast call --rpc-url "$fork" "$hot" 'balanceOf(address)(uint256)' "$locker" | cut -d' ' -f1) == 100000000000000000000 ]] ||
+	fail "anvil did not give the locker HOT"
+# The website reads at the `safe` block, which anvil answers as 32 blocks behind
+# the latest, as Ethereum's lags: mining past that puts the rotation, and later
+# the claim, in the block it reads.
+mine_past_safe() { cast rpc anvil_mine 40 --rpc-url "$fork" >/dev/null; }
+coupon_status() {
+	mine_past_safe
+	(
+		cd ui
+		env "${website[@]}" REHEARSAL_RPC_URL="$fork" REHEARSAL_SAFE_COUPON_STATUS="$1" \
+			SAFE_COUPON="$safe_coupon" ONE_OWNER_COUPON="$one_owner_coupon" NON_OWNER_COUPON="$non_owner_coupon" \
+			npx vitest run src/routes/api/coupon-status/server.fork.test.ts
+	)
+}
+coupon_status unredeemed
+# The claim as the website sends it, from the claimer; the vault holds the HOT a
+# lock put there through the proofs' own fork, not this one, so lock first.
+cast send --rpc-url "$fork" --private-key "${keys[3]}" "$hot" 'approve(address,uint256)' "$vault" 100000000000000000000 >/dev/null
+cast send --rpc-url "$fork" --private-key "${keys[3]}" "$vault" 'lock(uint256,bytes32)' 100000000000000000000 \
+	"$(cast keccak "a Unyt agent")" >/dev/null
+cast send --rpc-url "$fork" --private-key "$claimer_key" 0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20 "$claim_calldata" >/dev/null ||
+	fail "the Safe-signed coupon's claim failed on the fork"
+echo "claimed the Safe-signed coupon on the fork"
+coupon_status redeemed
+
+step "Deploying with UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes: a key as the vault admin, the signer Safe as the coupon signer"
+deploy_block=$(next_block)
+ETH_RPC_URL=$fork UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes ADMIN_ADDRESS=$admin VALID_SIGNER=$signer_safe \
+	./deploy-mainnet.sh "${wallet[@]}" | tee "$work/unsafe.log"
+grep -qF "UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes: ADMIN_ADDRESS $admin is one key, which alone controls the vault" \
+	"$work/unsafe.log" || fail "the deploy did not log the override"
+read_record "$work/unsafe.log"
+[[ $(record_value PUBLIC_CLAIM_SIGNER "$work/unsafe.log") == "$signer_safe" ]] ||
+	fail "the deploy record does not name the signer Safe"
+expect_startup "$work/unsafe.log" "for the signer Safe as the coupon signer from the deploy" SAFE_OWNER_KEYS="$two_owner_keys"
+ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
+	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
+	ADMIN_ADDRESS=$admin SIGNER_SAFE=$signer_safe HOLO_BRIDGE_DEPLOYER=$bridge_deployer \
+	REHEARSAL_DEPLOY_BLOCK=$deploy_block REHEARSAL_SIGNER_OWNER_KEYS="$two_owner_keys" \
+	proofs --match-contract SingleKeyAdminRehearsal
 
 step "Fork rehearsal passed"
