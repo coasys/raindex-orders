@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `HoloBridgeDeployer` deploys the mainnet bridge in one transaction and hands the vault to `ADMIN_ADDRESS` inside it, so a Safe is the vault admin from the vault's first block and no key ever holds it. `deploy-mainnet.sh` refuses a key, a contract that is not a Safe, or a Safe of threshold 1 as the admin unless `UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes` is set, takes the Safe's expected `ADMIN_SAFE_THRESHOLD` and `ADMIN_SAFE_OWNERS` and refuses a Safe that answers otherwise, and its record refuses a vault whose admin changed other than once, from the deployer contract to `ADMIN_ADDRESS`.
+- bridge-orchestrator signs coupons for a Safe as `CLAIM_SIGNER` with `SAFE_OWNER_KEYS`, the keys of its threshold of owners: each coupon carries the owners' signatures of the SafeMessage hash of its digest, which the Safe's EIP-1271 `isValidSignature` accepts. At startup it checks the Safe's threshold, owners and EIP-712 domain against the keys, and simulates a claim through the Safe. One orchestrator holding every owner key is one party, not M-of-N.
+- `docs/signer-service.md`: what a Safe owner's signer service receives and checks on Holochain before it signs, as an interface and open questions; nothing is built.
+- `test/fork-rehearsal.sh` launches with the Safe admin, proves its refusals, the orchestrator signing for a Safe, the website's coupon status against a real Safe on the fork before and after a claim, and the override deploy.
 - `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
 - `ClaimInputToken`, the claim order's input token, deployed with the vault: Raindex V6 takes an order only at a positive io-ratio and pulls at least one unit of the input token from the taker, so the claim order's ratio is 1e-30 per HOT and this token's transfers move nothing.
 - `test/TestClaimBaseSepolia.t.sol` deploys the TestNet bridge on a fork of Base Sepolia and proves a lock and a claim against the Raindex V6 there.
