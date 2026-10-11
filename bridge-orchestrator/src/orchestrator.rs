@@ -61,8 +61,8 @@ enum PressureSeverity {
 /// conductor.
 #[derive(Debug, PartialEq, Eq)]
 enum CycleFailureAction {
-    /// A transport/connection failure (`is_connection_error`): drop and
-    /// rebuild the socket.
+    /// `is_connection_error`: the conductor socket or the signer's lair
+    /// connection is gone, so rebuild the `Ham`.
     Reconnect,
     /// Server-side source-chain pressure or a client-side per-request timeout
     /// (`is_source_chain_pressure` / `is_request_timeout`): the socket is
@@ -598,13 +598,10 @@ impl BridgeOrchestrator {
                                 match action {
                                     CycleFailureAction::Reconnect => {
                                         warn!(event = "ham.disconnected", error = %err_str);
-                                        // A lost socket is neither cooldown class, so drop
-                                        // whichever one an earlier cycle published: it would
-                                        // otherwise outlive its condition and — since the
-                                        // dashboard ranks a cooldown class above "failing
-                                        // cycles" — hide a reconnect loop behind a stale
-                                        // pressure or unclassified badge until the next
-                                        // fully-clean cycle.
+                                        // A lost connection is neither cooldown class. The
+                                        // dashboard ranks a cooldown class above failing
+                                        // cycles, so a stale one would hide this reconnect
+                                        // loop until the next clean cycle.
                                         self.reporter.update(|h| {
                                             h.reconnect_failures_total =
                                                 h.reconnect_failures_total.saturating_add(1);
@@ -8033,29 +8030,36 @@ mod tests {
         assert!(!orch.should_eject(u128::MAX));
     }
 
-    // -----------------------------------------------------------------
-    // Cycle-failure disposition tests
-    //
-    // `classify_cycle_failure` is the single source of truth for the
-    // cycle loop's three-way reaction to a failed cycle. These pin each
-    // branch — most importantly the terminal `UnclassifiedCooldown`
-    // fallback (B111): before it existed, an error matching none of ham's
-    // classifiers fell off the end of the chain and retried at full tempo.
-    //
-    // Errors are fed as their rendered `Display` text, exactly as a `Ham`
-    // caller receives them (every `Ham` method wraps upstream with
-    // `anyhow!("…: {}", e)`). The strings here are ones the *currently
-    // pinned* ham classifies deterministically — `ResponderDropped` (now
-    // `is_connection_error` on ham's side) is pinned in ham's own suite,
-    // not here, since this crate builds against the pinned `ham` rev.
-    // -----------------------------------------------------------------
-
+    // Built from text: `Ham::call_zome` flattens the upstream error into its
+    // message, and ham's classifiers match only on its `{:#}` text.
     #[test]
     fn classify_cycle_failure_routes_connection_errors_to_reconnect() {
         let e = anyhow::anyhow!(
             "Failed to call zome: Websocket error: Websocket closed: No connection"
         );
         assert_eq!(classify_cycle_failure(&e), CycleFailureAction::Reconnect);
+    }
+
+    #[test]
+    fn a_lair_restart_rebuilds_ham_and_a_conductor_answer_does_not() {
+        for lair_gone in ["BrokenPipe", "ConnectionAborted"] {
+            let e = anyhow::anyhow!(
+                r#"Failed to call zome: Unable to sign zome call: {{"error":"{lair_gone}"}}"#
+            );
+            assert_eq!(
+                classify_cycle_failure(&e),
+                CycleFailureAction::Reconnect,
+                "{e:#}"
+            );
+        }
+        let answered = anyhow::anyhow!(
+            r#"Failed to call zome: External API wire error: InternalError("IO error: connection reset by peer")"#
+        );
+        assert_eq!(
+            classify_cycle_failure(&answered),
+            CycleFailureAction::UnclassifiedCooldown,
+            "the socket that carried the conductor's answer is open"
+        );
     }
 
     #[test]
@@ -8077,10 +8081,6 @@ mod tests {
 
     #[test]
     fn classify_cycle_failure_routes_unclassified_errors_to_the_terminal_fallback() {
-        // The B111 fix: an error matching none of ham's classifiers must
-        // route to the cooldown fallback instead of a full-tempo retry. A
-        // zome/guest logic error is the common live case; a deserialize
-        // failure another; plus a wholly unexpected string.
         for msg in [
             "Failed to call zome: guest error: validation failed",
             "Failed to deserialize response: invalid type",
