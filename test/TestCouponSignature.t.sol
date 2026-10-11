@@ -4,14 +4,22 @@ pragma solidity =0.8.25;
 import {Test} from "forge-std/Test.sol";
 import {SignedContextV1} from "rainlang-interface-0.2.9/src/interface/IInterpreterCallerV4.sol";
 import {Float, LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
-import {OrderV4, IOV2, EvaluableV4} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {
+    IRaindexV6,
+    OrderV4,
+    IOV2,
+    EvaluableV4,
+    TakeOrderConfigV4,
+    TakeOrdersConfigV5
+} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
 import {
     HOLO_VAULT_ID,
     RAINDEX,
     MAINNET_HOT,
     RAINLANG_INTERPRETER,
     RAINLANG_STORE,
-    CLAIM_ORDER_NONCE
+    CLAIM_ORDER_NONCE,
+    CLAIM_IO_RATIO
 } from "src/Constants.sol";
 import {LibCoupon} from "./lib/LibCoupon.sol";
 import {SignContext} from "./lib/SignContext.sol";
@@ -98,5 +106,50 @@ contract TestOrderHashVector is Test {
         );
 
         assertEq(keccak256(abi.encode(order)), 0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b);
+    }
+}
+
+/// The claim test vector: the takeOrders4 call the website sends for the coupon
+/// of the test vector, signed by anvil's third account, against the vector's
+/// order. ui/src/lib/claim.test.ts pins this calldata.
+contract TestClaimCalldataVector is Test, SignContext {
+    function testTheClaimCalldataOfTheVector() external view {
+        IOV2[] memory inputs = new IOV2[](1);
+        inputs[0] = IOV2(0x1234567890123456789012345678901234567890, HOLO_VAULT_ID);
+        IOV2[] memory outputs = new IOV2[](1);
+        outputs[0] = IOV2(address(MAINNET_HOT), HOLO_VAULT_ID);
+        OrderV4 memory order = OrderV4(
+            0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6,
+            EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, hex"00ab"),
+            inputs,
+            outputs,
+            CLAIM_ORDER_NONCE
+        );
+        bytes32[] memory words = LibCoupon.words(
+            0x1111111111111111111111111111111111111111,
+            1.5e18,
+            1_750_000_000 + 7 days,
+            keccak256(abi.encode(order)),
+            0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6,
+            address(RAINDEX),
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            bytes32(uint256(8496889498503184870230947373316602526857109467185425766089433217409414560631))
+        );
+        SignedContextV1[] memory signed = new SignedContextV1[](1);
+        signed[0] = signContext(0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a, words);
+        TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
+        orders[0] = TakeOrderConfigV4(order, 0, 0, signed);
+        Float amount = Float.wrap(words[1]);
+
+        bytes memory calldata_ = abi.encodeCall(
+            IRaindexV6.takeOrders4, (TakeOrdersConfigV5(amount, amount, CLAIM_IO_RATIO, true, orders, ""))
+        );
+
+        assertEq(
+            signed[0].signature,
+            hex"f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b"
+        );
+        assertEq(keccak256(calldata_), 0x9c90a13c518aa17629ca92bb5947f54e0fcfb1c0ef65376c17d8ea02e7763522);
     }
 }
