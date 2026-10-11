@@ -5,13 +5,13 @@ import {Script, console2} from "forge-std/Script.sol";
 import {MockHOT} from "src/test/MockHOT.sol";
 
 /// @title DeployTestHOT
-/// @notice Deploys a mock HOT token for testing on Sepolia
+/// @notice Deploys a mock HOT token for testing on Base Sepolia, the TestNet
 /// @dev Run with:
-///   # Sepolia (dry-run):
-///   forge script script/DeployTestHOT.s.sol:DeployTestHOT --rpc-url $SEPOLIA_RPC_URL
+///   # Base Sepolia (dry-run):
+///   forge script script/DeployTestHOT.s.sol:DeployTestHOT --rpc-url $BASE_SEPOLIA_RPC_URL
 ///
-///   # Sepolia (broadcast):
-///   forge script script/DeployTestHOT.s.sol:DeployTestHOT --rpc-url $SEPOLIA_RPC_URL --broadcast --verify
+///   # Base Sepolia (broadcast):
+///   forge script script/DeployTestHOT.s.sol:DeployTestHOT --rpc-url $BASE_SEPOLIA_RPC_URL --broadcast --verify
 contract DeployTestHOT is Script {
     function run() external {
         console2.log("Deploying Mock HOT Token...");
@@ -32,7 +32,7 @@ contract DeployTestHOT is Script {
 /// @notice Mint test tokens to an address
 /// @dev Run with:
 ///   TOKEN_ADDRESS=0x... RECIPIENT=0x... AMOUNT=1000000000000000000000 \
-///   forge script script/DeployTestHOT.s.sol:MintTestHOT --rpc-url $SEPOLIA_RPC_URL --broadcast
+///   forge script script/DeployTestHOT.s.sol:MintTestHOT --rpc-url $BASE_SEPOLIA_RPC_URL --broadcast
 contract MintTestHOT is Script {
     function run() external {
         address tokenAddress = vm.envAddress("TOKEN_ADDRESS");

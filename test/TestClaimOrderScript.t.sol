@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
 import {Test} from "forge-std/Test.sol";
-import {IOrderBookV3, OrderConfigV2} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
+import {IRaindexV6, OrderConfigV4} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {MockHOT} from "src/test/MockHOT.sol";
-import {MockOrderBook} from "src/test/MockOrderBook.sol";
+import {MockRaindex} from "src/test/MockRaindex.sol";
 import {ClaimOrderScript} from "script/ClaimOrderScript.sol";
 
 contract AdminHarness is ClaimOrderScript {
@@ -39,11 +39,11 @@ contract TestClaimOrderScript is Test {
 
     /// A vault whose admin is the broadcaster a test sends as, with `adminCode` at it.
     function vaultAdministeredBy(bytes memory adminCode) internal returns (HoloLockVault vault, bytes[] memory calls) {
-        MockOrderBook orderbook = new MockOrderBook();
-        vault = new HoloLockVault(address(new MockHOT()), address(orderbook), 1, DEFAULT_SENDER, 1);
+        MockRaindex orderbook = new MockRaindex();
+        vault = new HoloLockVault(address(new MockHOT()), address(orderbook), bytes32(uint256(1)), DEFAULT_SENDER, 1);
         vm.etch(DEFAULT_SENDER, adminCode);
-        vm.mockCall(address(orderbook), abi.encodeWithSelector(IOrderBookV3.addOrder.selector), abi.encode(true));
-        OrderConfigV2 memory config;
+        vm.mockCall(address(orderbook), abi.encodeWithSelector(IRaindexV6.addOrder4.selector), abi.encode(true));
+        OrderConfigV4 memory config;
         calls = new bytes[](1);
         calls[0] = abi.encodeCall(HoloLockVault.addOrder, (config));
     }

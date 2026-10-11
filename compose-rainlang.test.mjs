@@ -6,13 +6,13 @@ import { RAINDEX_SUBPARSER, TEST_SIGNER, bindings, compose } from './compose-rai
 
 /** Rain's deterministic address, the same on both networks. */
 const SUBPARSER = {
-	sepolia: RAINDEX_SUBPARSER,
+	'base-sepolia': RAINDEX_SUBPARSER,
 	mainnet: RAINDEX_SUBPARSER
 }
 const SIGNER = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
 const COMPOSER = fileURLToPath(new URL('compose-rainlang.mjs', import.meta.url))
 
-for (const network of ['sepolia', 'mainnet']) {
+for (const network of ['base-sepolia', 'mainnet']) {
 	test(`${network}: binds the subparser and signer it is given`, async () => {
 		const rainlang = await compose({ network, subparser: SUBPARSER[network], signer: SIGNER })
 
@@ -23,10 +23,10 @@ for (const network of ['sepolia', 'mainnet']) {
 	})
 }
 
-test('sepolia takes the test signer', async () => {
+test('base-sepolia takes the test signer', async () => {
 	const rainlang = await compose({
-		network: 'sepolia',
-		subparser: SUBPARSER.sepolia,
+		network: 'base-sepolia',
+		subparser: SUBPARSER['base-sepolia'],
 		signer: TEST_SIGNER
 	})
 
@@ -36,7 +36,7 @@ test('sepolia takes the test signer', async () => {
 test('composes for TestNet when given nothing', async () => {
 	const rainlang = await compose({})
 
-	assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER.sepolia}`))
+	assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER['base-sepolia']}`))
 	assert.match(rainlang, new RegExp(TEST_SIGNER))
 	assert.equal(execFileSync('node', [COMPOSER], { encoding: 'utf8' }).trim(), rainlang.trim())
 })
@@ -62,12 +62,16 @@ test('names every missing or malformed input', () => {
 		() => bindings({ network: 'goerli', subparser: '0x1234', signer: undefined }),
 		{
 			message:
-				'--network must be sepolia or mainnet, not goerli; --subparser must be a nonzero address, not 0x1234; --signer must be a nonzero address, not unset'
+				'--network must be base-sepolia or mainnet, not goerli; --subparser must be a nonzero address, not 0x1234; --signer must be a nonzero address, not unset'
 		}
 	)
 	assert.throws(
 		() =>
-			bindings({ network: 'sepolia', subparser: SUBPARSER.sepolia, signer: `0x${'0'.repeat(40)}` }),
+			bindings({
+				network: 'base-sepolia',
+				subparser: SUBPARSER['base-sepolia'],
+				signer: `0x${'0'.repeat(40)}`
+			}),
 		/--signer must be a nonzero address/
 	)
 })

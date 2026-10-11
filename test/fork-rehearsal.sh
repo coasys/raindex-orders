@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-FORK_URL=${FORK_URL:-https://eth.drpc.org}
+FORK_URL=${FORK_URL:-https://ethereum-rpc.publicnode.com}
 ORCHESTRATOR=${ORCHESTRATOR:-bridge-orchestrator/target/debug/bridge-orchestrator}
 PORT=${REHEARSAL_PORT:-18545}
 fork=http://127.0.0.1:$PORT
@@ -128,8 +128,9 @@ vault=$(record_value MAINNET_LOCK_VAULT_ADDRESS "$work/deploy.log")
 order_hash=$(record_value ORDER_HASH "$work/deploy.log")
 interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/deploy.log")
 store=$(record_value PUBLIC_CLAIM_STORE "$work/deploy.log")
-expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/deploy.log")
-[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $expression ]] ||
+bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/deploy.log")
+input_token=$(record_value PUBLIC_CLAIM_INPUT_TOKEN "$work/deploy.log")
+[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $bytecode && -n $input_token ]] ||
 	fail "the deploy printed no complete deploy record"
 
 proofs() {
@@ -171,7 +172,7 @@ echo "refused: a key the claim order does not accept"
 
 step "Proving the deployed bridge on the fork"
 ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
-	PUBLIC_CLAIM_EXPRESSION=$expression proofs --match-contract EoaRehearsal
+	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token proofs --match-contract EoaRehearsal
 
 safe() {
 	forge script test/rehearsal/RehearsalSafe.s.sol:RehearsalSafe --rpc-url "$fork" --broadcast \
@@ -206,8 +207,7 @@ echo "minLockAmount is $min_lock_amount, set by the admin Safe"
 
 step "Rotating the coupon signer to the signer Safe through rotate-claim-signer.sh"
 rotation=(NETWORK=mainnet ETH_RPC_URL="$fork" MAINNET_LOCK_VAULT_ADDRESS="$vault" ORDER_HASH="$order_hash"
-	PUBLIC_CLAIM_INTERPRETER="$interpreter" PUBLIC_CLAIM_STORE="$store" PUBLIC_CLAIM_EXPRESSION="$expression"
-	VALID_SIGNER="$signer_safe")
+	PUBLIC_CLAIM_BYTECODE="$bytecode" PUBLIC_CLAIM_INPUT_TOKEN="$input_token" VALID_SIGNER="$signer_safe")
 if env "${rotation[@]}" VALID_SIGNER="$test_signer" ./rotate-claim-signer.sh >"$work/refusal.log" 2>&1; then
 	fail "rotate-claim-signer.sh took the test signer on mainnet"
 fi
@@ -255,15 +255,13 @@ mapfile -t rogue < <(safe_calls "$work/rogue.log")
 [[ ${#rogue[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 calls for a second order"
 expect_record_refusal "the vault holds another order" "${rogue[0]}" "${calls[@]}"
 
-real_deployer=0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9
-forwarder=$(forge create test/rehearsal/ForwardingDeployer.sol:ForwardingDeployer --rpc-url "$fork" \
-	--private-key "$deployer_key" --broadcast --constructor-args "$real_deployer" |
-	grep -oE 'Deployed to: 0x[0-9a-fA-F]{40}' | cut -d' ' -f3 || true)
-[[ -n $forwarder ]] || fail "the forwarding deployer was not deployed"
+# The claim order's call names the network's interpreter; one naming another
+# address adds, since the orderbook does not check it, and the record must refuse it.
 padded() { printf '%064s' "$(tr 'A-F' 'a-f' <<<"${1#0x}")" | tr ' ' 0; }
-forwarded=${calls[0]//$(padded "$real_deployer")/$(padded "$forwarder")}
-[[ $forwarded != "${calls[0]}" ]] || fail "the claim order's call names no deployer to replace"
-expect_record_refusal "not deployed by the network's expression deployer" "$forwarded" "${calls[1]}"
+other_interpreter=$(address_of "${keys[3]}")
+misrun=${calls[0]//$(padded "$interpreter")/$(padded "$other_interpreter")}
+[[ $misrun != "${calls[0]}" ]] || fail "the claim order's call names no interpreter to replace"
+expect_record_refusal "not run by the network's interpreter and store" "$misrun" "${calls[1]}"
 
 from_block=$(($(cast block-number --rpc-url "$fork") + 1))
 execute "${calls[@]}"
@@ -275,11 +273,10 @@ grep -qF "is not the claim expression for VALID_SIGNER" "$work/refusal.log" ||
 echo "refused: a record naming a signer the claim order does not accept"
 env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" | tee "$work/rotated.log"
 new_order_hash=$(record_value ORDER_HASH "$work/rotated.log")
-new_interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/rotated.log")
-new_store=$(record_value PUBLIC_CLAIM_STORE "$work/rotated.log")
-new_expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/rotated.log")
-[[ -n $new_order_hash && -n $new_interpreter && -n $new_store && -n $new_expression ]] ||
-	fail "the rotation printed no complete deploy record"
+new_bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/rotated.log")
+[[ -n $new_order_hash && -n $new_bytecode ]] || fail "the rotation printed no complete deploy record"
+[[ $(record_value PUBLIC_CLAIM_INPUT_TOKEN "$work/rotated.log") == "$input_token" ]] ||
+	fail "the new deploy record does not keep the claim input token"
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||
 	fail "the new deploy record does not name the signer Safe"
 
@@ -292,8 +289,8 @@ echo "refused: the orchestrator for a claim order whose signer is a Safe"
 
 step "Proving the Safe admin and the Safe coupon signer on the fork"
 ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash \
-	PUBLIC_CLAIM_INTERPRETER=$new_interpreter PUBLIC_CLAIM_STORE=$new_store \
-	PUBLIC_CLAIM_EXPRESSION=$new_expression \
+	PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
+	PUBLIC_CLAIM_BYTECODE=$new_bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
 	ADMIN_SAFE=$admin_safe SIGNER_SAFE=$signer_safe REHEARSAL_MIN_LOCK_AMOUNT=$min_lock_amount \
 	REHEARSAL_SIGNER_OWNER_KEYS="${signer_owner_keys[1]},${signer_owner_keys[2]}" \
 	REHEARSAL_SIGNER_ONE_OWNER_KEY="${signer_owner_keys[0]}" \

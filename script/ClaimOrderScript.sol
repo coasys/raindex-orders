@@ -1,108 +1,66 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {Vm} from "forge-std/Vm.sol";
-import {IOrderBookV3, OrderConfigV2, OrderV2, IO} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
-import {IParserV1} from "rain.interpreter.interface/interface/IParserV1.sol";
-import {IExpressionDeployerV3} from "rain.interpreter.interface/interface/IExpressionDeployerV3.sol";
-import {EvaluableConfigV3, EvaluableV2} from "rain.interpreter.interface/interface/IInterpreterCallerV2.sol";
-import {LibOrder} from "rain.orderbook/src/lib/LibOrder.sol";
-import {HoloLockVault} from "src/HoloLockVault.sol";
 import {
-    MAINNET_ORDERBOOK,
-    MAINNET_DEPLOYER,
-    MAINNET_SUBPARSER,
-    MAINNET_USDT,
-    SEPOLIA_ORDERBOOK,
-    SEPOLIA_DEPLOYER,
-    SEPOLIA_SUBPARSER,
-    SEPOLIA_NOOP,
+    IRaindexV6,
+    OrderConfigV4,
+    OrderV4,
+    IOV2,
+    EvaluableV4
+} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {HoloLockVault} from "src/HoloLockVault.sol";
+import {ClaimInputToken} from "src/ClaimInputToken.sol";
+import {
+    RAINDEX,
+    RAINDEX_CODEHASH,
+    RAINDEX_SUBPARSER,
+    RAINDEX_SUBPARSER_CODEHASH,
+    RAINLANG_DEPLOYER,
+    RAINLANG_DEPLOYER_HASH,
+    RAINLANG_INTERPRETER,
+    RAINLANG_INTERPRETER_HASH,
+    RAINLANG_STORE,
+    RAINLANG_STORE_HASH,
     TEST_SIGNER_ADDRESS,
-    HOLO_VAULT_ID
+    HOLO_VAULT_ID,
+    CLAIM_ORDER_NONCE
 } from "src/Constants.sol";
-
-interface ExpressionDeployerParts {
-    function iParser() external view returns (IParserV1);
-    function iInterpreter() external view returns (address);
-    function iStore() external view returns (address);
-}
 
 interface SafeThreshold {
     function getThreshold() external view returns (uint256);
 }
 
-/// One network's claim order: where it is added, what parses it, and the input
-/// token it names. The input is a placeholder, as the order's io-ratio is 0.
+/// One network's claim order: its name, chain, and the variable its lock vault
+/// is passed as. Raindex V6 and the Rainlang contracts are at the same address on
+/// every chain, so the network names nothing else. The TestNet is Base Sepolia.
 struct ClaimNetwork {
     string name;
     uint256 chainId;
-    IOrderBookV3 orderbook;
-    IExpressionDeployerV3 deployer;
-    address subparser;
-    address inputToken;
     string vaultVar;
 }
 
 abstract contract ClaimOrderScript is Script {
-    using LibOrder for OrderV2;
-
-    /// Both IOs declare 18 decimals, USDT's 6 included: the website builds the
-    /// order with 18, and the order's hash covers the decimals.
-    uint8 internal constant CLAIM_IO_DECIMALS = 18;
-
-    bytes32 private constant ADD_ORDER = keccak256(
-        "AddOrder(address,address,(address,bool,(address,address,address),(address,uint8,uint256)[],(address,uint8,uint256)[]),bytes32)"
+    bytes32 private constant ADD_ORDER_V3 = keccak256(
+        "AddOrderV3(address,bytes32,(address,(address,address,bytes),(address,bytes32)[],(address,bytes32)[],bytes32))"
     );
 
     function claimNetwork(string memory name) internal pure returns (ClaimNetwork memory) {
         bytes32 key = keccak256(bytes(name));
         if (key == keccak256("mainnet")) {
-            return ClaimNetwork(
-                "mainnet",
-                1,
-                MAINNET_ORDERBOOK,
-                MAINNET_DEPLOYER,
-                MAINNET_SUBPARSER,
-                address(MAINNET_USDT),
-                "MAINNET_LOCK_VAULT_ADDRESS"
-            );
+            return ClaimNetwork("mainnet", 1, "MAINNET_LOCK_VAULT_ADDRESS");
         }
-        if (key == keccak256("sepolia")) {
-            return ClaimNetwork(
-                "sepolia",
-                11155111,
-                SEPOLIA_ORDERBOOK,
-                SEPOLIA_DEPLOYER,
-                SEPOLIA_SUBPARSER,
-                address(SEPOLIA_NOOP),
-                "SEPOLIA_LOCK_VAULT_ADDRESS"
-            );
+        if (key == keccak256("base-sepolia")) {
+            return ClaimNetwork("base-sepolia", 84532, "BASE_SEPOLIA_LOCK_VAULT_ADDRESS");
         }
-        revert(string.concat("NETWORK must be sepolia or mainnet, not ", name));
+        revert(string.concat("NETWORK must be base-sepolia or mainnet, not ", name));
     }
 
-    /// NETWORK's claim order, sepolia when NETWORK is unset.
+    /// NETWORK's claim order, base-sepolia when NETWORK is unset.
     function networkFromEnv() internal view returns (ClaimNetwork memory net) {
-        net = claimNetwork(vm.envOr("NETWORK", string("sepolia")));
+        net = claimNetwork(vm.envOr("NETWORK", string("base-sepolia")));
         requireChain(net);
-    }
-
-    /// `name`, or on sepolia TestNet's value when it is unset. Mainnet has none.
-    function envOrTestnet(ClaimNetwork memory net, string memory name, address testnet)
-        internal
-        view
-        returns (address)
-    {
-        return net.chainId == 11155111 ? vm.envOr(name, testnet) : vm.envAddress(name);
-    }
-
-    function envOrTestnet(ClaimNetwork memory net, string memory name, bytes32 testnet)
-        internal
-        view
-        returns (bytes32)
-    {
-        return net.chainId == 11155111 ? vm.envOr(name, testnet) : vm.envBytes32(name);
     }
 
     function requireChain(ClaimNetwork memory net) internal view {
@@ -116,6 +74,36 @@ abstract contract ClaimOrderScript is Script {
                 " is chain ",
                 vm.toString(net.chainId)
             )
+        );
+    }
+
+    /// The Raindex V6 and Rainlang release src/Constants.sol names must be on the
+    /// chain, byte for byte. Rain deploys each through its deterministic deployer
+    /// to the same address on every chain, on Ethereum mainnet and Base Sepolia
+    /// among them.
+    function requireRainV6() internal view {
+        requireRelease("RaindexV6", address(RAINDEX), RAINDEX_CODEHASH);
+        requireRelease("RaindexV6SubParser", RAINDEX_SUBPARSER, RAINDEX_SUBPARSER_CODEHASH);
+        requireRelease("RainlangExpressionDeployer", address(RAINLANG_DEPLOYER), RAINLANG_DEPLOYER_HASH);
+        requireRelease("RainlangInterpreter", address(RAINLANG_INTERPRETER), RAINLANG_INTERPRETER_HASH);
+        requireRelease("RainlangStore", address(RAINLANG_STORE), RAINLANG_STORE_HASH);
+    }
+
+    function requireRelease(string memory name, address at, bytes32 codehash) private view {
+        require(
+            at.code.length > 0,
+            string.concat(
+                name,
+                " is not deployed at ",
+                vm.toString(at),
+                " on chain ",
+                vm.toString(block.chainid),
+                ": Rain has not deployed this release there (DEPLOY.md)"
+            )
+        );
+        require(
+            at.codehash == codehash,
+            string.concat(name, " at ", vm.toString(at), " is not the release src/Constants.sol names")
         );
     }
 
@@ -145,47 +133,61 @@ abstract contract ClaimOrderScript is Script {
         }
     }
 
-    /// The claim order paying `token` out of HOLO_VAULT_ID, accepting coupons
-    /// from `signer`, composed and parsed before anything is sent.
-    function claimOrderConfig(ClaimNetwork memory net, address token, address signer)
+    /// The claim order paying `token` out of HOLO_VAULT_ID against `inputToken`,
+    /// accepting coupons from `signer`, composed and parsed before anything is
+    /// sent.
+    function claimOrderConfig(ClaimNetwork memory net, address token, address inputToken, address signer)
         internal
-        returns (OrderConfigV2 memory)
+        returns (OrderConfigV4 memory)
     {
-        (bytes memory bytecode, uint256[] memory constants) = parseClaim(net, signer);
-        return OrderConfigV2(
-            claimIO(net.inputToken), claimIO(token), EvaluableConfigV3(net.deployer, bytecode, constants), ""
+        return OrderConfigV4(
+            EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, parseClaim(net, signer)),
+            claimIO(inputToken),
+            claimIO(token),
+            CLAIM_ORDER_NONCE,
+            bytes32(0),
+            ""
         );
     }
 
-    function claimOrder(ClaimNetwork memory net, address vault, address token, EvaluableV2 memory evaluable)
+    function claimOrder(address vault, address token, address inputToken, bytes memory bytecode)
         internal
         pure
-        returns (OrderV2 memory)
+        returns (OrderV4 memory)
     {
-        return OrderV2(vault, true, evaluable, claimIO(net.inputToken), claimIO(token));
+        return OrderV4(
+            vault,
+            EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, bytecode),
+            claimIO(inputToken),
+            claimIO(token),
+            CLAIM_ORDER_NONCE
+        );
     }
 
-    function claimIO(address token) private pure returns (IO[] memory io) {
-        io = new IO[](1);
-        io[0] = IO(token, CLAIM_IO_DECIMALS, HOLO_VAULT_ID);
+    function orderHashOf(OrderV4 memory order) internal pure returns (bytes32) {
+        return keccak256(abi.encode(order));
     }
 
-    function parseClaim(ClaimNetwork memory net, address signer)
-        private
-        returns (bytes memory bytecode, uint256[] memory constants)
-    {
+    function claimIO(address token) private pure returns (IOV2[] memory io) {
+        io = new IOV2[](1);
+        io[0] = IOV2(token, HOLO_VAULT_ID);
+    }
+
+    /// The claim expression for `signer`, composed by compose-rainlang.mjs and
+    /// parsed by the network's expression deployer into the order's bytecode.
+    function parseClaim(ClaimNetwork memory net, address signer) private returns (bytes memory) {
         string[] memory command = new string[](8);
         command[0] = "node";
         command[1] = "compose-rainlang.mjs";
         command[2] = "--network";
         command[3] = net.name;
         command[4] = "--subparser";
-        command[5] = vm.toString(net.subparser);
+        command[5] = vm.toString(RAINDEX_SUBPARSER);
         command[6] = "--signer";
         command[7] = vm.toString(signer);
         Vm.FfiResult memory composed = vm.tryFfi(command);
         require(composed.exitCode == 0, string.concat("compose-rainlang.mjs failed: ", string(composed.stderr)));
-        return ExpressionDeployerParts(address(net.deployer)).iParser().parse(composed.stdout);
+        return RAINLANG_DEPLOYER.parse2(composed.stdout);
     }
 
     /// Sends `calls` to the vault as its admin, each of which must change the
@@ -231,51 +233,52 @@ abstract contract ClaimOrderScript is Script {
 
     /// The claim order `vault` added last from `fromBlock` on, read from the chain
     /// and checked against it: the only order the vault added since that is still on
-    /// the orderbook, paying the vault's token out of HOLO_VAULT_ID, and evaluating,
-    /// through the network's deployer, the claim expression that accepts coupons from
-    /// `signer` and nothing else.
+    /// the orderbook, paying the vault's token out of HOLO_VAULT_ID against a
+    /// ClaimInputToken, run by the network's interpreter and store, and carrying
+    /// the claim expression that accepts coupons from `signer` and nothing else.
     function findClaimOrder(ClaimNetwork memory net, HoloLockVault vault, address signer, uint256 fromBlock)
         internal
-        returns (OrderV2 memory order, bytes32 orderHash)
+        returns (OrderV4 memory order, bytes32 orderHash)
     {
         requireSigner(net, signer);
         bytes32[] memory topics = new bytes32[](1);
-        topics[0] = ADD_ORDER;
-        Vm.EthGetLogs[] memory logs = vm.eth_getLogs(fromBlock, block.number, address(net.orderbook), topics);
+        topics[0] = ADD_ORDER_V3;
+        Vm.EthGetLogs[] memory logs = vm.eth_getLogs(fromBlock, block.number, address(RAINDEX), topics);
         bool found;
-        IExpressionDeployerV3 deployer;
         for (uint256 i = 0; i < logs.length; i++) {
-            (address sender, IExpressionDeployerV3 addedBy, OrderV2 memory added, bytes32 addedHash) =
-                abi.decode(logs[i].data, (address, IExpressionDeployerV3, OrderV2, bytes32));
+            (address sender, bytes32 addedHash, OrderV4 memory added) =
+                abi.decode(logs[i].data, (address, bytes32, OrderV4));
             if (sender != address(vault)) continue;
             if (found) {
                 require(
-                    !net.orderbook.orderExists(orderHash),
+                    !RAINDEX.orderExists(orderHash),
                     string.concat("the vault holds another order added since block ", vm.toString(fromBlock))
                 );
             }
-            (order, orderHash, deployer, found) = (added, addedHash, addedBy, true);
+            (order, orderHash, found) = (added, addedHash, true);
         }
         require(found, string.concat("the vault added no order from block ", vm.toString(fromBlock)));
-        ExpressionDeployerParts parts = ExpressionDeployerParts(address(net.deployer));
         require(
-            address(deployer) == address(net.deployer) && address(order.evaluable.interpreter) == parts.iInterpreter()
-                && address(order.evaluable.store) == parts.iStore(),
-            "the claim order was not deployed by the network's expression deployer"
+            order.evaluable.interpreter == RAINLANG_INTERPRETER && order.evaluable.store == RAINLANG_STORE,
+            "the claim order is not run by the network's interpreter and store"
         );
-        require(order.hash() == orderHash, "the AddOrder event's order does not hash to its order hash");
-        require(net.orderbook.orderExists(orderHash), "the vault's last claim order is no longer on the orderbook");
+        require(orderHashOf(order) == orderHash, "the AddOrderV3 event's order does not hash to its order hash");
+        require(RAINDEX.orderExists(orderHash), "the vault's last claim order is no longer on the orderbook");
         require(
-            claimOrder(net, address(vault), address(vault.token()), order.evaluable).hash() == orderHash,
+            order.validInputs.length == 1 && order.validOutputs.length == 1
+                && orderHashOf(
+                    claimOrder(
+                        address(vault), address(vault.token()), order.validInputs[0].token, order.evaluable.bytecode
+                    )
+                ) == orderHash,
             "the vault's last order is not a claim order paying its token out of HOLO_VAULT_ID"
         );
-
-        // A data contract holds a zero byte, then the expression's constants and
-        // bytecode, each after its length.
-        (bytes memory bytecode, uint256[] memory constants) = parseClaim(net, signer);
-        bytes memory expected = abi.encodePacked(bytes1(0), constants.length, constants, bytecode.length, bytecode);
         require(
-            keccak256(order.evaluable.expression.code) == keccak256(expected),
+            order.validInputs[0].token.codehash == keccak256(type(ClaimInputToken).runtimeCode),
+            "the claim order's input token is not a ClaimInputToken"
+        );
+        require(
+            keccak256(order.evaluable.bytecode) == keccak256(parseClaim(net, signer)),
             "the claim order's expression is not the claim expression for VALID_SIGNER"
         );
     }
@@ -285,26 +288,27 @@ abstract contract ClaimOrderScript is Script {
         ClaimNetwork memory net,
         HoloLockVault vault,
         address signer,
-        OrderV2 memory order,
+        OrderV4 memory order,
         bytes32 orderHash
     ) internal view {
         string memory vaultAddress = vm.toString(address(vault));
         string memory token = vm.toString(order.validOutputs[0].token);
         string memory orderbook = vm.toString(address(vault.orderbook()));
         string memory hash = vm.toString(orderHash);
+        string memory bytecode = vm.toString(order.evaluable.bytecode);
         console2.log("Deploy record");
         console2.log("bridge-orchestrator:");
         console2.log(string.concat("NETWORK=", net.name));
         console2.log(string.concat(net.vaultVar, "=", vaultAddress));
         console2.log(string.concat("TOKEN_ADDRESS=", token));
         console2.log(string.concat("ORDERBOOK_ADDRESS=", orderbook));
-        console2.log(string.concat("VAULT_ID=", vm.toString(bytes32(order.validOutputs[0].vaultId))));
+        console2.log(string.concat("VAULT_ID=", vm.toString(order.validOutputs[0].vaultId)));
         console2.log(string.concat("ORDER_HASH=", hash));
         console2.log(string.concat("ORDER_OWNER=", vm.toString(order.owner)));
         console2.log(string.concat("CLAIM_SIGNER=", vm.toString(signer)));
         console2.log(string.concat("CLAIM_INTERPRETER=", vm.toString(address(order.evaluable.interpreter))));
         console2.log(string.concat("CLAIM_STORE=", vm.toString(address(order.evaluable.store))));
-        console2.log(string.concat("CLAIM_EXPRESSION=", vm.toString(order.evaluable.expression)));
+        console2.log(string.concat("CLAIM_BYTECODE=", bytecode));
         console2.log(string.concat("CLAIM_INPUT_TOKEN=", vm.toString(order.validInputs[0].token)));
         console2.log("website:");
         console2.log(string.concat("PUBLIC_NETWORK=", net.name));
@@ -315,7 +319,7 @@ abstract contract ClaimOrderScript is Script {
         console2.log(string.concat("PUBLIC_CLAIM_SIGNER=", vm.toString(signer)));
         console2.log(string.concat("PUBLIC_CLAIM_INTERPRETER=", vm.toString(address(order.evaluable.interpreter))));
         console2.log(string.concat("PUBLIC_CLAIM_STORE=", vm.toString(address(order.evaluable.store))));
-        console2.log(string.concat("PUBLIC_CLAIM_EXPRESSION=", vm.toString(order.evaluable.expression)));
+        console2.log(string.concat("PUBLIC_CLAIM_BYTECODE=", bytecode));
         console2.log(string.concat("PUBLIC_CLAIM_INPUT_TOKEN=", vm.toString(order.validInputs[0].token)));
     }
 }

@@ -4,7 +4,15 @@ pragma solidity =0.8.25;
 import {Test} from "forge-std/Test.sol";
 import {SignedContextV1} from "rainlang-interface-0.2.9/src/interface/IInterpreterCallerV4.sol";
 import {Float, LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
-import {HOLO_VAULT_ID, RAINDEX, MAINNET_HOT} from "src/Constants.sol";
+import {OrderV4, IOV2, EvaluableV4} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {
+    HOLO_VAULT_ID,
+    RAINDEX,
+    MAINNET_HOT,
+    RAINLANG_INTERPRETER,
+    RAINLANG_STORE,
+    CLAIM_ORDER_NONCE
+} from "src/Constants.sol";
 import {LibCoupon} from "./lib/LibCoupon.sol";
 import {SignContext} from "./lib/SignContext.sol";
 
@@ -68,5 +76,27 @@ contract TestCouponSignature is Test, SignContext {
             coupon.signature,
             hex"452449c0ce920f0e30878832f19e55a7ad3c173dfb7074cef53cc1cc1db54cd43df1a26a92e096b59ba413f28cd2c0c1f4aa6276b56ea14eb612c07fcd76eb191b"
         );
+    }
+}
+
+/// The order hash test vector: a claim order with a two-byte stand-in bytecode,
+/// hashed as Raindex V6 hashes it (keccak256 of abi.encode(OrderV4)).
+/// bridge-orchestrator/src/preflight.rs (`hashes_the_claim_order_as_raindex_does`)
+/// and ui/src/lib/network.test.ts rebuild the same hash.
+contract TestOrderHashVector is Test {
+    function testTheOrderHashOfTheVector() external pure {
+        IOV2[] memory inputs = new IOV2[](1);
+        inputs[0] = IOV2(0x1234567890123456789012345678901234567890, HOLO_VAULT_ID);
+        IOV2[] memory outputs = new IOV2[](1);
+        outputs[0] = IOV2(address(MAINNET_HOT), HOLO_VAULT_ID);
+        OrderV4 memory order = OrderV4(
+            0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6,
+            EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, hex"00ab"),
+            inputs,
+            outputs,
+            CLAIM_ORDER_NONCE
+        );
+
+        assertEq(keccak256(abi.encode(order)), 0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b);
     }
 }

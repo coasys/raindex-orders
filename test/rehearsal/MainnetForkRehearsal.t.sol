@@ -1,29 +1,46 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
 import {Test} from "forge-std/Test.sol";
-import {ECDSA} from "openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol";
-import {OrderV2, IO, TakeOrderConfigV2, TakeOrdersConfigV2} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
-import {EvaluableV2, SignedContextV1} from "rain.interpreter.interface/interface/IInterpreterCallerV2.sol";
-import {IInterpreterV2} from "rain.interpreter.interface/interface/IInterpreterV2.sol";
-import {IInterpreterStoreV2} from "rain.interpreter.interface/interface/IInterpreterStoreV2.sol";
-import {LibOrder} from "rain.orderbook/src/lib/LibOrder.sol";
+import {
+    OrderV4,
+    IOV2,
+    EvaluableV4,
+    TakeOrderConfigV4,
+    TakeOrdersConfigV5,
+    SignedContextV1,
+    Float
+} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {IInterpreterV4} from "rainlang-interface-0.2.9/src/interface/IInterpreterV4.sol";
+import {IInterpreterStoreV3} from "rainlang-interface-0.2.9/src/interface/IInterpreterStoreV3.sol";
+import {LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
-import {MAINNET_ORDERBOOK, MAINNET_HOT, MAINNET_USDT, HOLO_VAULT_ID, MIN_LOCK_AMOUNT} from "src/Constants.sol";
+import {
+    RAINDEX,
+    MAINNET_HOT,
+    HOLO_VAULT_ID,
+    MIN_LOCK_AMOUNT,
+    CLAIM_IO_RATIO,
+    CLAIM_ORDER_NONCE
+} from "src/Constants.sol";
+import {LibCoupon} from "../lib/LibCoupon.sol";
 import {SignContext} from "../lib/SignContext.sol";
 import {ISafe, LibSafe} from "./Safe.sol";
 
 /// Proofs that test/fork-rehearsal.sh runs against its anvil fork of mainnet,
 /// after it has deployed the bridge there. Skipped unless REHEARSAL is set.
 abstract contract ForkRehearsal is Test, SignContext {
-    using LibOrder for OrderV2;
+    using LibDecimalFloat for Float;
 
     event Lock(address indexed sender, uint256 amount, bytes32 indexed holochainAgent, uint256 lockId);
 
     bytes32 internal constant AGENT = keccak256("a Unyt agent");
 
     HoloLockVault internal vault;
-    EvaluableV2 internal evaluable;
+    IInterpreterV4 internal interpreter;
+    IInterpreterStoreV3 internal store;
+    bytes internal bytecode;
+    address internal inputToken;
     bytes32 internal orderHash;
     address internal locker = makeAddr("locker");
     address internal claimer = makeAddr("claimer");
@@ -38,21 +55,26 @@ abstract contract ForkRehearsal is Test, SignContext {
         vm.createSelectFork(vm.envString("REHEARSAL_RPC_URL"));
         vault = HoloLockVault(vm.envAddress("MAINNET_LOCK_VAULT_ADDRESS"));
         orderHash = vm.envBytes32("ORDER_HASH");
-        evaluable = EvaluableV2(
-            IInterpreterV2(vm.envAddress("PUBLIC_CLAIM_INTERPRETER")),
-            IInterpreterStoreV2(vm.envAddress("PUBLIC_CLAIM_STORE")),
-            vm.envAddress("PUBLIC_CLAIM_EXPRESSION")
+        interpreter = IInterpreterV4(vm.envAddress("PUBLIC_CLAIM_INTERPRETER"));
+        store = IInterpreterStoreV3(vm.envAddress("PUBLIC_CLAIM_STORE"));
+        bytecode = vm.envBytes("PUBLIC_CLAIM_BYTECODE");
+        inputToken = vm.envAddress("PUBLIC_CLAIM_INPUT_TOKEN");
+        require(keccak256(abi.encode(order())) == orderHash, "the deploy record does not rebuild ORDER_HASH");
+    }
+
+    function order() internal view returns (OrderV4 memory) {
+        return OrderV4(
+            address(vault),
+            EvaluableV4(interpreter, store, bytecode),
+            claimIO(inputToken),
+            claimIO(address(MAINNET_HOT)),
+            CLAIM_ORDER_NONCE
         );
-        require(order().hash() == orderHash, "the deploy record does not rebuild ORDER_HASH");
     }
 
-    function order() internal view returns (OrderV2 memory) {
-        return OrderV2(address(vault), true, evaluable, claimIO(address(MAINNET_USDT)), claimIO(address(MAINNET_HOT)));
-    }
-
-    function claimIO(address token) private pure returns (IO[] memory io) {
-        io = new IO[](1);
-        io[0] = IO(token, 18, HOLO_VAULT_ID);
+    function claimIO(address token) private pure returns (IOV2[] memory io) {
+        io = new IOV2[](1);
+        io[0] = IOV2(token, HOLO_VAULT_ID);
     }
 
     function fundLocker(uint256 amount) internal {
@@ -70,46 +92,48 @@ abstract contract ForkRehearsal is Test, SignContext {
     /// The nine context words the orchestrator signs for a withdrawal of `amount`
     /// to `claimer`. The nonce is the keccak of a 39-byte action hash, as the
     /// orchestrator's is, though its last 4 bytes are not a real DHT location.
-    function context(uint256 amount, uint256 expiry, uint256 withdrawal) internal view returns (uint256[] memory c) {
-        c = new uint256[](9);
-        c[0] = uint256(uint160(claimer));
-        c[1] = amount;
-        c[2] = expiry;
-        c[3] = uint256(orderHash);
-        c[4] = uint256(uint160(address(vault)));
-        c[5] = uint256(uint160(address(MAINNET_ORDERBOOK)));
-        c[6] = uint256(uint160(address(MAINNET_HOT)));
-        c[7] = HOLO_VAULT_ID;
-        c[8] = uint256(keccak256(abi.encodePacked(hex"842924", bytes32(withdrawal), bytes4(0))));
+    function context(uint256 amount, uint256 expiry, uint256 withdrawal) internal view returns (bytes32[] memory) {
+        return LibCoupon.words(
+            claimer,
+            amount,
+            expiry,
+            orderHash,
+            address(vault),
+            address(RAINDEX),
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            keccak256(abi.encodePacked(hex"842924", bytes32(withdrawal), bytes4(0)))
+        );
     }
 
     function inAWeek() internal view returns (uint256) {
         return block.timestamp + 7 days;
     }
 
+    /// The claim as the website sends it: takeOrders4 for exactly the coupon's amount.
     function claim(SignedContextV1 memory coupon) internal {
         SignedContextV1[] memory signed = new SignedContextV1[](1);
         signed[0] = coupon;
-        TakeOrderConfigV2[] memory orders = new TakeOrderConfigV2[](1);
-        orders[0] = TakeOrderConfigV2(order(), 0, 0, signed);
-        uint256 amount = coupon.context[1];
+        TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
+        orders[0] = TakeOrderConfigV4(order(), 0, 0, signed);
+        Float amount = Float.wrap(coupon.context[1]);
         vm.prank(claimer);
-        MAINNET_ORDERBOOK.takeOrders(TakeOrdersConfigV2(amount, amount, 0, orders, ""));
+        RAINDEX.takeOrders4(TakeOrdersConfigV5(amount, amount, CLAIM_IO_RATIO, true, orders, ""));
     }
 }
 
 /// The bridge as deployed: an EOA admin and an EOA coupon signer.
 contract EoaRehearsal is ForkRehearsal {
-    function signed(uint256[] memory c) private view returns (SignedContextV1 memory) {
+    function signed(bytes32[] memory c) private view returns (SignedContextV1 memory) {
         return signContext(vm.envUint("REHEARSAL_SIGNER_KEY"), c);
     }
 
     function testTheVaultHoldsWhatTheDeployRecordSays() external onFork {
         assertEq(address(vault.token()), address(MAINNET_HOT));
-        assertEq(address(vault.orderbook()), address(MAINNET_ORDERBOOK));
+        assertEq(address(vault.orderbook()), address(RAINDEX));
         assertEq(vault.vaultId(), HOLO_VAULT_ID);
         assertEq(vault.minLockAmount(), MIN_LOCK_AMOUNT);
-        assertTrue(MAINNET_ORDERBOOK.orderExists(orderHash));
+        assertTrue(RAINDEX.orderExists(orderHash));
     }
 
     function testALockLandsInTheVaultAndEmitsLock() external onFork {
@@ -183,10 +207,10 @@ contract EoaRehearsal is ForkRehearsal {
 contract SafeRehearsal is ForkRehearsal {
     error InvalidSignature(uint256 i);
 
-    function safeSigned(uint256[] memory c, string memory ownerKeys) private view returns (SignedContextV1 memory) {
+    function safeSigned(bytes32[] memory c, string memory ownerKeys) private view returns (SignedContextV1 memory) {
         address safe = vm.envAddress("SIGNER_SAFE");
-        bytes32 digest = ECDSA.toEthSignedMessageHash(keccak256(abi.encodePacked(c)));
-        return SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, vm.envUint(ownerKeys, ","), digest));
+        return
+            SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, vm.envUint(ownerKeys, ","), LibCoupon.digest(c)));
     }
 
     function assertTwoOfThree(address safe) private view {
@@ -207,8 +231,8 @@ contract SafeRehearsal is ForkRehearsal {
 
     function testTheRotationReplacedTheClaimOrder() external onFork {
         assertTwoOfThree(vm.envAddress("SIGNER_SAFE"));
-        assertTrue(MAINNET_ORDERBOOK.orderExists(orderHash));
-        assertFalse(MAINNET_ORDERBOOK.orderExists(vm.envBytes32("PREVIOUS_ORDER_HASH")));
+        assertTrue(RAINDEX.orderExists(orderHash));
+        assertFalse(RAINDEX.orderExists(vm.envBytes32("PREVIOUS_ORDER_HASH")));
     }
 
     function testACouponCarryingTwoOwnerSignaturesClaims() external onFork {

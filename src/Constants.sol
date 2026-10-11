@@ -14,19 +14,28 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 // release freezes it in src/generated/<tag>/. The bridge takes the release Rain
 // deployed on Ethereum mainnet: rain.orderbook 0.1.15 (its RaindexV6 and
 // subparser are unchanged since 0.1.14, cut 2026-08-23) and rainlang 0.1.9 (cut
-// 2026-08-25). Moving to another release is one edit per line below. None of
-// these is on Sepolia yet: script/DeployRainV6Suite.s.sol puts them there.
-import {DEPLOYED_ADDRESS as RAINDEX_V6_ADDRESS} from "raindex-0.1.15/src/generated/0_1_15/RaindexV6.sol";
+// 2026-08-25), and the same release on Base Sepolia, the TestNet. Moving to
+// another release is one edit per line below.
 import {
-    DEPLOYED_ADDRESS as RAINDEX_V6_SUBPARSER_ADDRESS
+    DEPLOYED_ADDRESS as RAINDEX_V6_ADDRESS,
+    BYTECODE_HASH as RAINDEX_V6_CODEHASH
+} from "raindex-0.1.15/src/generated/0_1_15/RaindexV6.sol";
+import {
+    DEPLOYED_ADDRESS as RAINDEX_V6_SUBPARSER_ADDRESS,
+    BYTECODE_HASH as RAINDEX_V6_SUBPARSER_CODEHASH
 } from "raindex-0.1.15/src/generated/0_1_15/RaindexV6SubParser.sol";
 import {
-    DEPLOYED_ADDRESS as RAINLANG_DEPLOYER_ADDRESS
+    DEPLOYED_ADDRESS as RAINLANG_DEPLOYER_ADDRESS,
+    BYTECODE_HASH as RAINLANG_DEPLOYER_CODEHASH
 } from "rainlang-0.2.6/src/generated/0_1_9/RainlangExpressionDeployer.sol";
 import {
-    DEPLOYED_ADDRESS as RAINLANG_INTERPRETER_ADDRESS
+    DEPLOYED_ADDRESS as RAINLANG_INTERPRETER_ADDRESS,
+    BYTECODE_HASH as RAINLANG_INTERPRETER_CODEHASH
 } from "rainlang-0.2.6/src/generated/0_1_9/RainlangInterpreter.sol";
-import {DEPLOYED_ADDRESS as RAINLANG_STORE_ADDRESS} from "rainlang-0.2.6/src/generated/0_1_9/RainlangStore.sol";
+import {
+    DEPLOYED_ADDRESS as RAINLANG_STORE_ADDRESS,
+    BYTECODE_HASH as RAINLANG_STORE_CODEHASH
+} from "rainlang-0.2.6/src/generated/0_1_9/RainlangStore.sol";
 
 IRaindexV6 constant RAINDEX = IRaindexV6(RAINDEX_V6_ADDRESS);
 address constant RAINDEX_SUBPARSER = RAINDEX_V6_SUBPARSER_ADDRESS;
@@ -35,12 +44,21 @@ address constant RAINDEX_SUBPARSER = RAINDEX_V6_SUBPARSER_ADDRESS;
 IParserV2 constant RAINLANG_DEPLOYER = IParserV2(RAINLANG_DEPLOYER_ADDRESS);
 IInterpreterV4 constant RAINLANG_INTERPRETER = IInterpreterV4(RAINLANG_INTERPRETER_ADDRESS);
 IInterpreterStoreV3 constant RAINLANG_STORE = IInterpreterStoreV3(RAINLANG_STORE_ADDRESS);
+// Each release file's BYTECODE_HASH is the hash of the code at that address,
+// which the scripts check before they send anything.
+bytes32 constant RAINDEX_CODEHASH = RAINDEX_V6_CODEHASH;
+bytes32 constant RAINDEX_SUBPARSER_CODEHASH = RAINDEX_V6_SUBPARSER_CODEHASH;
+bytes32 constant RAINLANG_DEPLOYER_HASH = RAINLANG_DEPLOYER_CODEHASH;
+bytes32 constant RAINLANG_INTERPRETER_HASH = RAINLANG_INTERPRETER_CODEHASH;
+bytes32 constant RAINLANG_STORE_HASH = RAINLANG_STORE_CODEHASH;
 
 // ========== MAINNET ==========
 IERC20 constant MAINNET_HOT = IERC20(0x6c6EE5e31d828De241282B9606C8e98Ea48526E2);
 
-// ========== SEPOLIA ==========
-IERC20 constant SEPOLIA_TROT = IERC20(0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b);
+// ========== BASE SEPOLIA (the TestNet, chain 84532) ==========
+// Rain deployed the same release on Base Sepolia, at the same addresses. The
+// TestNet's mock HOT, lock vault and claim order are deployed by
+// deploy-base-sepolia.sh and named in its deploy record, not here.
 
 // ========== SHARED ==========
 bytes32 constant TEST_SIGNER_KEY = 0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd;

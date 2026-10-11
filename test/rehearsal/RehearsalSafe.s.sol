@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {ISafe, LibSafe, SAFE_PROXY_FACTORY, SAFE_SINGLETON} from "./Safe.sol";
