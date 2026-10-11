@@ -28,8 +28,21 @@ import {
     CLAIM_ORDER_NONCE
 } from "src/Constants.sol";
 
-interface SafeThreshold {
+/// What a Safe answers about itself.
+interface ISafeView {
     function getThreshold() external view returns (uint256);
+    function getOwners() external view returns (address[] memory);
+}
+
+// The override that lets a mainnet deploy hand the vault to one key.
+string constant SINGLE_KEY_ADMIN_OVERRIDE = "UNSAFE_ALLOW_SINGLE_KEY_ADMIN";
+
+/// What the operator states the vault admin is: whether one key may hold it,
+/// and the threshold and owners of the Safe that does.
+struct AdminInputs {
+    bool singleKeyAllowed;
+    uint256 threshold;
+    address[] owners;
 }
 
 /// One network's claim order: its name, chain, and the variable its lock vault
@@ -134,12 +147,134 @@ abstract contract ClaimOrderScript is Script {
             "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
         );
         if (isContract(signer)) {
-            (bool answered, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));
+            (bool isSafe, uint256 threshold,) = safeOf(signer);
             require(
-                answered && threshold.length == 32 && abi.decode(threshold, (uint256)) >= 2
-                    && abi.decode(threshold, (uint256)) <= 20,
+                isSafe && threshold >= 2 && threshold <= 20,
                 "VALID_SIGNER is a contract but not a Safe whose threshold is 2 to 20"
             );
+        }
+    }
+
+    /// Whether `account` answers as a Safe, and its threshold and owners if so.
+    function safeOf(address account) internal view returns (bool isSafe, uint256 threshold, address[] memory owners) {
+        (bool answered, bytes memory answer) = account.staticcall(abi.encodeCall(ISafeView.getThreshold, ()));
+        if (!answered || answer.length != 32) return (false, 0, owners);
+        threshold = abi.decode(answer, (uint256));
+        (answered, answer) = account.staticcall(abi.encodeCall(ISafeView.getOwners, ()));
+        if (!answered || answer.length < 64) return (false, 0, owners);
+        owners = abi.decode(answer, (address[]));
+        isSafe = threshold >= 1 && owners.length >= threshold;
+    }
+
+    /// The vault admin a mainnet deploy hands the bridge to, from its first
+    /// transaction: a Safe whose threshold is 2 or more, so that no one key
+    /// controls the vault. `given` is what the operator takes the Safe to be, its
+    /// threshold and owners, and must match what it answers, so the vault cannot
+    /// go to a Safe other than the one meant. One key, or a Safe of threshold 1,
+    /// is refused unless the override is set, which is logged.
+    function requireAdmin(address admin, AdminInputs memory given) internal view {
+        require(admin != address(0), "ADMIN_ADDRESS must be a nonzero address");
+        string memory at = vm.toString(admin);
+        if (!isContract(admin)) {
+            require(
+                given.singleKeyAllowed,
+                string.concat(
+                    "ADMIN_ADDRESS ",
+                    at,
+                    " is a key, not a Safe: on mainnet the vault admin is a Safe from the first transaction (docs/enable-multisig.md). To hand the vault to one key regardless, set ",
+                    SINGLE_KEY_ADMIN_OVERRIDE,
+                    "=yes"
+                )
+            );
+            console2.log(
+                string.concat(
+                    SINGLE_KEY_ADMIN_OVERRIDE, "=yes: ADMIN_ADDRESS ", at, " is one key, which alone controls the vault"
+                )
+            );
+            return;
+        }
+        (bool isSafe, uint256 threshold, address[] memory owners) = safeOf(admin);
+        require(isSafe, string.concat("ADMIN_ADDRESS ", at, " is a contract but not a Safe"));
+        string memory shape = string.concat(
+            "a Safe of threshold ", vm.toString(threshold), " with ", vm.toString(owners.length), " owners"
+        );
+        require(
+            threshold >= 2 || given.singleKeyAllowed,
+            string.concat(
+                "ADMIN_ADDRESS ",
+                at,
+                " is ",
+                shape,
+                ", which one key controls. Use a Safe of threshold 2 or more, or set ",
+                SINGLE_KEY_ADMIN_OVERRIDE,
+                "=yes"
+            )
+        );
+        require(
+            given.threshold != 0, "ADMIN_SAFE_THRESHOLD is required: the threshold ADMIN_ADDRESS is expected to have"
+        );
+        require(
+            given.threshold == threshold,
+            string.concat(
+                "ADMIN_ADDRESS ",
+                at,
+                " is ",
+                shape,
+                ", not ADMIN_SAFE_THRESHOLD=",
+                vm.toString(given.threshold),
+                ": is it the Safe meant?"
+            )
+        );
+        require(
+            given.owners.length != 0,
+            "ADMIN_SAFE_OWNERS is required: the owners ADMIN_ADDRESS is expected to have, separated by commas"
+        );
+        require(
+            sameAddresses(given.owners, owners),
+            string.concat(
+                "ADMIN_SAFE_OWNERS does not list the owners of ADMIN_ADDRESS ",
+                at,
+                ", which are ",
+                joined(owners),
+                ": is it the Safe meant?"
+            )
+        );
+        console2.log(string.concat("ADMIN_ADDRESS ", at, " is ", shape, ": ", joined(owners)));
+        if (threshold < 2) {
+            console2.log(string.concat(SINGLE_KEY_ADMIN_OVERRIDE, "=yes: one of those keys alone controls the vault"));
+        }
+    }
+
+    /// The admin inputs as deploy-mainnet.sh passes them: the override, and
+    /// the Safe's expected threshold and owners.
+    function adminInputsFromEnv() internal view returns (AdminInputs memory) {
+        return AdminInputs(
+            keccak256(bytes(vm.envOr(SINGLE_KEY_ADMIN_OVERRIDE, string("")))) == keccak256("yes"),
+            vm.envOr("ADMIN_SAFE_THRESHOLD", uint256(0)),
+            vm.envOr("ADMIN_SAFE_OWNERS", ",", new address[](0))
+        );
+    }
+
+    /// Whether `stated` lists exactly the addresses of `actual`, in any order
+    /// and naming none twice.
+    function sameAddresses(address[] memory stated, address[] memory actual) internal pure returns (bool) {
+        if (stated.length != actual.length) return false;
+        for (uint256 i = 0; i < stated.length; i++) {
+            for (uint256 j = i + 1; j < stated.length; j++) {
+                if (stated[i] == stated[j]) return false;
+            }
+            bool listed;
+            for (uint256 j = 0; j < actual.length && !listed; j++) {
+                listed = stated[i] == actual[j];
+            }
+            if (!listed) return false;
+        }
+        return true;
+    }
+
+    function joined(address[] memory addresses) internal pure returns (string memory list) {
+        for (uint256 i = 0; i < addresses.length; i++) {
+            list = string.concat(list, i == 0 ? "" : ", ", vm.toString(addresses[i]));
         }
     }
 
@@ -151,13 +286,14 @@ abstract contract ClaimOrderScript is Script {
         returns (OrderConfigV4 memory)
     {
         return OrderConfigV4(
-            EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, parseClaim(net, signer)),
-            claimIO(inputToken),
-            claimIO(token),
-            CLAIM_ORDER_NONCE,
-            bytes32(0),
-            ""
+            claimEvaluable(net, signer), claimIO(inputToken), claimIO(token), CLAIM_ORDER_NONCE, bytes32(0), ""
         );
+    }
+
+    /// The claim order's evaluable: the network's interpreter and store, and the
+    /// claim expression accepting coupons from `signer`, parsed.
+    function claimEvaluable(ClaimNetwork memory net, address signer) internal returns (EvaluableV4 memory) {
+        return EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, parseClaim(net, signer));
     }
 
     function claimOrder(address vault, address token, address inputToken, bytes memory bytecode)
