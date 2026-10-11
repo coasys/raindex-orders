@@ -2,6 +2,7 @@ use crate::config::{log_testnet_defaults, with_network_defaults, Network};
 use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
+use alloy::sol_types::SolValue;
 use anyhow::{Context, Result};
 use holo_hash::ActionHash;
 use std::env;
@@ -34,10 +35,17 @@ const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
 const HOT_DECIMALS: u32 = 18;
 
 pub(crate) fn env_variables() -> impl Iterator<Item = &'static str> {
-    CLAIM_ORDER_VARIABLES
-        .into_iter()
-        .chain(["SIGNER_PRIVATE_KEY", "EXPIRY_SECONDS"])
+    CLAIM_ORDER_VARIABLES.into_iter().chain([
+        "SIGNER_PRIVATE_KEY",
+        "SAFE_OWNER_KEYS",
+        "EXPIRY_SECONDS",
+    ])
 }
+
+/// A Safe coupon signer's threshold is at least 2, so that one key alone
+/// signs nothing, and the website reads at most 20 owner signatures.
+const MIN_SAFE_OWNER_KEYS: usize = 2;
+const MAX_SAFE_OWNER_KEYS: usize = 20;
 
 const DEFAULT_EXPIRY_SECONDS: NonZeroU64 = match NonZeroU64::new(604_800) {
     Some(seconds) => seconds,
@@ -76,6 +84,10 @@ pub type Signing<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>
 pub trait CouponKey: Send + Sync {
     fn address(&self) -> Address;
     fn sign<'a>(&'a self, digest: &'a B256) -> Signing<'a>;
+    /// The owners this signs as, when the signer is a Safe. A key has none.
+    fn safe_owners(&self) -> Option<Vec<Address>> {
+        None
+    }
 }
 
 impl CouponKey for PrivateKeySigner {
@@ -93,6 +105,112 @@ impl CouponKey for PrivateKeySigner {
             Ok(bytes)
         })
     }
+}
+
+/// The keys of `threshold` owners of a Safe, signing coupons for it. Raindex
+/// V6 asks the Safe's EIP-1271 `isValidSignature(digest, signature)`, which
+/// its CompatibilityFallbackHandler answers by checking each owner's signature
+/// of the SafeMessage of the digest: the EIP-712 hash, under the Safe's domain
+/// on this chain, of `SafeMessage(bytes message)` with the digest as the
+/// message. The signature is each owner's 65-byte signature of that hash, in
+/// ascending owner order, as the Safe requires.
+///
+/// This holds every key in one process: it is one party signing as the Safe,
+/// however many owners it holds. It is not M-of-N. That needs each owner to
+/// check the withdrawal on Holochain itself before it signs
+/// (docs/signer-service.md).
+#[derive(Debug)]
+pub struct SafeOwners {
+    safe: Address,
+    chain_id: u64,
+    keys: Vec<PrivateKeySigner>,
+}
+
+impl SafeOwners {
+    /// `keys`, sorted by address, for `safe` on chain `chain_id`. Refuses fewer
+    /// than 2 keys, more than 20, or one key twice.
+    pub fn new(safe: Address, chain_id: u64, mut keys: Vec<PrivateKeySigner>) -> Result<Self> {
+        anyhow::ensure!(
+            (MIN_SAFE_OWNER_KEYS..=MAX_SAFE_OWNER_KEYS).contains(&keys.len()),
+            "SAFE_OWNER_KEYS holds {} keys: a Safe coupon signer needs the keys of its threshold of owners, 2 to 20",
+            keys.len()
+        );
+        keys.sort_by_key(Signer::address);
+        if let Some(pair) = keys
+            .windows(2)
+            .find(|pair| Signer::address(&pair[0]) == Signer::address(&pair[1]))
+        {
+            anyhow::bail!(
+                "SAFE_OWNER_KEYS holds the key of {} twice",
+                Signer::address(&pair[0])
+            );
+        }
+        Ok(Self {
+            safe,
+            chain_id,
+            keys,
+        })
+    }
+
+    /// The hash the owners sign: the SafeMessage of `digest`.
+    pub fn message_hash(&self, digest: &B256) -> B256 {
+        safe_message_hash(self.chain_id, self.safe, digest)
+    }
+}
+
+impl CouponKey for SafeOwners {
+    fn address(&self) -> Address {
+        self.safe
+    }
+
+    fn sign<'a>(&'a self, digest: &'a B256) -> Signing<'a> {
+        Box::pin(async move {
+            let hash = self.message_hash(digest);
+            let mut bytes = Vec::with_capacity(65 * self.keys.len());
+            for key in &self.keys {
+                bytes.extend_from_slice(&CouponKey::sign(key, &hash).await?);
+            }
+            Ok(bytes)
+        })
+    }
+
+    fn safe_owners(&self) -> Option<Vec<Address>> {
+        Some(self.keys.iter().map(Signer::address).collect())
+    }
+}
+
+/// A Safe's EIP-712 domain separator, as Safe 1.3.0 and later compute it:
+/// `EIP712Domain(uint256 chainId,address verifyingContract)`.
+pub fn safe_domain_separator(chain_id: u64, safe: Address) -> B256 {
+    keccak256(
+        (
+            keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)"),
+            U256::from(chain_id),
+            safe,
+        )
+            .abi_encode(),
+    )
+}
+
+/// The hash a Safe's CompatibilityFallbackHandler has its owners sign for
+/// `isValidSignature(digest, signature)` to accept: `getMessageHashForSafe(safe,
+/// abi.encode(digest))`.
+pub fn safe_message_hash(chain_id: u64, safe: Address, digest: &B256) -> B256 {
+    let message = keccak256(
+        (
+            keccak256(b"SafeMessage(bytes message)"),
+            keccak256(digest.abi_encode()),
+        )
+            .abi_encode(),
+    );
+    keccak256(
+        [
+            &[0x19, 0x01][..],
+            safe_domain_separator(chain_id, safe).as_slice(),
+            message.as_slice(),
+        ]
+        .concat(),
+    )
 }
 
 pub struct CouponSigner {
@@ -133,25 +251,66 @@ impl CouponSigner {
             },
         };
 
-        let key = match setting("SIGNER_PRIVATE_KEY") {
-            None => {
-                faults.push("SIGNER_PRIVATE_KEY is required".to_string());
+        let key: Option<Box<dyn CouponKey>> = match (
+            setting("SIGNER_PRIVATE_KEY"),
+            setting("SAFE_OWNER_KEYS"),
+            signer,
+        ) {
+            (None, None, _) => {
+                faults.push("SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS when CLAIM_SIGNER is a Safe".to_string());
                 None
             }
-            Some(raw) => match raw.parse::<PrivateKeySigner>() {
-                Ok(key) => Some(key),
+            (Some(_), Some(_), _) => {
+                faults.push("SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set: a key signs with the first, a Safe with the second".to_string());
+                None
+            }
+            (Some(raw), None, _) => match raw.parse::<PrivateKeySigner>() {
+                Ok(key) => {
+                    if network == Network::Mainnet && Signer::address(&key) == TEST_SIGNER {
+                        faults.push(format!(
+                            "SIGNER_PRIVATE_KEY is the test signer {TEST_SIGNER}, whose key is public: mainnet refuses it"
+                        ));
+                    }
+                    Some(Box::new(key))
+                }
                 Err(_) => {
                     faults.push("SIGNER_PRIVATE_KEY is not a secp256k1 private key".to_string());
                     None
                 }
             },
+            (None, Some(raw), signer) => {
+                let keys: std::result::Result<Vec<PrivateKeySigner>, _> = raw
+                    .split(',')
+                    .map(|key| key.trim().parse::<PrivateKeySigner>())
+                    .collect();
+                match keys {
+                    Err(_) => {
+                        faults.push("SAFE_OWNER_KEYS is not a list of secp256k1 private keys separated by commas".to_string());
+                        None
+                    }
+                    Ok(keys) => {
+                        if network == Network::Mainnet
+                            && keys.iter().any(|key| Signer::address(key) == TEST_SIGNER)
+                        {
+                            faults.push(format!(
+                                "SAFE_OWNER_KEYS holds the test signer {TEST_SIGNER}, whose key is public: mainnet refuses it"
+                            ));
+                        }
+                        match SafeOwners::new(
+                            signer.unwrap_or(Address::ZERO),
+                            network.chain_id(),
+                            keys,
+                        ) {
+                            Ok(owners) => Some(Box::new(owners)),
+                            Err(err) => {
+                                faults.push(format!("{err:#}"));
+                                None
+                            }
+                        }
+                    }
+                }
+            }
         };
-        if network == Network::Mainnet && key.as_ref().map(CouponKey::address) == Some(TEST_SIGNER)
-        {
-            faults.push(format!(
-                "SIGNER_PRIVATE_KEY is the test signer {TEST_SIGNER}, whose key is public: mainnet refuses it"
-            ));
-        }
 
         let order = match (
             order_hash,
@@ -192,7 +351,7 @@ impl CouponSigner {
         };
         match (order, expiry_seconds, key) {
             (Some(order), Some(expiry_seconds), Some(key)) if faults.is_empty() => Ok(Self {
-                key: Box::new(key),
+                key,
                 order,
                 expiry_seconds,
             }),
@@ -206,6 +365,12 @@ impl CouponSigner {
 
     pub fn address(&self) -> Address {
         self.key.address()
+    }
+
+    /// The owners the signer signs as when CLAIM_SIGNER is a Safe, and nothing
+    /// when it signs as a key.
+    pub fn safe_owners(&self) -> Option<Vec<Address>> {
+        self.key.safe_owners()
     }
 
     /// The claim coupon for the withdrawal whose transaction ID is `withdrawal`.
@@ -664,11 +829,18 @@ mod tests {
         settings_with(&all)
     }
 
+    const NO_KEY: &str =
+        "SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS when CLAIM_SIGNER is a Safe";
+
     #[test]
     fn mainnet_names_each_unset_signer_variable() {
         for (key, _) in VECTOR_SIGNER_SETTINGS {
             let message = refusal(Network::Mainnet, mainnet_settings_with(&[(key, None)]));
-            assert_eq!(message, format!("{key} is required"));
+            if key == "SIGNER_PRIVATE_KEY" {
+                assert_eq!(message, NO_KEY);
+            } else {
+                assert_eq!(message, format!("{key} is required"));
+            }
         }
     }
 
@@ -686,7 +858,7 @@ mod tests {
         );
         assert_eq!(
             refusal(Network::BaseSepolia, test_settings(&[])),
-            "ORDER_HASH is required; ORDER_OWNER is required; TOKEN_ADDRESS is required; CLAIM_BYTECODE is required; CLAIM_INPUT_TOKEN is required; SIGNER_PRIVATE_KEY is required"
+            format!("ORDER_HASH is required; ORDER_OWNER is required; TOKEN_ADDRESS is required; CLAIM_BYTECODE is required; CLAIM_INPUT_TOKEN is required; {NO_KEY}")
         );
         let given = settings_with(&[
             ("ORDERBOOK_ADDRESS", None),
@@ -731,7 +903,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "ORDER_HASH is required; TOKEN_ADDRESS=hot is not an address; SIGNER_PRIVATE_KEY is required"
+            format!("ORDER_HASH is required; TOKEN_ADDRESS=hot is not an address; {NO_KEY}")
         );
     }
 
@@ -793,6 +965,176 @@ mod tests {
             .recover_address_from_prehash(&context_digest(&probe.context))
             .unwrap();
         assert_eq!(recovered, TEST_SIGNER);
+    }
+
+    /// Anvil's accounts 1, 2 and 3: the owners of the Safe of threshold 2 at
+    /// SAFE on mainnet in test/TestSafeCouponSignature.t.sol.
+    const OWNER_KEYS: [&str; 3] = [
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+        "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+        "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+    ];
+    const SAFE: Address = address!("3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22");
+
+    fn owner_key(i: usize) -> PrivateKeySigner {
+        OWNER_KEYS[i].parse().unwrap()
+    }
+
+    /// The vector test/TestSafeCouponSignature.t.sol pins against the Safe 1.4.1
+    /// contracts on a fork of mainnet: the hash the Safe's fallback handler has
+    /// the owners sign for the coupon vector's digest.
+    #[test]
+    fn the_safe_message_hash_is_what_the_fallback_handler_computes() {
+        let digest: B256 = "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            safe_message_hash(1, SAFE, &digest),
+            "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+                .parse::<B256>()
+                .unwrap()
+        );
+        assert_ne!(
+            safe_message_hash(84_532, SAFE, &digest),
+            safe_message_hash(1, SAFE, &digest)
+        );
+    }
+
+    /// A Safe-signed coupon names the Safe, and carries each owner's 65-byte
+    /// signature of the SafeMessage hash in ascending owner order, whatever
+    /// order the keys were given in.
+    #[tokio::test]
+    async fn owners_sign_the_safe_message_hash_in_ascending_owner_order() {
+        let owners = SafeOwners::new(SAFE, 1, vec![owner_key(2), owner_key(0)]).unwrap();
+        let signer = CouponSigner::with_key(owners);
+        let withdrawal = ActionHash::from_raw_32(vec![7; 32]);
+
+        let coupon = coupon(&signer, &withdrawal, NOW).await;
+        let fields: Vec<&str> = coupon.split(',').collect();
+        let context: Vec<B256> = fields[2..]
+            .iter()
+            .map(|f| B256::from(f.parse::<U256>().unwrap()))
+            .collect();
+        let signature = hex::decode(&fields[1][2..]).unwrap();
+        let hash = safe_message_hash(1, SAFE, &context_digest(&context));
+
+        assert_eq!(fields[0], format!("{SAFE:?}"));
+        assert_eq!(signature.len(), 130);
+        let recovered: Vec<Address> = signature
+            .chunks(65)
+            .map(|part| {
+                alloy::primitives::PrimitiveSignature::try_from(part)
+                    .unwrap()
+                    .recover_address_from_prehash(&hash)
+                    .unwrap()
+            })
+            .collect();
+        let mut expected = vec![owner_key(0).address(), owner_key(2).address()];
+        expected.sort();
+        assert_eq!(recovered, expected);
+        assert_eq!(
+            signer.safe_owners().unwrap(),
+            expected,
+            "the owners, sorted"
+        );
+    }
+
+    #[test]
+    fn safe_owner_keys_are_two_to_twenty_and_none_twice() {
+        let refused = |keys: Vec<PrivateKeySigner>| {
+            format!("{:#}", SafeOwners::new(SAFE, 1, keys).unwrap_err())
+        };
+
+        assert_eq!(
+            refused(vec![owner_key(0)]),
+            "SAFE_OWNER_KEYS holds 1 keys: a Safe coupon signer needs the keys of its threshold of owners, 2 to 20"
+        );
+        assert_eq!(
+            refused((0..21).map(|_| PrivateKeySigner::random()).collect()),
+            "SAFE_OWNER_KEYS holds 21 keys: a Safe coupon signer needs the keys of its threshold of owners, 2 to 20"
+        );
+        assert_eq!(
+            refused(vec![owner_key(0), owner_key(1), owner_key(0)]),
+            format!(
+                "SAFE_OWNER_KEYS holds the key of {} twice",
+                owner_key(0).address()
+            )
+        );
+        assert!(SafeOwners::new(SAFE, 1, vec![owner_key(0), owner_key(1)]).is_ok());
+    }
+
+    /// The vector's settings with the Safe as CLAIM_SIGNER and `keys` as
+    /// SAFE_OWNER_KEYS, and no SIGNER_PRIVATE_KEY.
+    fn safe_settings(keys: &str) -> impl Fn(&str) -> Option<String> {
+        let keys = keys.to_string();
+        let safe = format!("{SAFE:?}");
+        move |key| match key {
+            "SIGNER_PRIVATE_KEY" => None,
+            "SAFE_OWNER_KEYS" => Some(keys.clone()),
+            "CLAIM_SIGNER" => Some(safe.clone()),
+            other => settings_with(&[])(other),
+        }
+    }
+
+    #[test]
+    fn safe_owner_keys_sign_for_claim_signer_as_a_safe() {
+        let two = format!("{}, {}", OWNER_KEYS[1], OWNER_KEYS[0]);
+        let signer = CouponSigner::from_settings(Network::Mainnet, safe_settings(&two)).unwrap();
+
+        assert_eq!(signer.address(), SAFE);
+        assert_eq!(signer.order().signer, SAFE);
+        let mut expected = vec![owner_key(0).address(), owner_key(1).address()];
+        expected.sort();
+        assert_eq!(signer.safe_owners().unwrap(), expected);
+    }
+
+    #[test]
+    fn each_fault_in_the_safe_owner_keys_is_named() {
+        let refused = |network, keys: &str| refusal(network, safe_settings(keys));
+
+        assert_eq!(
+            refused(Network::Mainnet, "0xZZ,0x01"),
+            "SAFE_OWNER_KEYS is not a list of secp256k1 private keys separated by commas"
+        );
+        assert_eq!(
+            refused(Network::Mainnet, OWNER_KEYS[0]),
+            "SAFE_OWNER_KEYS holds 1 keys: a Safe coupon signer needs the keys of its threshold of owners, 2 to 20"
+        );
+        assert_eq!(
+            refused(
+                Network::Mainnet,
+                &format!("{},{}", OWNER_KEYS[0], OWNER_KEYS[0])
+            ),
+            format!(
+                "SAFE_OWNER_KEYS holds the key of {} twice",
+                owner_key(0).address()
+            )
+        );
+        assert_eq!(
+            refused(
+                Network::Mainnet,
+                &format!("{},{}", OWNER_KEYS[0], TEST_SIGNER_KEY)
+            ),
+            format!(
+                "SAFE_OWNER_KEYS holds the test signer {TEST_SIGNER}, whose key is public: mainnet refuses it"
+            )
+        );
+        assert!(CouponSigner::from_settings(
+            Network::BaseSepolia,
+            safe_settings(&format!("{},{}", OWNER_KEYS[0], TEST_SIGNER_KEY))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_key_and_safe_owner_keys_together_are_refused() {
+        let both = settings_with(&[("SAFE_OWNER_KEYS", Some(OWNER_KEYS[0]))]);
+
+        assert_eq!(
+            refusal(Network::BaseSepolia, both),
+            "SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set: a key signs with the first, a Safe with the second"
+        );
     }
 
     #[test]

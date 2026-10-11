@@ -85,6 +85,16 @@ library LibSafe {
         return sign(vm, ownerKeys, SAFE_FALLBACK_HANDLER.getMessageHashForSafe(safe, abi.encode(digest)));
     }
 
+    /// The SafeMessage hash of `digest` for `safe` on `chainId`, computed as
+    /// Safe 1.3.0 and later do, and as bridge-orchestrator/src/signer.rs does
+    /// offline: `getMessageHashForSafe(safe, abi.encode(digest))`.
+    function messageHash(uint256 chainId, address safe, bytes32 digest) internal pure returns (bytes32) {
+        bytes32 domain =
+            keccak256(abi.encode(keccak256("EIP712Domain(uint256 chainId,address verifyingContract)"), chainId, safe));
+        bytes32 message = keccak256(abi.encode(keccak256("SafeMessage(bytes message)"), keccak256(abi.encode(digest))));
+        return keccak256(abi.encodePacked(bytes1(0x19), bytes1(0x01), domain, message));
+    }
+
     /// Each owner's 65-byte signature of `hash`, in ascending owner order as Safe
     /// requires.
     function sign(Vm vm, uint256[] memory ownerKeys, bytes32 hash) internal pure returns (bytes memory signatures) {

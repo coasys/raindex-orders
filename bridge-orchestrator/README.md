@@ -32,14 +32,22 @@ refuses to start, naming each variable at fault, when:
 - the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
   `CLAIM_*` values describe does not hash to `ORDER_HASH`
 - `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
-- `CLAIM_SIGNER` is a contract, such as a Safe: the orchestrator signs only as
-  a key
+- `SIGNER_PRIVATE_KEY` and `SAFE_OWNER_KEYS` are both set, or neither
+- `CLAIM_SIGNER` is a contract, such as a Safe, and `SIGNER_PRIVATE_KEY` is
+  set: a key cannot sign for it
+- `CLAIM_SIGNER` is a key and `SAFE_OWNER_KEYS` is set
 - `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
-- the claim order does not accept a coupon signed with that key. `run`
-  simulates `takeOrders4` with a one-wei coupon to itself, and starts only if
-  the order pays it, or answers `MinimumIO` because its vault is empty.
-- on `mainnet`, `SIGNER_PRIVATE_KEY` is the test signer
-  `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+- `CLAIM_SIGNER` is a Safe and `SAFE_OWNER_KEYS` does not hold as many keys as
+  its threshold, holds a key that is not one of its owners, or holds one
+  twice; or `CLAIM_SIGNER` does not answer as a Safe, or does not sign under
+  the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s chain
+- the claim order does not accept a coupon signed with that key, or by those
+  owners for the Safe. `run` simulates `takeOrders4` with a one-wei coupon to
+  the signer, and starts only if the order pays it, or answers `MinimumIO`
+  because its vault is empty. For a Safe, that simulation runs the Safe's own
+  `isValidSignature` over the owners' signatures.
+- on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
+  signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
 its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
@@ -338,13 +346,14 @@ rest is required on `base-sepolia` as on `mainnet`.
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
-| `SIGNER_PRIVATE_KEY` | Yes | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`) |
+| `SIGNER_PRIVATE_KEY` | One of the two | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
+| `SAFE_OWNER_KEYS` | One of the two | -- The keys of as many owners of `CLAIM_SIGNER` as its threshold, separated by commas, when it is a Safe. The orchestrator signs each coupon as all of them: it is one party, however many keys it holds ([docs/signer-service.md](../docs/signer-service.md)) |
 | `ORDER_HASH` | Yes | -- |
 | `ORDER_OWNER` | Yes | -- (the vault) |
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |
 | `TOKEN_ADDRESS` | Yes | -- (the mock HOT deploy-base-sepolia.sh deployed) |
 | `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
-| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address) |
+| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address, or the Safe) |
 | `CLAIM_INTERPRETER` | mainnet | `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_STORE` | mainnet | `0x1Aa775533E28B1D843e1A589034984E3a62005DC` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_BYTECODE` | Yes | -- (the claim order's parsed expression, as hex; a V6 order carries its bytecode in place of an expression address) |
