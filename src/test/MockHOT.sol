@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
-import {MockERC20} from "forge-std/mocks/MockERC20.sol";
+import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 
 /// @title MockHOT
 /// @notice A mock HOT token for testing the HoloLockVault
 /// @dev Exposes mint function for test purposes
-contract MockHOT is MockERC20 {
-    constructor() {
-        initialize("Mock HOT Token", "HOT", 18);
-    }
+contract MockHOT is ERC20 {
+    constructor() ERC20("Mock HOT Token", "HOT") {}
 
     /// @notice Mint tokens to an address (for testing only)
     /// @param to The recipient address

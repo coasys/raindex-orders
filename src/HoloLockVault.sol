@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IOrderBookV3, OrderConfigV2, OrderV2} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
+import {IRaindexV6, OrderConfigV4, OrderV4, TaskV2, Float} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
 
 /// @title HoloLockVault
 /// @notice A wrapper contract that accepts HOT token deposits and forwards them
-/// to a Raindex orderbook vault. Emits events with Holochain agent public keys
+/// to a Raindex V6 vault. Emits events with Holochain agent public keys
 /// to enable cross-chain bridging to HoloFuel.
 ///
 /// This contract is the LOCK side of the HOT <> HoloFuel swap:
 /// - LOCK: User sends HOT -> receives HoloFuel (this contract)
 /// - UNLOCK: User burns HoloFuel -> receives HOT (via claim coupons)
+///
+/// Raindex V6 counts every amount as a decimal float. This contract takes and
+/// reports amounts in the token's own units (wei for HOT), and converts each one
+/// losslessly, refusing an amount a float cannot carry.
 contract HoloLockVault {
     using SafeERC20 for IERC20;
+    using LibDecimalFloat for Float;
 
     /// @notice Emitted when HOT is locked for HoloFuel redemption
     /// @param sender The Ethereum address that locked HOT
@@ -34,6 +41,9 @@ contract HoloLockVault {
     /// @param newAdmin The new admin address
     event AdminChanged(address indexed oldAdmin, address indexed newAdmin);
 
+    /// The largest amount a float carries losslessly: its coefficient is an int224.
+    uint256 internal constant MAX_FLOAT_AMOUNT = uint256(uint224(type(int224).max));
+
     // Storage layout is append-only. This contract is deployed and holds user funds, so
     // a new variable goes after the last one below: nothing already here is reordered,
     // retyped or removed. The live contract keeps reading the same slots, and shifting
@@ -43,11 +53,14 @@ contract HoloLockVault {
     /// @notice The token being locked (HOT on mainnet)
     IERC20 public immutable token;
 
-    /// @notice The Raindex orderbook contract
-    IOrderBookV3 public immutable orderbook;
+    /// @notice The token's decimals, which every float conversion uses
+    uint8 public immutable tokenDecimals;
+
+    /// @notice The Raindex V6 orderbook contract
+    IRaindexV6 public immutable orderbook;
 
     /// @notice The vault ID used in the orderbook for this contract's deposits
-    uint256 public immutable vaultId;
+    bytes32 public immutable vaultId;
 
     /// @notice Running counter for unique lock IDs
     uint256 public lockNonce;
@@ -66,24 +79,26 @@ contract HoloLockVault {
 
     /// @notice Initialize the lock vault
     /// @param _token The ERC20 token to accept (HOT)
-    /// @param _orderbook The Raindex orderbook address
+    /// @param _orderbook The Raindex V6 address
     /// @param _vaultId The vault ID to deposit into
     /// @param _admin The admin address for emergency functions
     /// @param _minLockAmount Minimum amount that can be locked
-    constructor(address _token, address _orderbook, uint256 _vaultId, address _admin, uint256 _minLockAmount) {
+    constructor(address _token, address _orderbook, bytes32 _vaultId, address _admin, uint256 _minLockAmount) {
         require(_token != address(0), "HoloLockVault: zero token address");
         require(_orderbook != address(0), "HoloLockVault: zero orderbook address");
+        require(_vaultId != bytes32(0), "HoloLockVault: zero vault id");
         require(_admin != address(0), "HoloLockVault: zero admin address");
 
         token = IERC20(_token);
-        orderbook = IOrderBookV3(_orderbook);
+        tokenDecimals = IERC20Metadata(_token).decimals();
+        orderbook = IRaindexV6(_orderbook);
         vaultId = _vaultId;
         admin = _admin;
         minLockAmount = _minLockAmount;
 
         // Approve orderbook to spend our tokens for deposits
         // Using max approval since we trust the orderbook contract
-        IERC20(_token).safeApprove(_orderbook, type(uint256).max);
+        IERC20(_token).forceApprove(_orderbook, type(uint256).max);
     }
 
     /// @notice Lock tokens to receive HoloFuel on Holochain
@@ -99,7 +114,7 @@ contract HoloLockVault {
         token.safeTransferFrom(msg.sender, address(this), amount);
 
         // Deposit into orderbook vault (this contract owns the vault)
-        orderbook.deposit(address(token), vaultId, amount);
+        orderbook.deposit4(address(token), vaultId, toFloat(amount), new TaskV2[](0));
 
         // Generate unique lock ID and emit event
         lockId = lockNonce++;
@@ -107,9 +122,11 @@ contract HoloLockVault {
     }
 
     /// @notice Get the current vault balance in the orderbook
+    /// @dev Rounded down to the token's units, should a claim ever leave a
+    /// fraction of one in the vault
     /// @return balance The amount of tokens in the orderbook vault
     function vaultBalance() external view returns (uint256 balance) {
-        return orderbook.vaultBalance(address(this), address(token), vaultId);
+        (balance,) = orderbook.vaultBalance2(address(this), address(token), vaultId).toFixedDecimalLossy(tokenDecimals);
     }
 
     /// @notice Admin function for emergency withdrawal from orderbook vault
@@ -121,7 +138,7 @@ contract HoloLockVault {
         require(amount > 0, "HoloLockVault: zero amount");
 
         // Withdraw from orderbook vault
-        orderbook.withdraw(address(token), vaultId, amount);
+        orderbook.withdraw4(address(token), vaultId, toFloat(amount), new TaskV2[](0));
 
         // Transfer to recipient
         token.safeTransfer(to, amount);
@@ -163,14 +180,22 @@ contract HoloLockVault {
     /// @dev This makes HoloLockVault the order owner, so claim outputs come from its vault
     /// @param config The order configuration
     /// @return stateChanged True if the order was added
-    function addOrder(OrderConfigV2 calldata config) external onlyAdmin returns (bool stateChanged) {
-        return orderbook.addOrder(config);
+    function addOrder(OrderConfigV4 calldata config) external onlyAdmin returns (bool stateChanged) {
+        return orderbook.addOrder4(config, new TaskV2[](0));
     }
 
     /// @notice Admin function to remove an order from the orderbook
     /// @param order The order to remove
     /// @return stateChanged True if the order was removed
-    function removeOrder(OrderV2 calldata order) external onlyAdmin returns (bool stateChanged) {
-        return orderbook.removeOrder(order);
+    function removeOrder(OrderV4 calldata order) external onlyAdmin returns (bool stateChanged) {
+        return orderbook.removeOrder3(order, new TaskV2[](0));
+    }
+
+    /// `amount` of the token as the float Raindex counts it: the amount in the
+    /// token's units as the coefficient, and minus its decimals as the exponent,
+    /// so converting back loses nothing.
+    function toFloat(uint256 amount) internal view returns (Float) {
+        require(amount <= MAX_FLOAT_AMOUNT, "HoloLockVault: amount too large for a float");
+        return LibDecimalFloat.fromFixedDecimalLosslessPacked(amount, tokenDecimals);
     }
 }

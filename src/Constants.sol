@@ -1,36 +1,64 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
-import {IOrderBookV3} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
-import {IExpressionDeployerV3} from "rain.interpreter.interface/interface/IExpressionDeployerV3.sol";
+import {IRaindexV6} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {IParserV2} from "rainlang-interface-0.2.9/src/interface/IParserV2.sol";
+import {IInterpreterV4} from "rainlang-interface-0.2.9/src/interface/IInterpreterV4.sol";
+import {IInterpreterStoreV3} from "rainlang-interface-0.2.9/src/interface/IInterpreterStoreV3.sol";
+import {Float} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
+// ========== RAIN, AS DEPLOYED ==========
+// Rain deploys each release through the Zoltu deterministic deployer, so a
+// contract has the same address on every chain it is deployed to, and the
+// release freezes it in src/generated/<tag>/. The bridge takes the release Rain
+// deployed on Ethereum mainnet: rain.orderbook 0.1.15 (its RaindexV6 and
+// subparser are unchanged since 0.1.14, cut 2026-08-23) and rainlang 0.1.9 (cut
+// 2026-08-25). Moving to another release is one edit per line below. None of
+// these is on Sepolia yet: script/DeployRainV6Suite.s.sol puts them there.
+import {DEPLOYED_ADDRESS as RAINDEX_V6_ADDRESS} from "raindex-0.1.15/src/generated/0_1_15/RaindexV6.sol";
+import {
+    DEPLOYED_ADDRESS as RAINDEX_V6_SUBPARSER_ADDRESS
+} from "raindex-0.1.15/src/generated/0_1_15/RaindexV6SubParser.sol";
+import {
+    DEPLOYED_ADDRESS as RAINLANG_DEPLOYER_ADDRESS
+} from "rainlang-0.2.6/src/generated/0_1_9/RainlangExpressionDeployer.sol";
+import {
+    DEPLOYED_ADDRESS as RAINLANG_INTERPRETER_ADDRESS
+} from "rainlang-0.2.6/src/generated/0_1_9/RainlangInterpreter.sol";
+import {DEPLOYED_ADDRESS as RAINLANG_STORE_ADDRESS} from "rainlang-0.2.6/src/generated/0_1_9/RainlangStore.sol";
+
+IRaindexV6 constant RAINDEX = IRaindexV6(RAINDEX_V6_ADDRESS);
+address constant RAINDEX_SUBPARSER = RAINDEX_V6_SUBPARSER_ADDRESS;
+// The expression deployer parses the claim expression (`parse2`) into the
+// bytecode the order carries.
+IParserV2 constant RAINLANG_DEPLOYER = IParserV2(RAINLANG_DEPLOYER_ADDRESS);
+IInterpreterV4 constant RAINLANG_INTERPRETER = IInterpreterV4(RAINLANG_INTERPRETER_ADDRESS);
+IInterpreterStoreV3 constant RAINLANG_STORE = IInterpreterStoreV3(RAINLANG_STORE_ADDRESS);
+
 // ========== MAINNET ==========
-IOrderBookV3 constant MAINNET_ORDERBOOK = IOrderBookV3(0xf1224A483ad7F1E9aA46A8CE41229F32d7549A74);
-IExpressionDeployerV3 constant MAINNET_DEPLOYER = IExpressionDeployerV3(0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9);
 IERC20 constant MAINNET_HOT = IERC20(0x6c6EE5e31d828De241282B9606C8e98Ea48526E2);
-IERC20 constant MAINNET_USDT = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
-address constant MAINNET_SUBPARSER = 0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326;
 
 // ========== SEPOLIA ==========
-IOrderBookV3 constant SEPOLIA_ORDERBOOK = IOrderBookV3(0xfca89cD12Ba1346b1ac570ed988AB43b812733fe);
-IExpressionDeployerV3 constant SEPOLIA_DEPLOYER = IExpressionDeployerV3(0xd19581a021f4704ad4eBfF68258e7A0a9DB1CD77);
 IERC20 constant SEPOLIA_TROT = IERC20(0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b);
-IERC20 constant SEPOLIA_NOOP = IERC20(0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028);
-address constant SEPOLIA_SUBPARSER = 0xe6A589716d5a72276C08E0e08bc941a28005e55A;
-// The TestNet bridge as deployed, which a sepolia script takes for any value it is not given.
-address constant SEPOLIA_LOCK_VAULT = 0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6;
-bytes32 constant SEPOLIA_CLAIM_ORDER_HASH = 0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9;
-address constant SEPOLIA_CLAIM_INTERPRETER = 0x8853D126bC23A45B9f807739B6EA0B38eF569005;
-address constant SEPOLIA_CLAIM_STORE = 0x23F77e7Bc935503e437166498D7D72f2Ea290E1f;
-address constant SEPOLIA_CLAIM_EXPRESSION = 0x0a1369aee76570Cc7404492d55a5D1468D5A9b4B;
 
 // ========== SHARED ==========
 bytes32 constant TEST_SIGNER_KEY = 0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd;
 address constant TEST_SIGNER_ADDRESS = 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37;
 
 // Vault ID used by the HoloLockVault
-uint256 constant HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b;
+bytes32 constant HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b;
 
 // Minimum lock amount (1 token with 18 decimals)
 uint256 constant MIN_LOCK_AMOUNT = 1e18;
+
+// The claim order's io-ratio, `1e-30` in src/holo-claim.rain, as the Float the
+// parser makes of it: coefficient 1, exponent -30. Raindex V6 takes an order
+// only at a positive ratio, and pulls at least one unit of the input token for
+// it, so the input token is a ClaimInputToken that moves nothing. A claim passes
+// this as its maximum ratio.
+Float constant CLAIM_IO_RATIO =
+    Float.wrap(bytes32(uint256(0xffffffe200000000000000000000000000000000000000000000000000000001)));
+
+// The claim order's nonce: one claim order per signer list and threshold.
+bytes32 constant CLAIM_ORDER_NONCE = bytes32(0);

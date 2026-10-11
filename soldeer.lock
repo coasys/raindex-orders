@@ -1,0 +1,50 @@
+version = 2
+
+[[dependencies]]
+name = "@openzeppelin-contracts"
+version = "5.6.1"
+url = "https://soldeer-revisions.s3.amazonaws.com/@openzeppelin-contracts/5_6_1_15-03-2026_09:19:50_contracts.zip"
+checksum = "a3b6bc661be858c7c27f60a1708cbebe8c71034b4cc1e9fe270d0a05b069352f"
+integrity = "bce03af7ada1eee21a7fff393f238bcd7cd75a022a4db55ffb6b0dbb32433d35"
+
+[[dependencies]]
+name = "forge-std"
+version = "1.16.2"
+url = "https://soldeer-revisions.s3.amazonaws.com/forge-std/1_16_2_03-07-2026_07:37:45_forge-std-1.16.zip"
+checksum = "405dccc9d60d753f6abc412b4adf0359f4390f65dbadbbb277a12b4946ed8969"
+integrity = "5fb4325b60d7d4194bd0481e2f94398cf1d9c6561dd12a66fb2748ef4a68205f"
+
+[[dependencies]]
+name = "rain-math-float"
+version = "0.2.1"
+url = "https://soldeer-revisions.s3.amazonaws.com/rain-math-float/0_2_1_08-09-2026_07:26:32_rain.math.zip"
+checksum = "d9433a80d1a546b73e80ba3ccda6e2a88e2986222522a6526173a1a0d5d13bef"
+integrity = "c24a336446be885b680026d4e7d937e6d4559997a2cb0ee385f4c9be95990d77"
+
+[[dependencies]]
+name = "raindex"
+version = "0.1.15"
+url = "https://soldeer-revisions.s3.amazonaws.com/raindex/0_1_15_25-08-2026_05:47:07_raindex.zip"
+checksum = "8b9e10ba744ffade62e3e9ae651f5bb5ab0a8a7c1a447ff48e59c08d68a5a314"
+integrity = "1b8c573c6454c004fb4850d763ba3fbadb97c261af82925aa42d0ec63f027dcb"
+
+[[dependencies]]
+name = "raindex-interface"
+version = "0.1.7"
+url = "https://soldeer-revisions.s3.amazonaws.com/raindex-interface/0_1_7_14-09-2026_14:23:44_raindex.zip"
+checksum = "2d0ea20553ce2501a64f1206fc02bfdea054506834b7e022fe7749121c9848ec"
+integrity = "c6a4727d07a940b550be4c69662611859ea14d37c3337603b699caedcdd1b12b"
+
+[[dependencies]]
+name = "rainlang"
+version = "0.2.6"
+url = "https://soldeer-revisions.s3.amazonaws.com/rainlang/0_2_6_14-09-2026_12:37:13_rainlang.zip"
+checksum = "7746995b3d636a4200c015364bcd7d904444b952ce5d2aa3787551330ce61955"
+integrity = "12abcc719f018dc46a1ef7f973e685687bd17c804c90cfcc39bcb4c2f930843b"
+
+[[dependencies]]
+name = "rainlang-interface"
+version = "0.2.9"
+url = "https://soldeer-revisions.s3.amazonaws.com/rainlang-interface/0_2_9_13-09-2026_19:05:27_rainlang.zip"
+checksum = "a5f47c60fe86ba2e7183bcb30c4bac4c86e2c9b5bad1544f3bc04c98cf282d95"
+integrity = "f4e56272672f10c3988b1bd354909f4b08f06a62ca46f4a566234020226f7d6b"
