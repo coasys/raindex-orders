@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- bridge-orchestrator reconnects after its lair keystore restarts.
 - bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, for deposits it records from this release on.
 - bridge-orchestrator marks a deposit bridged only once a RAVE has consumed its link: a deposit whose link the template refused waits, and one whose link it redacted is failed for a person.
 - bridge-orchestrator counts a deposit proof only on a link its bridging agent signed, so a copy in another agent's spend neither marks a deposit bridged nor holds deposits back.
