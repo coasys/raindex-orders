@@ -260,7 +260,9 @@ expect_record_refusal() {
 
 expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
 	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$(address_of "${keys[2]}")" ./deploy-mainnet.sh "${wallet[@]}"
-env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log" ||
+# A V6 order is its bytecode, so the same signer gives the same order, which the
+# orderbook already holds: the second order is for another signer.
+env "${rotation[@]}" VALID_SIGNER="$(address_of "$other_signer_key")" ./rotate-claim-signer.sh >"$work/rogue.log" ||
 	fail "rotate-claim-signer.sh did not print the calls for a second order"
 mapfile -t rogue < <(safe_calls "$work/rogue.log")
 [[ ${#rogue[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 calls for a second order"
