@@ -1,120 +1,225 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
-import {console2, Test, Vm} from "forge-std/Test.sol";
-import {IOrderBookV3ArbOrderTaker} from "rain.orderbook.interface/interface/IOrderBookV3ArbOrderTaker.sol";
-import {IParserV1} from "rain.interpreter.interface/interface/IParserV1.sol";
-import {IExpressionDeployerV3} from "rain.interpreter.interface/interface/IExpressionDeployerV3.sol";
-import {EvaluableConfigV3, SignedContextV1} from "rain.interpreter.interface/interface/IInterpreterCallerV2.sol";
+import {Test, stdError} from "forge-std/Test.sol";
 import {
-    OrderConfigV2,
-    OrderV2,
-    IO,
-    TakeOrderConfigV2,
-    TakeOrdersConfigV2
-} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
-import {LibOrder} from "rain.orderbook/src/lib/LibOrder.sol";
+    OrderConfigV4,
+    OrderV4,
+    IOV2,
+    EvaluableV4,
+    TaskV2,
+    TakeOrderConfigV4,
+    TakeOrdersConfigV5,
+    SignedContextV1,
+    Float
+} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
+import {LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
+import {ClaimInputToken} from "src/ClaimInputToken.sol";
+import {
+    RAINDEX,
+    RAINDEX_SUBPARSER,
+    RAINLANG_DEPLOYER,
+    RAINLANG_INTERPRETER,
+    RAINLANG_STORE,
+    MAINNET_HOT,
+    HOLO_VAULT_ID,
+    CLAIM_IO_RATIO,
+    CLAIM_ORDER_NONCE
+} from "src/Constants.sol";
+import {LibCoupon} from "./lib/LibCoupon.sol";
 import {SignContext} from "./lib/SignContext.sol";
-import {MAINNET_ORDERBOOK, MAINNET_DEPLOYER, MAINNET_HOT, MAINNET_USDT, MAINNET_SUBPARSER} from "src/Constants.sol";
 
-interface GetParser {
-    function iParser() external view returns (IParserV1);
-}
-
+/// The claim order on a fork of Ethereum mainnet, against the Raindex V6 and
+/// Rainlang contracts Rain deployed there.
 contract TestClaim is Test, SignContext {
-    using LibOrder for OrderV2;
+    using LibDecimalFloat for Float;
+
+    address internal orderOwner = makeAddr("owner");
+    address internal claimer = makeAddr("claimer");
+    address internal signer;
+    uint256 internal signerKey;
+    ClaimInputToken internal inputToken;
+    bytes internal bytecode;
+    bytes32 internal orderHash;
 
     function setUp() public {
-        uint256 fork = vm.createFork(vm.envString("RPC_URL_ETH"));
-        vm.selectFork(fork);
+        vm.createSelectFork(vm.envOr("RPC_URL_ETH", string("https://ethereum-rpc.publicnode.com")));
+
+        (signer, signerKey) = makeAddrAndKey("coupon signer");
+        inputToken = new ClaimInputToken();
+
+        bytecode = RAINLANG_DEPLOYER.parse2(composed(signer));
+        OrderV4 memory claimOrder = order();
+
+        vm.startPrank(orderOwner);
+        assertTrue(
+            RAINDEX.addOrder4(
+                OrderConfigV4(
+                    claimOrder.evaluable,
+                    claimOrder.validInputs,
+                    claimOrder.validOutputs,
+                    CLAIM_ORDER_NONCE,
+                    bytes32(0),
+                    ""
+                ),
+                new TaskV2[](0)
+            )
+        );
+        orderHash = keccak256(abi.encode(claimOrder));
+        assertTrue(RAINDEX.orderExists(orderHash));
+
+        deal(address(MAINNET_HOT), orderOwner, 100e18);
+        MAINNET_HOT.approve(address(RAINDEX), 100e18);
+        RAINDEX.deposit4(
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            LibDecimalFloat.fromFixedDecimalLosslessPacked(100e18, 18),
+            new TaskV2[](0)
+        );
+        vm.stopPrank();
+        assertEq(vaultBalance(), 100e18);
     }
 
-    function testHappyPath() public {
-        address orderOwner = makeAddr("owner");
-        address taker = makeAddr("taker");
+    /// The claim order as the vault adds it and a claim names it.
+    function order() internal view returns (OrderV4 memory) {
+        IOV2[] memory inputs = new IOV2[](1);
+        inputs[0] = IOV2(address(inputToken), HOLO_VAULT_ID);
+        IOV2[] memory outputs = new IOV2[](1);
+        outputs[0] = IOV2(address(MAINNET_HOT), HOLO_VAULT_ID);
+        return OrderV4(
+            orderOwner, EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, bytecode), inputs, outputs, CLAIM_ORDER_NONCE
+        );
+    }
 
-        (address signer, uint256 privateKey) = makeAddrAndKey("coupon signer");
+    function composed(address validSigner) internal returns (bytes memory) {
         string[] memory compose = new string[](8);
         compose[0] = "node";
         compose[1] = "compose-rainlang.mjs";
         compose[2] = "--network";
         compose[3] = "mainnet";
         compose[4] = "--subparser";
-        compose[5] = vm.toString(MAINNET_SUBPARSER);
+        compose[5] = vm.toString(RAINDEX_SUBPARSER);
         compose[6] = "--signer";
-        compose[7] = vm.toString(signer);
-        bytes memory rainlang = vm.ffi(compose);
-        console2.log(string(rainlang));
+        compose[7] = vm.toString(validSigner);
+        return vm.ffi(compose);
+    }
 
-        IParserV1 parser = GetParser(address(MAINNET_DEPLOYER)).iParser();
+    function vaultBalance() internal view returns (uint256 balance) {
+        (balance,) = RAINDEX.vaultBalance2(orderOwner, address(MAINNET_HOT), HOLO_VAULT_ID).toFixedDecimalLossy(18);
+    }
 
-        (bytes memory bytecode, uint256[] memory constants) = parser.parse(rainlang);
+    function coupon(uint256 amount, uint256 expiry, uint256 nonce) internal view returns (bytes32[] memory) {
+        return LibCoupon.words(
+            claimer,
+            amount,
+            expiry,
+            orderHash,
+            orderOwner,
+            address(RAINDEX),
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            bytes32(nonce)
+        );
+    }
 
-        OrderV2 memory order;
+    function signed(bytes32[] memory words) internal view returns (SignedContextV1 memory) {
+        return signContext(signerKey, words);
+    }
 
-        {
-            EvaluableConfigV3 memory evaluableConfig = EvaluableConfigV3(MAINNET_DEPLOYER, bytecode, constants);
-            IO[] memory inputs = new IO[](1);
-            inputs[0] = IO(address(MAINNET_USDT), 6, 1);
-            IO[] memory outputs = new IO[](1);
-            outputs[0] = IO(address(MAINNET_HOT), 18, 1);
+    function inAWeek() internal view returns (uint256) {
+        return block.timestamp + 7 days;
+    }
 
-            OrderConfigV2 memory orderConfig = OrderConfigV2(inputs, outputs, evaluableConfig, "");
+    /// The claim: takeOrders4 for exactly `amount` of HOT, as the website sends it.
+    function claim(SignedContextV1 memory signedCoupon, uint256 amount) internal {
+        SignedContextV1[] memory signedContexts = new SignedContextV1[](1);
+        signedContexts[0] = signedCoupon;
+        TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
+        orders[0] = TakeOrderConfigV4(order(), 0, 0, signedContexts);
+        Float io = LibDecimalFloat.fromFixedDecimalLosslessPacked(amount, 18);
+        vm.prank(claimer);
+        RAINDEX.takeOrders4(TakeOrdersConfigV5(io, io, CLAIM_IO_RATIO, true, orders, ""));
+    }
 
-            vm.startPrank(orderOwner);
-            vm.recordLogs();
-            MAINNET_ORDERBOOK.addOrder(orderConfig);
-            Vm.Log[] memory entries = vm.getRecordedLogs();
-            (,, order,) = abi.decode(entries[2].data, (address, address, OrderV2, bytes32));
-        }
+    function testHappyPath() public {
+        claim(signed(coupon(40e18, inAWeek(), 1)), 40e18);
 
-        {
-            deal(address(MAINNET_HOT), orderOwner, 100e18);
-            vm.startPrank(orderOwner);
-            MAINNET_HOT.approve(address(MAINNET_ORDERBOOK), 100e18);
-            MAINNET_ORDERBOOK.deposit(address(MAINNET_HOT), 1, 100e18);
-            assertEq(MAINNET_HOT.balanceOf(address(MAINNET_ORDERBOOK)), 100e18);
-        }
+        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(vaultBalance(), 60e18);
+    }
 
-        uint256 amount = 100e18;
+    /// The claim pays to the wei: the float the coupon carries converts back
+    /// to the amount it was made from.
+    function testAnOddNumberOfWeiPaysExactly() public {
+        uint256 amount = 12345678901234567891;
+        claim(signed(coupon(amount, inAWeek(), 2)), amount);
 
-        {
-            /**
-             *  Our "coupon" (the SignedContext array) will be:
-             *  [0] recipient address
-             *  [1] amount
-             *  [2] expiry timestamp in seconds
-             *  Plus some domain separators
-             *  [3] order hash
-             *  [4] order owner
-             *  [5] orderbook address
-             *  [6] token address
-             *  [7] output vault id
-             */
-            uint256[] memory context = new uint256[](9);
+        assertEq(MAINNET_HOT.balanceOf(claimer), amount);
+        assertEq(vaultBalance(), 100e18 - amount);
+    }
 
-            context[0] = uint256(uint160(taker));
-            context[1] = amount;
-            context[2] = block.timestamp + 60 * 60 * 24 * 7; // 1 week
-            context[3] = uint256(order.hash());
-            context[4] = uint256(uint160(orderOwner));
-            context[5] = uint256(uint160(address(MAINNET_ORDERBOOK)));
-            context[6] = uint256(uint160(address(MAINNET_HOT)));
-            context[7] = 1;
-            context[8] = 10;
+    function testTheClaimerPaysNoInputToken() public {
+        claim(signed(coupon(40e18, inAWeek(), 3)), 40e18);
 
-            SignedContextV1[] memory signedContexts = new SignedContextV1[](1);
-            signedContexts[0] = signContext(privateKey, context);
+        assertEq(inputToken.balanceOf(claimer), 0);
+        assertEq(inputToken.balanceOf(address(RAINDEX)), 0);
+    }
 
-            TakeOrderConfigV2[] memory orders = new TakeOrderConfigV2[](1);
+    function testACouponFromAnotherSignerFails() public {
+        (, uint256 otherKey) = makeAddrAndKey("not the coupon signer");
+        SignedContextV1 memory other = signContext(otherKey, coupon(40e18, inAWeek(), 4));
 
-            orders[0] = TakeOrderConfigV2(order, 0, 0, signedContexts);
+        vm.expectRevert(bytes("Wrong signer"));
+        claim(other, 40e18);
+    }
 
-            TakeOrdersConfigV2 memory takeOrdersConfig = TakeOrdersConfigV2(amount, amount, 0, orders, "");
-            vm.startPrank(taker);
-            MAINNET_ORDERBOOK.takeOrders(takeOrdersConfig);
-        }
+    function testTheSameNonceCannotBeClaimedTwice() public {
+        claim(signed(coupon(40e18, inAWeek(), 5)), 40e18);
+        SignedContextV1 memory again = signed(coupon(40e18, inAWeek() + 1, 5));
 
-        assertEq(MAINNET_HOT.balanceOf(taker), amount);
+        vm.expectRevert(bytes("Nonce already used"));
+        claim(again, 40e18);
+    }
+
+    function testAnExpiredCouponFails() public {
+        SignedContextV1 memory expired = signed(coupon(40e18, block.timestamp + 60, 6));
+        vm.warp(block.timestamp + 60);
+
+        vm.expectRevert(bytes("Order expired"));
+        claim(expired, 40e18);
+    }
+
+    function testACouponForAnotherRecipientFails() public {
+        bytes32[] memory words = coupon(40e18, inAWeek(), 7);
+        words[0] = bytes32(uint256(uint160(makeAddr("someone else"))));
+        SignedContextV1 memory other = signed(words);
+
+        vm.expectRevert(bytes("Wrong recipient"));
+        claim(other, 40e18);
+    }
+
+    function testAClaimForLessThanTheCouponFails() public {
+        SignedContextV1 memory forty = signed(coupon(40e18, inAWeek(), 8));
+
+        vm.expectRevert(bytes("Wrong output amount"));
+        claim(forty, 30e18);
+    }
+
+    function testAClaimForMoreThanTheVaultHoldsFails() public {
+        SignedContextV1 memory tooMuch = signed(coupon(140e18, inAWeek(), 9));
+
+        vm.expectRevert(bytes("Wrong output amount"));
+        claim(tooMuch, 140e18);
+    }
+
+    function testAClaimWithNoCouponFails() public {
+        TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
+        orders[0] = TakeOrderConfigV4(order(), 0, 0, new SignedContextV1[](0));
+        Float io = LibDecimalFloat.fromFixedDecimalLosslessPacked(40e18, 18);
+
+        // The order reads the signer, and a claim with no coupon has no signers column.
+        vm.prank(claimer);
+        vm.expectRevert(stdError.indexOOBError);
+        RAINDEX.takeOrders4(TakeOrdersConfigV5(io, io, CLAIM_IO_RATIO, true, orders, ""));
     }
 }

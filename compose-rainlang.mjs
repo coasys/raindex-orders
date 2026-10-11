@@ -10,11 +10,13 @@ import { parseArgs } from 'node:util'
 const { RainDocument, MetaStore } = pkg
 
 export const TEST_SIGNER = '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37'
+/** `RAINDEX_SUBPARSER` in src/Constants.sol: Rain's deterministic address, the same on every chain. */
+export const RAINDEX_SUBPARSER = '0x09Bc7AF266012F44fb41D8Bd682da931666605e1'
 const NETWORKS = ['sepolia', 'mainnet']
 const ZERO_ADDRESS = `0x${'0'.repeat(40)}`
 /** TestNet's bindings: a sepolia composition takes each one it is not given. */
 const SEPOLIA_DEFAULTS = {
-	subparser: '0xe6A589716d5a72276C08E0e08bc941a28005e55A',
+	subparser: RAINDEX_SUBPARSER,
 	signer: TEST_SIGNER
 }
 

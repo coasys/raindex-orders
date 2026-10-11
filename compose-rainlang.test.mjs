@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { TEST_SIGNER, bindings, compose } from './compose-rainlang.mjs'
+import { RAINDEX_SUBPARSER, TEST_SIGNER, bindings, compose } from './compose-rainlang.mjs'
 
+/** Rain's deterministic address, the same on both networks. */
 const SUBPARSER = {
-	sepolia: '0xe6A589716d5a72276C08E0e08bc941a28005e55A',
-	mainnet: '0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326'
+	sepolia: RAINDEX_SUBPARSER,
+	mainnet: RAINDEX_SUBPARSER
 }
 const SIGNER = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
 const COMPOSER = fileURLToPath(new URL('compose-rainlang.mjs', import.meta.url))
@@ -16,7 +17,8 @@ for (const network of ['sepolia', 'mainnet']) {
 		const rainlang = await compose({ network, subparser: SUBPARSER[network], signer: SIGNER })
 
 		assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER[network]}`))
-		assert.match(rainlang, new RegExp(`equal-to\\(signer<0>\\(\\) ${SIGNER}\\)`))
+		assert.match(rainlang, new RegExp(`binary-equal-to\\(signer<0>\\(\\) ${SIGNER}\\)`))
+		assert.match(rainlang, /io-ratio: 1e-30;/)
 		assert.doesNotMatch(rainlang, new RegExp(TEST_SIGNER, 'i'))
 	})
 }
