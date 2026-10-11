@@ -11,12 +11,14 @@ This document describes the architecture of the two-way bridge between HOT token
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| HoloLockVault Contract | Complete | `src/HoloLockVault.sol` |
-| MockHOT Token | Complete | `src/MockHOT.sol` |
-| Rainlang Claim Expression | Complete | `src/holo-claim.rain` |
+| HoloLockVault Contract | Complete, on Raindex V6 | `src/HoloLockVault.sol` |
+| ClaimInputToken | Complete | `src/ClaimInputToken.sol` |
+| MockHOT Token | Complete | `src/test/MockHOT.sol` |
+| Rainlang Claim Expression | Complete, on Rainlang 0.1.9 | `src/holo-claim.rain` |
 | Bridge Orchestrator (Rust) | Complete | `bridge-orchestrator/` |
 | Web UI | Complete | `ui/` |
-| Deployment Scripts | Complete | `deploy-sepolia.sh`, `script/` |
+| Deployment Scripts | Complete | `deploy-base-sepolia.sh`, `deploy-mainnet.sh`, `script/` |
+| TestNet on Base Sepolia | Pending deploy | `deploy-base-sepolia.sh` |
 | Foundry Tests | Complete | `test/` |
 | Holochain Integration | Pending | - |
 
@@ -25,7 +27,7 @@ This document describes the architecture of the two-way bridge between HOT token
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         SHARED LIQUIDITY POOL                                │
-│           (Raindex Orderbook Vault owned by HoloLockVault)                  │
+│           (Raindex V6 vault owned by HoloLockVault)                         │
 │                                                                              │
 │                            ┌───────────────┐                                │
 │      LOCK (HOT→bHOT)       │   HOT Tokens  │        CLAIM (bHOT→HOT)        │
@@ -43,7 +45,7 @@ This document describes the architecture of the two-way bridge between HOT token
 
 ### Key Design Decision: Shared Vault Ownership
 
-In Raindex, vaults are identified by: `(owner_address, token_address, vault_id)`
+In Raindex V6, vaults are identified by: `(owner_address, token_address, vault_id)`, the vault ID a bytes32, and balances are decimal floats. The vault converts each lock losslessly: the wei as the float's coefficient, -18 as its exponent.
 
 The **HoloLockVault contract** owns both:
 1. The vault where locked HOT is deposited
@@ -217,17 +219,19 @@ contract HoloLockVault {
     function vaultBalance() external view returns (uint256);
 
     // Admin functions (order management)
-    function addOrder(OrderConfigV2 calldata config) external onlyAdmin returns (bool);
-    function removeOrder(OrderV2 calldata order) external onlyAdmin returns (bool);
+    function addOrder(OrderConfigV4 calldata config) external onlyAdmin returns (bool);
+    function removeOrder(OrderV4 calldata order) external onlyAdmin returns (bool);
     function adminWithdraw(uint256 amount, address to) external onlyAdmin;
 }
 ```
 
 **Key Features**:
-- Emits `Lock` event with Holochain agent public key (bytes32)
-- Deposits to Raindex orderbook vault owned by this contract
+- Emits `Lock` event with Holochain agent public key (bytes32), unchanged from V3
+- Deposits to the Raindex V6 vault owned by this contract (`deposit4`), as a lossless decimal float, refusing an amount no float carries
 - Can deploy/manage claim orders (making itself the order owner)
-- Admin controls for emergency withdrawal
+- Admin controls for emergency withdrawal (`withdraw4`)
+
+**ClaimInputToken** (`src/ClaimInputToken.sol`): Raindex V6 takes an order only at a positive io-ratio, and pulls at least one unit of the input token from the taker. The claim order's ratio is 1e-30 per HOT, and its input token is this one: every transfer succeeds and nothing is held, so a claimer needs no balance or allowance of anything.
 
 ### 2. Rainlang Claim Expression (`src/holo-claim.rain`)
 
@@ -237,34 +241,40 @@ contract HoloLockVault {
 #calculate-io
 using-words-from orderbook-subparser
 
-/* Validate coupon signature and parameters */
-:ensure(equal-to(signer<0>() valid-signer) "Wrong signer"),
-:ensure(equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
+/* Validate coupon signature and parameters: addresses and hashes bit for bit */
+:ensure(binary-equal-to(signer<0>() valid-signer) "Wrong signer"),
+:ensure(binary-equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
 :ensure(less-than(block-timestamp() signed-context<0 2>()) "Order expired"),
-:ensure(equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
-:ensure(equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
-:ensure(equal-to(signed-context<0 5>() orderbook()) "Wrong orderbook"),
-:ensure(equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
-:ensure(equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
+:ensure(binary-equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
+:ensure(binary-equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
+:ensure(binary-equal-to(signed-context<0 5>() raindex()) "Wrong orderbook"),
+:ensure(binary-equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
+:ensure(binary-equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
 
 /* Prevent replay attacks via nonce */
 :ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
 :set(hash(order-hash() signed-context<0 8>()) 1),
 
-/* Output claim amount (io-ratio=0 means free claim) */
+/* Output claim amount, a decimal float. V6 takes no order at ratio 0: the claimer
+   pays 1e-30 of the ClaimInputToken per HOT, which never moves */
 output-amount: signed-context<0 1>(),
-io-ratio: 0;
+io-ratio: 1e-30;
+
+#handle-io
+:ensure(equal-to(output-vault-decrease() signed-context<0 1>()) "Wrong output amount");
 ```
 
-**Coupon Context Fields**:
+The expression is composed by `compose-rainlang.mjs` with the subparser and signer bound, and parsed by the Rainlang expression deployer into the bytecode the order carries. Only words the deployed Rainlang 0.1.9 parses are used.
+
+**Coupon Context Fields** (each a bytes32 word):
 | Index | Field | Description |
 |-------|-------|-------------|
 | 0 | recipient | Ethereum address to receive tokens |
-| 1 | amount | Token amount in wei |
-| 2 | expiry | Unix timestamp when coupon expires |
-| 3 | orderHash | Hash of the claim order |
+| 1 | amount | The decimal float Raindex V6 pays out: the wei with exponent -18, `0xffffffee` then the wei |
+| 2 | expiry | Unix timestamp when coupon expires (a float of exponent 0) |
+| 3 | orderHash | Hash of the claim order (keccak256 of the abi-encoded OrderV4) |
 | 4 | orderOwner | HoloLockVault address |
-| 5 | orderbook | Orderbook contract address |
+| 5 | orderbook | RaindexV6 address |
 | 6 | outputToken | Token address |
 | 7 | outputVaultId | Vault ID |
 | 8 | nonce | Unique nonce (prevents replay) |
@@ -286,7 +296,7 @@ cargo run -- run
 
 **Configuration** (via `.env`):
 - `SIGNER_PRIVATE_KEY`: Key that matches `valid-signer` in Rainlang
-- `ORDER_HASH`, `ORDER_OWNER`, `ORDERBOOK_ADDRESS`, `TOKEN_ADDRESS`, `VAULT_ID`
+- `ORDER_HASH`, `ORDER_OWNER`, `ORDERBOOK_ADDRESS`, `TOKEN_ADDRESS`, `VAULT_ID`, `CLAIM_INTERPRETER`, `CLAIM_STORE`, `CLAIM_BYTECODE`, `CLAIM_INPUT_TOKEN`: the claim order, which startup rebuilds, hashes and probes with a simulated `takeOrders4`
 - Network/RPC settings, polling interval, coupon batch size cap (see `bridge-orchestrator/src/config.rs`)
 
 ### 4. Web UI (`ui/`)
@@ -309,19 +319,21 @@ cargo run -- run
 
 ---
 
-## Sepolia Deployment
+## Rain's contracts, and the TestNet on Base Sepolia
+
+The release Rain deployed on Ethereum mainnet and Base Sepolia, at the same addresses (rain.orderbook 0.1.15, rainlang 0.1.9; `src/Constants.sol` takes them from the release files):
 
 | Contract | Address |
 |----------|---------|
-| MockHOT Token | `0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749` |
-| HoloLockVault | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
-| Raindex Orderbook | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |
-| Expression Deployer | `0xd19581a021f4704ad4eBfF68258e7A0a9DB1CD77` |
-| Orderbook Subparser | `0xe6A589716d5a72276C08E0e08bc941a28005e55A` |
-| NOOP Token (placeholder) | `0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028` |
-| Claim Order Hash | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
+| RaindexV6 | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` |
+| RaindexV6SubParser | `0x09Bc7AF266012F44fb41D8Bd682da931666605e1` |
+| Rainlang expression deployer | `0xb90c299a8321fbdd8D0F367e560f5341F840dA3F` |
+| Rainlang interpreter | `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf` |
+| Rainlang store | `0x1Aa775533E28B1D843e1A589034984E3a62005DC` |
 | Test Signer | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
 | Vault ID | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
+
+The TestNet moved from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532). Its mock HOT, HoloLockVault, ClaimInputToken and claim order are not deployed there yet: `deploy-base-sepolia.sh` deploys them and keeps their addresses in `.env` ([DEPLOY.md](./DEPLOY.md#deploy-the-testnet-on-base-sepolia)). The old Sepolia bridge, on OrderBookV3, does not carry over.
 
 ---
 
@@ -382,7 +394,7 @@ The bridge-orchestrator also handles coupon generation for claims:
 - **Parameter Binding**: Coupon bound to specific order, owner, token, vault
 
 ### Bridge Security
-- **Finality**: Bridge orchestrator should wait for sufficient confirmations (15+)
+- **Finality**: Bridge orchestrator records a lock after 5 confirmations, on mainnet (about a minute) and on Base Sepolia (about 10 seconds, enough for a TestNet whose locks carry no value)
 - **Replay Protection**: Track processed lock IDs on both sides
 - **Same Signer**: Use the same trusted signer for both directions ([docs/enable-multisig.md](./docs/enable-multisig.md))
 
@@ -399,17 +411,19 @@ The bridge-orchestrator also handles coupon generation for claims:
 raindex-orders/
 ├── src/
 │   ├── HoloLockVault.sol       # Lock vault contract
-│   ├── Constants.sol           # Network addresses and the test signer
+│   ├── ClaimInputToken.sol     # The claim order's input token, which moves nothing
+│   ├── Constants.sol           # Rain's contracts from the release files, the test signer
 │   ├── test/MockHOT.sol        # Test token
+│   ├── test/MockRaindex.sol    # Raindex V6 mock for the vault's unit tests
 │   └── holo-claim.rain         # Rainlang claim expression
 ├── script/
 │   ├── ClaimOrderScript.sol    # Shared claim order composition and checks
 │   ├── DeployTestHOT.s.sol     # Test token deployment and minting
-│   ├── DeployHoloLockVault.s.sol # Sepolia vault deployment
+│   ├── DeployHoloLockVault.s.sol # Base Sepolia vault deployment
 │   ├── DeployClaimOrderViaVault.s.sol # Claim order deployment
 │   ├── DeployMainnet.s.sol     # Mainnet deployment
 │   └── RotateClaimSigner.s.sol # Coupon signer rotation
-├── test/                       # Foundry tests and the mainnet fork rehearsal
+├── test/                       # Foundry tests, the mainnet and Base Sepolia fork tests, the rehearsal
 ├── bridge-orchestrator/        # Rust bridge orchestrator (lock watcher + coupon signer)
 │   └── src/
 ├── ui/                         # SvelteKit web UI
@@ -421,7 +435,7 @@ raindex-orders/
 │       ├── orderConfig.ts      # The claim order, from the build variables
 │       ├── coupon.ts           # Coupon parsing
 │       └── ethereum.ts         # MetaMask integration
-├── deploy-sepolia.sh           # Sepolia deployment
+├── deploy-base-sepolia.sh      # Base Sepolia (TestNet) deployment
 ├── deploy-mainnet.sh           # Mainnet deployment
 ├── rotate-claim-signer.sh      # Coupon signer rotation
 ├── compose-rainlang.mjs        # Composes the claim expression for a network

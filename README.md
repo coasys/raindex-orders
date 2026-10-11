@@ -1,6 +1,6 @@
 # HOT <> Bridged HOT Bridge
 
-A two-way bridge between HOT tokens on Ethereum and bridged HOT on Holochain.
+A two-way bridge between HOT tokens on Ethereum and bridged HOT on Holochain, on Raindex V6.
 
 ## Overview
 
@@ -12,7 +12,7 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SHARED LIQUIDITY POOL                         │
-│         (Raindex Orderbook Vault owned by HoloLockVault)        │
+│         (Raindex V6 vault owned by HoloLockVault)               │
 │                                                                  │
 │   LOCK (HOT→bHOT)            HOT Tokens             CLAIM (bHOT→HOT)
 │   ─────────────────►    ┌───────────────┐    ◄─────────────────
@@ -26,7 +26,9 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 | Component | Description | Language |
 |-----------|-------------|----------|
 | `src/HoloLockVault.sol` | Smart contract for locking HOT and managing claim orders | Solidity |
+| `src/ClaimInputToken.sol` | The claim order's input token, which moves nothing | Solidity |
 | `src/holo-claim.rain` | Rainlang expression for validating claim coupons | Rainlang |
+| `src/Constants.sol` | Raindex V6 and Rainlang at the addresses Rain deployed, from the release files | Solidity |
 | `bridge-orchestrator/` | Service that watches Lock events, drives the Holochain bridge, and generates withdrawal coupons | Rust |
 | `ui/` | Web interface for locking and claiming | SvelteKit |
 
@@ -37,9 +39,11 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (forge, cast)
 - [Rust](https://rustup.rs/) (for bridge-orchestrator)
 - [Node.js 20+](https://nodejs.org/) (for UI)
-- A Sepolia deployer wallet with Sepolia ETH (a Ledger or an encrypted keystore), and MetaMask for the UI
+- A Base Sepolia deployer wallet with Base Sepolia ETH (a Ledger or an encrypted keystore), and MetaMask for the UI
 
-### 1. Deploy to Sepolia
+The Solidity side builds on Soldeer packages: `forge soldeer install` once, then `forge build`. It takes Raindex V6 and Rainlang at the addresses Rain deployed on Ethereum mainnet and Base Sepolia, the same on both ([DEPLOY.md](./DEPLOY.md#raindex-v6-and-rainlang)).
+
+### 1. Deploy the TestNet on Base Sepolia
 
 ```bash
 # Set up environment: addresses only, never a private key
@@ -48,13 +52,13 @@ cp .env.example .env
 cast wallet import deployer --interactive
 
 # Deploy all contracts
-./deploy-sepolia.sh token --account deployer            # Deploy MockHOT token
-./deploy-sepolia.sh vault --account deployer            # Deploy HoloLockVault
-./deploy-sepolia.sh mint --account deployer             # Mint test tokens
-./deploy-sepolia.sh order-via-vault --account deployer  # Deploy claim order
+./deploy-base-sepolia.sh token --account deployer            # Deploy MockHOT token
+./deploy-base-sepolia.sh vault --account deployer            # Deploy HoloLockVault and its ClaimInputToken
+./deploy-base-sepolia.sh mint --account deployer             # Mint test tokens
+./deploy-base-sepolia.sh order-via-vault --account deployer  # Deploy claim order
 ```
 
-Mainnet deploys with `deploy-mainnet.sh`, rehearsed first on a fork: [DEPLOY.md](./DEPLOY.md#mainnet-deploy).
+The TestNet moved from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532): [DEPLOY.md](./DEPLOY.md#deploy-the-testnet-on-base-sepolia). Mainnet deploys with `deploy-mainnet.sh`, rehearsed first on a fork: [DEPLOY.md](./DEPLOY.md#mainnet-deploy).
 
 ### 2. Run the UI
 
@@ -69,21 +73,24 @@ npm run dev
 
 ```bash
 cd bridge-orchestrator
-# Set HOLOCHAIN_BRIDGING_AGENT_PUBKEY and SIGNER_PRIVATE_KEY. TestNet values are the
-# defaults for the rest (bridge-orchestrator/README.md)
+# Set HOLOCHAIN_BRIDGING_AGENT_PUBKEY, SIGNER_PRIVATE_KEY and the deploy record's
+# values. What is the same on every chain defaults to TestNet's
+# (bridge-orchestrator/README.md)
 cargo run -- run
 ```
 
 The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, and generates signed withdrawal coupons for claim flows.
 
-## Sepolia Deployment
+## Deployments
 
-| Contract | Address |
+| Contract | Ethereum mainnet and Base Sepolia |
 |----------|---------|
-| MockHOT Token | `0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749` |
-| HoloLockVault | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
-| Orderbook (Raindex) | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |
-| Claim Order Hash | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
+| RaindexV6 (rain.orderbook 0.1.15) | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` |
+| RaindexV6SubParser | `0x09Bc7AF266012F44fb41D8Bd682da931666605e1` |
+| Rainlang 0.1.9 expression deployer, interpreter, store | `0xb90c299a8321fbdd8D0F367e560f5341F840dA3F`, `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf`, `0x1Aa775533E28B1D843e1A589034984E3a62005DC` |
+| Test Signer (TestNet only) | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
+
+The TestNet bridge (mock HOT, HoloLockVault, ClaimInputToken, claim order) is not deployed on Base Sepolia yet; `deploy-base-sepolia.sh` writes its addresses to `.env`. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
 
 ## Documentation
 
@@ -96,7 +103,7 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 
 1. User approves HoloLockVault to spend their HOT
 2. User calls `lock(amount, holochainAgentPubKey)`
-3. HoloLockVault deposits tokens to its Raindex vault
+3. HoloLockVault deposits tokens to its Raindex V6 vault, as a decimal float of the wei
 4. `Lock` event emitted with amount and Holochain agent
 5. Bridge orchestrator detects the event
 6. Holochain side credits bridged HOT to agent
@@ -108,15 +115,17 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon
 5. Rainlang expression validates coupon (signer, expiry, nonce)
-6. HOT transferred from vault to user's wallet
+6. HOT transferred from vault to user's wallet. The claimer pays the order's input token at the order's ratio of 1e-30 per HOT, which the ClaimInputToken never moves
 
 ## Development
 
 ```bash
-# Build contracts
+# Fetch the Soldeer packages, then build contracts
+forge soldeer install
 forge build
 
-# Run tests
+# Run tests: the unit tests, and the claim order on forks of Ethereum mainnet
+# (RPC_URL_ETH) and Base Sepolia (RPC_URL_BASE_SEPOLIA), public RPCs by default
 forge test
 
 # Build the bridge orchestrator

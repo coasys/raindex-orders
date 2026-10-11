@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
+- `ClaimInputToken`, the claim order's input token, deployed with the vault: Raindex V6 takes an order only at a positive io-ratio and pulls at least one unit of the input token from the taker, so the claim order's ratio is 1e-30 per HOT and this token's transfers move nothing.
+- `test/TestClaimBaseSepolia.t.sol` deploys the TestNet bridge on a fork of Base Sepolia and proves a lock and a claim against the Raindex V6 there.
+- a coupon test vector (`test/TestCouponSignature.t.sol`): fixed inputs, their nine words, the signature, the order hash and the claim's `takeOrders4` calldata, reproduced by the orchestrator's and the website's tests.
+
+### Changed
+
+- the bridge runs on Raindex V6 and Rainlang 0.1.9, the release Rain deployed on Ethereum mainnet and Base Sepolia at the same deterministic addresses (RaindexV6 `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20`), in place of OrderBookV3. `src/Constants.sol` takes each address and code hash from the release's frozen file, and every script checks the code on chain before it sends anything.
+- HoloLockVault deposits and withdraws through `deposit4` and `withdraw4` with a bytes32 vault ID, converting every amount losslessly to Raindex's decimal float and refusing an amount no float carries. The `Lock` event is unchanged. It is a new deployment: the mainnet vault is not deployed yet, and the TestNet's is redeployed.
+- the claim expression compares addresses and hashes bit for bit (`binary-equal-to`), reads `raindex()` and `output-vault-decrease()`, and pays a decimal float. The coupon's amount word is that float, the wei with exponent -18 (`0xffffffee` then the wei); the other eight words are as before.
+- a claim is `takeOrders4` for exactly the coupon's amount at the order's ratio, and the orchestrator's startup probe simulates it.
+- the deploy record prints `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN` in place of `CLAIM_EXPRESSION`: a V6 order carries its parsed bytecode. The website takes `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN`, and `rotate-claim-signer.sh` reads the current order from them.
+- the TestNet moves from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532): `NETWORK` and `PUBLIC_NETWORK` are `base-sepolia` or `mainnet`, `deploy-base-sepolia.sh` replaces `deploy-sepolia.sh`, the RPC secret is `BASE_SEPOLIA_RPC_URL`, and the website names Base Sepolia, Basescan and Base's faucets. The orchestrator and the website default only what is the same on every chain; the mock HOT, vault and claim order must be given, as the TestNet is not deployed on Base Sepolia yet and the old Sepolia bridge does not carry over. A lock is still recorded after 5 confirmations, 10 seconds on Base.
+- the Solidity side builds on the Soldeer packages rain.orderbook pins with solc 0.8.25, in place of the git submodules and 0.8.19. `forge soldeer install` fetches them.
+- `test/fork-rehearsal.sh` re-targets V6, forks mainnet through `https://ethereum-rpc.publicnode.com` unless `FORK_URL` is set, gives the orchestrator a durable conductor config (the startup check added since 0.3.0 refused its missing one), and makes the rotation record refuse an order run by another interpreter in place of one from another expression deployer.
 
 ### Fixed
 
