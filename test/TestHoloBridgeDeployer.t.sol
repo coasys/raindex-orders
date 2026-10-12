@@ -176,16 +176,19 @@ contract TestHoloBridgeDeployerWithSafe is Test, SignContext {
         vault = bridge.vault();
     }
 
+    /// The claim expression for `validSigner` alone, 1 of 1.
     function composed(address validSigner) internal returns (bytes memory) {
-        string[] memory compose = new string[](8);
+        string[] memory compose = new string[](10);
         compose[0] = "node";
         compose[1] = "compose-rainlang.mjs";
         compose[2] = "--network";
         compose[3] = "mainnet";
         compose[4] = "--subparser";
         compose[5] = vm.toString(RAINDEX_SUBPARSER);
-        compose[6] = "--signer";
+        compose[6] = "--signers";
         compose[7] = vm.toString(validSigner);
+        compose[8] = "--threshold";
+        compose[9] = "1";
         return vm.ffi(compose);
     }
 

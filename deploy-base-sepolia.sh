@@ -173,17 +173,20 @@ deploy_order_via_vault() {
         exit 1
     fi
 
-    # TestNet coupons are signed by the test signer, whose key is in src/Constants.sol.
-    VALID_SIGNER="${VALID_SIGNER:-0x8E72b7568738da52ca3DCd9b24E178127A4E7d37}"
+    # TestNet coupons are signed by the test signer alone, whose key is in
+    # src/Constants.sol, unless VALID_SIGNERS and SIGNER_THRESHOLD name others.
+    [ -z "${VALID_SIGNER:-}" ] || die "VALID_SIGNER is replaced by VALID_SIGNERS and SIGNER_THRESHOLD: unset it"
+    VALID_SIGNERS="${VALID_SIGNERS:-0x8E72b7568738da52ca3DCd9b24E178127A4E7d37}"
+    SIGNER_THRESHOLD="${SIGNER_THRESHOLD:-1}"
     echo "Using vault: $BASE_SEPOLIA_LOCK_VAULT_ADDRESS"
     echo "Claim input token: $CLAIM_INPUT_TOKEN"
-    echo "Valid signer: $VALID_SIGNER"
+    echo "Coupon signers: $SIGNER_THRESHOLD of $VALID_SIGNERS"
 
     BROADCAST_FILE="${FOUNDRY_BROADCAST:-broadcast}/DeployClaimOrderViaVault.s.sol/84532/run-latest.json"
     STARTED=$(mktemp)
     trap 'rm -f "$STARTED"' EXIT
     NETWORK=base-sepolia BASE_SEPOLIA_LOCK_VAULT_ADDRESS="$BASE_SEPOLIA_LOCK_VAULT_ADDRESS" CLAIM_INPUT_TOKEN="$CLAIM_INPUT_TOKEN" \
-        VALID_SIGNER="$VALID_SIGNER" broadcast script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault
+        VALID_SIGNERS="$VALID_SIGNERS" SIGNER_THRESHOLD="$SIGNER_THRESHOLD" broadcast script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault
     sent_since "$STARTED" "$BROADCAST_FILE" || die "forge sent nothing: is the vault admin a Safe?"
 
     # The order hash is the second word of Raindex's AddOrderV3 event data.

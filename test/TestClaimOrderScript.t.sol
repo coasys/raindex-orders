@@ -6,7 +6,8 @@ import {IRaindexV6, OrderConfigV4} from "raindex-interface-0.1.7/src/interface/I
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {MockHOT} from "src/test/MockHOT.sol";
 import {MockRaindex} from "src/test/MockRaindex.sol";
-import {ClaimOrderScript, AdminInputs} from "script/ClaimOrderScript.sol";
+import {ClaimOrderScript, AdminInputs, ClaimSigners} from "script/ClaimOrderScript.sol";
+import {TEST_SIGNER_ADDRESS} from "src/Constants.sol";
 
 /// A Safe as the admin checks read it: a threshold and owners.
 contract MockSafe {
@@ -43,6 +44,10 @@ contract AdminHarness is ClaimOrderScript {
     function acceptSigner(address signer) external view {
         requireSigner(claimNetwork("mainnet"), signer);
     }
+
+    function acceptSigners(string memory network, ClaimSigners memory signers) external view {
+        requireSigners(claimNetwork(network), signers);
+    }
 }
 
 contract TestClaimOrderScript is Test {
@@ -72,10 +77,74 @@ contract TestClaimOrderScript is Test {
         vm.etch(ACCOUNT, abi.encodePacked(hex"ef0100", address(0xBEEF)));
         vm.expectRevert(
             bytes(
-                "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
+                "VALID_SIGNERS names 0x00000000000000000000000000000000000A11cE, which has an EIP-7702 delegation: Raindex V6 asks its delegate for a coupon's signature in place of the key. Use a key with no delegation, or a Safe"
             )
         );
         harness.acceptSigner(ACCOUNT);
+    }
+
+    function signersOf(uint256 count, uint256 threshold) internal returns (ClaimSigners memory signers) {
+        signers = ClaimSigners(new address[](count), threshold);
+        for (uint256 i = 0; i < count; i++) {
+            signers.list[i] = makeAddr(string.concat("coupon signer ", vm.toString(i)));
+        }
+    }
+
+    function testOneToFifteenSignersAndAThresholdOfOneToNAreAccepted() public {
+        harness.acceptSigners("mainnet", signersOf(1, 1));
+        harness.acceptSigners("mainnet", signersOf(3, 2));
+        harness.acceptSigners("mainnet", signersOf(3, 3));
+        harness.acceptSigners("mainnet", signersOf(15, 3));
+    }
+
+    function testASignerListOfNoneOrMoreThanFifteenIsRefused() public {
+        vm.expectRevert(bytes("VALID_SIGNERS lists 0 signers: a claim order takes 1 to 15"));
+        harness.acceptSigners("mainnet", signersOf(0, 0));
+        vm.expectRevert(bytes("VALID_SIGNERS lists 16 signers: a claim order takes 1 to 15"));
+        harness.acceptSigners("mainnet", signersOf(16, 2));
+    }
+
+    function testAThresholdOfZeroOrMoreThanTheSignersIsRefused() public {
+        vm.expectRevert(bytes("SIGNER_THRESHOLD is 0, and must be 1 to the 3 signers VALID_SIGNERS lists"));
+        harness.acceptSigners("mainnet", signersOf(3, 0));
+        vm.expectRevert(bytes("SIGNER_THRESHOLD is 4, and must be 1 to the 3 signers VALID_SIGNERS lists"));
+        harness.acceptSigners("mainnet", signersOf(3, 4));
+    }
+
+    function testASignerListedTwiceIsRefused() public {
+        ClaimSigners memory signers = signersOf(3, 2);
+        signers.list[2] = signers.list[0];
+
+        vm.expectRevert(bytes(string.concat("VALID_SIGNERS lists ", vm.toString(signers.list[0]), " twice")));
+        harness.acceptSigners("mainnet", signers);
+    }
+
+    function testEachListedSignerIsCheckedAsOne() public {
+        ClaimSigners memory signers = signersOf(3, 2);
+        signers.list[1] = TEST_SIGNER_ADDRESS;
+
+        vm.expectRevert(
+            bytes(
+                "VALID_SIGNERS names 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37, the test signer, whose key is public: mainnet refuses it"
+            )
+        );
+        harness.acceptSigners("mainnet", signers);
+        harness.acceptSigners("base-sepolia", signers);
+
+        signers.list[1] = address(new MockSafe(1, ownersOf(2)));
+        vm.expectRevert(
+            bytes(
+                string.concat(
+                    "VALID_SIGNERS names ",
+                    vm.toString(signers.list[1]),
+                    ", a contract but not a Safe whose threshold is 2 to 20"
+                )
+            )
+        );
+        harness.acceptSigners("mainnet", signers);
+
+        signers.list[1] = address(new MockSafe(2, ownersOf(3)));
+        harness.acceptSigners("mainnet", signers);
     }
 
     /// A vault whose admin is the broadcaster a test sends as, with `adminCode` at it.

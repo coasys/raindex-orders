@@ -7,13 +7,14 @@ import {OrderV4, EvaluableV4} from "raindex-interface-0.1.7/src/interface/IRaind
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {HoloBridgeDeployer} from "src/HoloBridgeDeployer.sol";
 import {MAINNET_HOT, RAINDEX, HOLO_VAULT_ID, MIN_LOCK_AMOUNT, CLAIM_ORDER_NONCE} from "src/Constants.sol";
-import {ClaimOrderScript, ClaimNetwork} from "./ClaimOrderScript.sol";
+import {ClaimOrderScript, ClaimNetwork, ClaimSigners} from "./ClaimOrderScript.sol";
 
 /// Deploys the HOT bridge on Ethereum mainnet against the RaindexV6 Rain
 /// deployed there, in one transaction: a HoloBridgeDeployer, which deploys the
 /// claim input token and HoloLockVault, adds the claim order through the vault,
 /// and hands the vault to ADMIN_ADDRESS, a Safe. No key is the vault's admin at
-/// any point. deploy-mainnet.sh runs it, then `record`.
+/// any point. The claim order takes coupons that SIGNER_THRESHOLD of
+/// VALID_SIGNERS sign. deploy-mainnet.sh runs it, then `record`.
 contract DeployMainnet is ClaimOrderScript {
     bytes32 private constant ADMIN_CHANGED = keccak256("AdminChanged(address,address)");
 
@@ -22,10 +23,10 @@ contract DeployMainnet is ClaimOrderScript {
         requireChain(net);
         requireRainV6();
         address admin = vm.envAddress("ADMIN_ADDRESS");
-        address signer = vm.envAddress("VALID_SIGNER");
+        ClaimSigners memory signers = signersFromEnv(net);
         requireAdmin(admin, adminInputsFromEnv());
-        requireSigner(net, signer);
-        EvaluableV4 memory evaluable = claimEvaluable(net, signer);
+        requireSigners(net, signers);
+        EvaluableV4 memory evaluable = claimEvaluable(net, signers);
 
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
@@ -55,14 +56,14 @@ contract DeployMainnet is ClaimOrderScript {
         address admin = vm.envAddress("ADMIN_ADDRESS");
         require(vault.admin() == admin, "the vault's admin is not ADMIN_ADDRESS");
         requireHandedOverOnce(vault, address(bridge), admin, fromBlock);
-        address signer = vm.envAddress("VALID_SIGNER");
-        (OrderV4 memory order, bytes32 orderHash) = findClaimOrder(net, vault, signer, fromBlock);
+        ClaimSigners memory signers = signersFromEnv(net);
+        (OrderV4 memory order, bytes32 orderHash) = findClaimOrder(net, vault, signers, fromBlock);
         require(
             order.validInputs[0].token == address(bridge.inputToken()),
             "the claim order's input token is not the one the HoloBridgeDeployer deployed"
         );
         console2.log(string.concat("HoloBridgeDeployer=", vm.toString(address(bridge))));
-        printRecord(net, vault, signer, order, orderHash);
+        printRecord(net, vault, signers, order, orderHash);
     }
 
     /// The vault's AdminChanged events from `fromBlock` on must be the one

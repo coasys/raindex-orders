@@ -4,20 +4,22 @@ pragma solidity =0.8.25;
 import {OrderV4} from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {RAINDEX} from "src/Constants.sol";
-import {ClaimOrderScript, ClaimNetwork} from "./ClaimOrderScript.sol";
+import {ClaimOrderScript, ClaimNetwork, ClaimSigners} from "./ClaimOrderScript.sol";
 
-/// Replaces the vault's claim order with one that accepts coupons from
-/// VALID_SIGNER: adds the new order, then removes the current one. It reads the
-/// current one from the deploy record's variables, under the names the record
-/// prints them. VALID_SIGNER, the new signer, has no default.
+/// Replaces the vault's claim order with one that accepts coupons signed by
+/// SIGNER_THRESHOLD of VALID_SIGNERS: adds the new order, then removes the
+/// current one. The signers and the threshold are written into the order's
+/// expression, so this is how either changes. It reads the current order from
+/// the deploy record's variables, under the names the record prints them.
+/// VALID_SIGNERS and SIGNER_THRESHOLD, the new ones, have no default.
 /// rotate-claim-signer.sh runs it.
 contract RotateClaimSigner is ClaimOrderScript {
     function run() external {
         ClaimNetwork memory net = networkFromEnv();
         requireRainV6();
         HoloLockVault vault = HoloLockVault(vm.envAddress(net.vaultVar));
-        address signer = vm.envAddress("VALID_SIGNER");
-        requireSigner(net, signer);
+        ClaimSigners memory signers = requiredSignersFromEnv(net);
+        requireSigners(net, signers);
         require(address(vault.orderbook()) == address(RAINDEX), "the vault's orderbook is not RaindexV6");
 
         address inputToken = vm.envAddress("PUBLIC_CLAIM_INPUT_TOKEN");
@@ -31,8 +33,9 @@ contract RotateClaimSigner is ClaimOrderScript {
         require(RAINDEX.orderExists(currentHash), "ORDER_HASH is not an order on the orderbook");
 
         bytes[] memory calls = new bytes[](2);
-        calls[0] =
-            abi.encodeCall(HoloLockVault.addOrder, (claimOrderConfig(net, address(vault.token()), inputToken, signer)));
+        calls[0] = abi.encodeCall(
+            HoloLockVault.addOrder, (claimOrderConfig(net, address(vault.token()), inputToken, signers))
+        );
         calls[1] = abi.encodeCall(HoloLockVault.removeOrder, (current));
         asAdmin(vault, calls);
     }
@@ -42,12 +45,21 @@ contract RotateClaimSigner is ClaimOrderScript {
     function record(uint256 fromBlock) external {
         ClaimNetwork memory net = networkFromEnv();
         HoloLockVault vault = HoloLockVault(vm.envAddress(net.vaultVar));
-        address signer = vm.envAddress("VALID_SIGNER");
-        (OrderV4 memory order, bytes32 orderHash) = findClaimOrder(net, vault, signer, fromBlock);
+        ClaimSigners memory signers = requiredSignersFromEnv(net);
+        (OrderV4 memory order, bytes32 orderHash) = findClaimOrder(net, vault, signers, fromBlock);
         require(
             !RAINDEX.orderExists(vm.envBytes32("ORDER_HASH")),
             "the previous claim order ORDER_HASH is still on the orderbook"
         );
-        printRecord(net, vault, signer, order, orderHash);
+        printRecord(net, vault, signers, order, orderHash);
+    }
+
+    /// The new signers, with no TestNet default: a rotation states them.
+    function requiredSignersFromEnv(ClaimNetwork memory net) private view returns (ClaimSigners memory) {
+        require(vm.envExists("VALID_SIGNERS"), "VALID_SIGNERS is required: the new coupon signers, separated by commas");
+        require(
+            vm.envExists("SIGNER_THRESHOLD"), "SIGNER_THRESHOLD is required: how many of VALID_SIGNERS sign each coupon"
+        );
+        return signersFromEnv(net);
     }
 }
