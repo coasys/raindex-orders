@@ -19,7 +19,7 @@ const readAbi = parseAbi([
 	'function getCurrentBlockTimestamp() view returns (uint256)'
 ])
 
-/** What the RPC answers: one chain, the claim order's store, and its signer. */
+/** What the RPC answers: one chain, the claim order's store, and its contract signers. */
 export type FakeChain = {
 	chainId: bigint
 	block: bigint
@@ -27,9 +27,14 @@ export type FakeChain = {
 	store: string
 	namespace: bigint
 	flags: Map<bigint, bigint>
-	/** A contract signer's EIP-1271 verdict. A key signer has no code and answers nothing. */
-	contractSigner?: { address: string; accepts: (hash: Hex, signature: Hex) => boolean }
+	/**
+	 * Each contract signer's EIP-1271 verdict. Any other address, such as a key signer's,
+	 * has no code and answers nothing.
+	 */
+	contractSigners?: ContractSigner[]
 }
+
+export type ContractSigner = { address: string; accepts: (hash: Hex, signature: Hex) => boolean }
 
 type RpcRequest = { method: string; params: [{ to: string; data: Hex }, string] }
 type SignatureCheck = { signer: string; hash: Hex; signature: Hex; accepted: boolean }
@@ -54,9 +59,9 @@ export function fakeRpc(chain: FakeChain) {
 			const target = call.target.toLowerCase()
 			if (decoded.functionName === 'isValidSignature') {
 				const [hash, signature] = decoded.args
-				const signer = chain.contractSigner
-				const isSigner = signer && target === signer.address.toLowerCase()
-				const accepted = !!isSigner && signer.accepts(hash, signature)
+				const signer = chain.contractSigners?.find(s => target === s.address.toLowerCase())
+				const isSigner = signer !== undefined
+				const accepted = isSigner && signer.accepts(hash, signature)
 				signatureChecks.push({ signer: target, hash, signature, accepted })
 				if (!isSigner) return { success: true, returnData: '0x' as Hex }
 				if (!accepted) return { success: false, returnData: '0x' as Hex }

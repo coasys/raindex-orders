@@ -7,12 +7,7 @@
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
-	import {
-		deserializeSignedContext,
-		floatToWei,
-		parseCoupon,
-		type SignedContextV1Struct
-	} from '$lib/coupon'
+	import { deserializeCoupon, floatToWei, parseCoupon, type SignedCoupon } from '$lib/coupon'
 	import { getOrderConfig, type OrderConfig } from '$lib/orderConfig'
 	import { claimCoupon } from '$lib/claim'
 	import { ethereumStore, onWrongNetwork, connectWallet, readContract } from '$lib/ethereum'
@@ -24,7 +19,7 @@
 
 	let couponInput = ''
 	let couponPrefilledFromUrl = false
-	let signedContext: SignedContextV1Struct | undefined
+	let signedCoupon: SignedCoupon | undefined
 
 	let orderConfig: OrderConfig | undefined
 	let orderExists = false
@@ -44,19 +39,19 @@
 
 	async function parseCouponInput() {
 		if (!couponInput) {
-			signedContext = undefined
+			signedCoupon = undefined
 			orderConfig = undefined
 			orderExists = false
 			return
 		}
 		try {
-			signedContext = deserializeSignedContext(couponInput)
-			const couponData = parseCoupon(signedContext)
+			signedCoupon = deserializeCoupon(couponInput)
+			const couponData = parseCoupon(signedCoupon)
 
 			orderConfig = getOrderConfig(couponData.orderHash)
 		} catch (e) {
 			console.error('Failed to parse coupon:', e)
-			signedContext = undefined
+			signedCoupon = undefined
 			orderConfig = undefined
 		}
 	}
@@ -105,7 +100,7 @@
 		}
 	}
 
-	$: coupon = signedContext ? parseCoupon(signedContext) : undefined
+	$: coupon = signedCoupon ? parseCoupon(signedCoupon) : undefined
 
 	let isLoading = false
 	let error = ''
@@ -114,7 +109,7 @@
 	let successTxHash = ''
 
 	const handleClaim = async () => {
-		if (!signedContext) return
+		if (!signedCoupon) return
 		if (!orderConfig) return
 
 		error = ''
@@ -122,7 +117,7 @@
 		isLoading = true
 
 		try {
-			const hash = await claimCoupon(signedContext)
+			const hash = await claimCoupon(signedCoupon)
 			success = true
 			successTxHash = hash
 			await getVaultBalance()
@@ -252,7 +247,7 @@
 					<Button
 						class="w-fit"
 						on:click={handleClaim}
-						disabled={isLoading || success || !signedContext || !orderConfig}
+						disabled={isLoading || success || !signedCoupon || !orderConfig}
 					>
 						{#if isLoading}
 							<Spinner size="4" class="mr-2" />

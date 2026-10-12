@@ -61,9 +61,10 @@ for (const [recipient, hot, expiry, wei = hot * 10n ** 18n] of OLD) {
 	coupons.push([signer.address, signature, ...words.map(String)].join(','))
 }
 const out = `// Twenty coupons for the TestNet claim order of src/lib/testing/builds.ts, signed by
-// the test signer, CLAIM_ORDER.signer on that build. Each keeps the recipient, amount,
-// expiry and nonce of a coupon once redeemed on the old Sepolia bridge, over the V6
-// order. None is redeemed on a chain. Written by scripts/coupon-fixtures.mjs.
+// the test signer, which CLAIM_ORDER.signers lists alone on that build, threshold 1:
+// each carries one seat. Each keeps the recipient, amount, expiry and nonce of a coupon
+// once redeemed on the old Sepolia bridge, over the V6 order. None is redeemed on a
+// chain. Written by scripts/coupon-fixtures.mjs.
 export const TESTNET_COUPONS: string[] = [
 ${coupons.map(c => `\t'${c}'`).join(',\n')}
 ]

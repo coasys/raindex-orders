@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { zeroAddress } from 'viem'
 import {
 	BASE_SEPOLIA_DEFAULTS,
 	BUILD_VARIABLES,
@@ -13,6 +14,15 @@ const without = (build: Record<string, string>, key: string) => {
 	const rest = { ...build }
 	delete rest[key]
 	return rest
+}
+
+// Anvil's third, fourth and fifth accounts.
+const SIGNER_A = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
+const SIGNER_B = '0x90F79bf6EB2c4f870365E785982E1f101E93b906'
+const SIGNER_C = '0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65'
+const TWO_OF_THREE = {
+	PUBLIC_CLAIM_SIGNERS: `${SIGNER_A},${SIGNER_B},${SIGNER_C}`,
+	PUBLIC_CLAIM_THRESHOLD: '2'
 }
 
 /** The build variables TestNet has no default for: its own deploy's values. */
@@ -37,7 +47,8 @@ describe('parseBridgeConfig', () => {
 		expect(config.orderbookAddress).toBe(BASE_SEPOLIA_BUILD.PUBLIC_ORDERBOOK_ADDRESS)
 		expect(config.claimOrder).toEqual({
 			orderHash: BASE_SEPOLIA_BUILD.PUBLIC_CLAIM_ORDER_HASH,
-			signer: TEST_SIGNER,
+			signers: [TEST_SIGNER],
+			threshold: 1,
 			interpreter: BASE_SEPOLIA_BUILD.PUBLIC_CLAIM_INTERPRETER,
 			store: BASE_SEPOLIA_BUILD.PUBLIC_CLAIM_STORE,
 			bytecode: BASE_SEPOLIA_BUILD.PUBLIC_CLAIM_BYTECODE,
@@ -56,7 +67,8 @@ describe('parseBridgeConfig', () => {
 		expect(config.faucet).toBe(false)
 		expect(config.rpcSecret).toBe('ETH_RPC_URL')
 		expect(config.addToWallet).toBeUndefined()
-		expect(config.claimOrder.signer).toBe(MAINNET_BUILD.PUBLIC_CLAIM_SIGNER)
+		expect(config.claimOrder.signers).toEqual([MAINNET_BUILD.PUBLIC_CLAIM_SIGNERS])
+		expect(config.claimOrder.threshold).toBe(1)
 		expect(config.claimOrder.inputToken).toBe(MAINNET_BUILD.PUBLIC_CLAIM_INPUT_TOKEN)
 	})
 
@@ -87,7 +99,8 @@ describe('parseBridgeConfig', () => {
 		expect(withTestnetDefaults(deployed).defaulted).toEqual([
 			'PUBLIC_NETWORK',
 			'PUBLIC_ORDERBOOK_ADDRESS',
-			'PUBLIC_CLAIM_SIGNER',
+			'PUBLIC_CLAIM_SIGNERS',
+			'PUBLIC_CLAIM_THRESHOLD',
 			'PUBLIC_CLAIM_INTERPRETER',
 			'PUBLIC_CLAIM_STORE'
 		])
@@ -171,14 +184,143 @@ describe('parseBridgeConfig', () => {
 		)
 	})
 
-	it('refuses the test signer on mainnet, in any case, and takes it on base-sepolia', () => {
+	it('refuses the test signer anywhere in a mainnet list, in any case, and takes it on base-sepolia', () => {
 		for (const signer of [TEST_SIGNER, TEST_SIGNER.toLowerCase()]) {
-			expect(() => parseBridgeConfig({ ...MAINNET_BUILD, PUBLIC_CLAIM_SIGNER: signer })).toThrow(
-				'PUBLIC_CLAIM_SIGNER is the test signer'
-			)
-			expect(
-				parseBridgeConfig({ ...BASE_SEPOLIA_BUILD, PUBLIC_CLAIM_SIGNER: signer }).network
-			).toBe('base-sepolia')
+			for (const signers of [signer, `${SIGNER_A},${signer},${SIGNER_B}`]) {
+				expect(() =>
+					parseBridgeConfig({ ...MAINNET_BUILD, PUBLIC_CLAIM_SIGNERS: signers })
+				).toThrow(
+					`PUBLIC_CLAIM_SIGNERS lists the test signer ${TEST_SIGNER}, whose key is public: mainnet refuses it`
+				)
+				expect(
+					parseBridgeConfig({ ...BASE_SEPOLIA_BUILD, PUBLIC_CLAIM_SIGNERS: signers }).network
+				).toBe('base-sepolia')
+			}
 		}
+	})
+})
+
+describe('parseBridgeConfig, the claim signers', () => {
+	it.each([
+		['base-sepolia', BASE_SEPOLIA_BUILD],
+		['mainnet', MAINNET_BUILD]
+	])('reads a %s order of 2 of 3 signers, as the deploy record lists them', (_, build) => {
+		const config = parseBridgeConfig({ ...build, ...TWO_OF_THREE })
+
+		expect(config.claimOrder.signers).toEqual([SIGNER_A, SIGNER_B, SIGNER_C])
+		expect(config.claimOrder.threshold).toBe(2)
+	})
+
+	it('reads 15 signers, the most a claim order lists, and a threshold of all of them', () => {
+		const fifteen = Array.from(
+			{ length: 15 },
+			(_, i) => `0x${(i + 1).toString(16).padStart(40, '0')}`
+		)
+
+		const config = parseBridgeConfig({
+			...MAINNET_BUILD,
+			PUBLIC_CLAIM_SIGNERS: fifteen.join(','),
+			PUBLIC_CLAIM_THRESHOLD: '15'
+		})
+
+		expect(config.claimOrder.signers).toEqual(fifteen)
+		expect(config.claimOrder.threshold).toBe(15)
+	})
+
+	it.each([
+		[
+			'an entry that is not an address',
+			`${SIGNER_A},0x1234`,
+			'"0x1234", not a valid nonzero address'
+		],
+		[
+			'the zero address',
+			`${SIGNER_A},${zeroAddress}`,
+			`"${zeroAddress}", not a valid nonzero address`
+		],
+		['an empty entry', `${SIGNER_A},,${SIGNER_B}`, '"", not a valid nonzero address'],
+		['a trailing comma', `${SIGNER_A},`, '"", not a valid nonzero address'],
+		[
+			'a space after a comma',
+			`${SIGNER_A}, ${SIGNER_B}`,
+			`" ${SIGNER_B}", not a valid nonzero address`
+		],
+		[
+			'16 signers',
+			Array.from({ length: 16 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, '0')}`).join(','),
+			'PUBLIC_CLAIM_SIGNERS lists 16 signers: a claim order takes 1 to 15'
+		],
+		[
+			'one signer twice, in another letter case',
+			`${SIGNER_A},${SIGNER_B},${SIGNER_A.toLowerCase()}`,
+			`PUBLIC_CLAIM_SIGNERS lists ${SIGNER_A.toLowerCase()} twice`
+		]
+	])('refuses a list with %s', (_, signers, fault) => {
+		for (const build of [BASE_SEPOLIA_BUILD, MAINNET_BUILD]) {
+			expect(() => parseBridgeConfig({ ...build, PUBLIC_CLAIM_SIGNERS: signers })).toThrow(fault)
+		}
+	})
+
+	it.each([
+		['0', 'PUBLIC_CLAIM_THRESHOLD=0 is not a whole number of signers from 1 up'],
+		['-1', 'PUBLIC_CLAIM_THRESHOLD=-1 is not a whole number of signers from 1 up'],
+		['1.5', 'PUBLIC_CLAIM_THRESHOLD=1.5 is not a whole number of signers from 1 up'],
+		['two', 'PUBLIC_CLAIM_THRESHOLD=two is not a whole number of signers from 1 up'],
+		['02', 'PUBLIC_CLAIM_THRESHOLD=02 is not a whole number of signers from 1 up'],
+		['4', 'PUBLIC_CLAIM_THRESHOLD=4 is more than the 3 signers PUBLIC_CLAIM_SIGNERS lists']
+	])('refuses the threshold %s', (threshold, fault) => {
+		for (const build of [BASE_SEPOLIA_BUILD, MAINNET_BUILD]) {
+			expect(() =>
+				parseBridgeConfig({ ...build, ...TWO_OF_THREE, PUBLIC_CLAIM_THRESHOLD: threshold })
+			).toThrow(fault)
+		}
+	})
+
+	it("takes TestNet's signer and threshold only when neither is given, so a list never pairs with threshold 1 unasked", () => {
+		const testnet = without(
+			without(BASE_SEPOLIA_BUILD, 'PUBLIC_CLAIM_SIGNERS'),
+			'PUBLIC_CLAIM_THRESHOLD'
+		)
+
+		expect(parseBridgeConfig(testnet).claimOrder).toMatchObject({
+			signers: [TEST_SIGNER],
+			threshold: 1
+		})
+		expect(() =>
+			parseBridgeConfig({ ...testnet, PUBLIC_CLAIM_SIGNERS: TWO_OF_THREE.PUBLIC_CLAIM_SIGNERS })
+		).toThrow('PUBLIC_CLAIM_THRESHOLD is required')
+		expect(() => parseBridgeConfig({ ...testnet, PUBLIC_CLAIM_THRESHOLD: '1' })).toThrow(
+			'PUBLIC_CLAIM_SIGNERS is required'
+		)
+		expect(
+			withTestnetDefaults({ ...testnet, PUBLIC_CLAIM_THRESHOLD: '1' }).defaulted
+		).not.toContain('PUBLIC_CLAIM_SIGNERS')
+	})
+
+	it.each([
+		['base-sepolia', BASE_SEPOLIA_BUILD],
+		['mainnet', MAINNET_BUILD]
+	])(
+		'refuses a %s build that still sets PUBLIC_CLAIM_SIGNER, naming what replaced it',
+		(_, build) => {
+			for (const value of [SIGNER_A, '']) {
+				expect(() => parseBridgeConfig({ ...build, PUBLIC_CLAIM_SIGNER: value })).toThrow(
+					'PUBLIC_CLAIM_SIGNER is replaced by PUBLIC_CLAIM_SIGNERS and PUBLIC_CLAIM_THRESHOLD'
+				)
+			}
+		}
+	)
+
+	it('names every signer fault in one error, with the others', () => {
+		expect(() =>
+			parseBridgeConfig({
+				...without(MAINNET_BUILD, 'PUBLIC_CLAIM_STORE'),
+				PUBLIC_CLAIM_SIGNER: SIGNER_A,
+				PUBLIC_CLAIM_SIGNERS: `${SIGNER_A},${TEST_SIGNER},${SIGNER_A}`,
+				PUBLIC_CLAIM_THRESHOLD: '0'
+			})
+		).toThrow(
+			`Bridge build variables: PUBLIC_CLAIM_SIGNER is replaced by PUBLIC_CLAIM_SIGNERS and PUBLIC_CLAIM_THRESHOLD: unset it; PUBLIC_CLAIM_STORE is required; PUBLIC_CLAIM_SIGNERS lists ${SIGNER_A.toLowerCase()} twice; PUBLIC_CLAIM_SIGNERS lists the test signer ${TEST_SIGNER}, whose key is public: mainnet refuses it; PUBLIC_CLAIM_THRESHOLD=0 is not a whole number of signers from 1 up`
+		)
 	})
 })

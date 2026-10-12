@@ -1,8 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
-import { encodeErrorResult, encodeFunctionResult, parseAbi, type Address, type Hex } from 'viem'
+import {
+	decodeFunctionData,
+	encodeErrorResult,
+	encodeFunctionResult,
+	getAddress,
+	parseAbi,
+	type Address,
+	type Hex
+} from 'viem'
 import { orderbookAbi } from '../generated'
-import { deserializeSignedContext, parseCoupon } from './coupon'
+import { deserializeCoupon, parseCoupon, serializeCoupon } from './coupon'
 import { TransactionStatus } from './stores/transactionStore'
 import { asBuild, BUILDS } from './testing/builds'
 import { chainAnswers, REPLACEMENT_HASH, type Fate } from './testing/chain'
@@ -10,10 +18,26 @@ import { settled } from './testing/clock'
 
 // The coupon of the claim test vector (test/TestCouponSignature.t.sol): the vector's
 // order on both builds, signed by anvil's third account, MAINNET_BUILD's claim signer.
-const COUPON = deserializeSignedContext(
+const COUPON = deserializeCoupon(
 	'0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0xf3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b,97433442488726861213578988847752201310395502865,115792088752037155414859468704681636286916632540171964433728779348048145154048,1750604800,76958440712206607560379240569074999120371888444883451443154037264025912540939,1300945060633283894583661816534861012306758682838,319615586448914156470689800627502155326116515104,619044111217614189527117770386815914092009957090,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631'
 )
 const RECIPIENT = parseCoupon(COUPON).recipient
+// The same coupon as a second signer, anvil's fourth account, also signs it (the
+// signature is a stand-in: the orderbook is not asked to check it here).
+const SECOND_SEAT = {
+	signer: '0x90f79bf6eb2c4f870365e785982e1f101e93b906',
+	signature: `0x${'22'.repeat(64)}1b`
+} as const
+const TWO_SEATS = deserializeCoupon(
+	serializeCoupon({ ...COUPON, seats: [...COUPON.seats, SECOND_SEAT] })
+)
+// A 2-of-3 claim order over the same order, as its deploy record lists it.
+const TWO_OF_THREE = {
+	...BUILDS['base-sepolia'],
+	PUBLIC_CLAIM_SIGNERS:
+		'0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC,0x90F79bf6EB2c4f870365E785982E1f101E93b906,0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65',
+	PUBLIC_CLAIM_THRESHOLD: '2'
+}
 const OTHER_WALLET = '0x2222222222222222222222222222222222222222'
 const EXPIRES = new Date(1750604800 * 1000).toLocaleString()
 const HASH = '0xe76a7f6dff5bd4384292b7ebf8bba2496021e3eb90a8cf5ee2cbf730d6021898'
@@ -26,7 +50,8 @@ const TAKE_ORDERS =
 	'0x69c728560000000000000000000000000000000000000000000000000000000000000020ffffffee000000000000000000000000000000000000000014d1120d7b160000ffffffee000000000000000000000000000000000000000014d1120d7b160000ffffffe200000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000005e0000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000280000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d600000000000000000000000000000000000000000000000000000000000000a0000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000000000000000000000000000000000001a000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004c52eee7fb6aed0f1a30130d96d02409d9d886cf0000000000000000000000001aa775533e28b1d843e1a589034984e3a62005dc0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000200ab00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000001234567890123456789012345678901234567890eede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b00000000000000000000000000000000000000000000000000000000000000010000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2eede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000003c44cdddb6a900fa2b585dd299e03d12fa4293bc000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000001a000000000000000000000000000000000000000000000000000000000000000090000000000000000000000001111111111111111111111111111111111111111ffffffee000000000000000000000000000000000000000014d1120d7b1600000000000000000000000000000000000000000000000000000000000068581c00aa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d600000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd200000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2eede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b770000000000000000000000000000000000000000000000000000000000000041f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
 
 // What the orderbook answers a claim it refuses: Error(string) reverts recorded on the old
-// Sepolia bridge (the same encoding on V6), and Rainlang's InvalidSignature(0).
+// Sepolia bridge (the same encoding on V6), and Rainlang's InvalidSignature(0). The
+// order reading seat M-1 of a claim of fewer seats panics with 0x32, out of bounds.
 const SEPOLIA = {
 	nonceUsed:
 		'0x08c379a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000124e6f6e636520616c726561647920757365640000000000000000000000000000',
@@ -36,6 +61,14 @@ const SEPOLIA = {
 		'0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000d4f72646572206578706972656400000000000000000000000000000000000000',
 	invalidSignature: '0x52bf98480000000000000000000000000000000000000000000000000000000000000000'
 } as const
+const invalidSignature = (i: bigint) =>
+	encodeErrorResult({ abi: orderbookAbi, errorName: 'InvalidSignature', args: [i] })
+const panic = (code: bigint) =>
+	encodeErrorResult({
+		abi: parseAbi(['error Panic(uint256)']),
+		errorName: 'Panic',
+		args: [code]
+	})
 
 const ensure = (reason: string) =>
 	encodeErrorResult({
@@ -121,6 +154,7 @@ type Wallet = {
 	accountDuringCheck?: string
 	chainAfterCheck?: Hex
 	coupon?: typeof COUPON
+	build?: Record<string, string>
 }
 
 async function wallet({
@@ -132,7 +166,8 @@ async function wallet({
 	account = RECIPIENT,
 	accountDuringCheck,
 	chainAfterCheck,
-	coupon = COUPON
+	coupon = COUPON,
+	build = BUILDS[network]
 }: Wallet) {
 	vi.useFakeTimers()
 	const asked: string[] = []
@@ -170,7 +205,7 @@ async function wallet({
 		return fromChain
 	})
 	vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
-	const { claim, ethereum, store } = await asBuild(BUILDS[network], async () => ({
+	const { claim, ethereum, store } = await asBuild(build, async () => ({
 		claim: await import('./claim'),
 		ethereum: await import('./ethereum'),
 		store: await import('./stores/transactionStore')
@@ -312,6 +347,83 @@ describe('a claim the order refuses', () => {
 
 		await expect(claim()).rejects.toMatchObject({ message })
 		expect(asked).not.toContain('eth_sendTransaction')
+	})
+})
+
+describe('a claim of an M-of-N claim order', () => {
+	it('carries every seat of the coupon, in order, each with the same nine words', async () => {
+		const { params, claim } = await wallet({
+			ethCallAnswers: [nodeRevert(ensure('Wrong output amount'))],
+			coupon: TWO_SEATS,
+			build: TWO_OF_THREE
+		})
+
+		await expect(claim()).rejects.toMatchObject({ message: VAULT_SHORT })
+		const { args } = decodeFunctionData({
+			abi: orderbookAbi,
+			data: (params.eth_call as { data: Hex }).data
+		})
+		const [{ signedContext }] = (args[0] as unknown as { orders: { signedContext: unknown[] }[] })
+			.orders
+		const words = COUPON.context.map(word => `0x${word.toString(16).padStart(64, '0')}`)
+		expect(signedContext).toEqual([
+			{
+				signer: getAddress(COUPON.seats[0].signer),
+				signature: COUPON.seats[0].signature,
+				context: words
+			},
+			{ signer: getAddress(SECOND_SEAT.signer), signature: SECOND_SEAT.signature, context: words }
+		])
+	})
+
+	it.each([
+		[
+			'with one signer in two seats',
+			ensure('Duplicate signer'),
+			`This coupon carries one signer's signature twice, and this bridge needs the signatures of 2 different signers. ${REISSUE_IF_UNPAID}`
+		],
+		[
+			'whose seats signed different coupons',
+			ensure('Coupons differ'),
+			`The signatures on this coupon do not all sign the same coupon. ${REISSUE_IF_UNPAID}`
+		],
+		[
+			'with a second signature that does not match',
+			invalidSignature(1n),
+			"Signature 2 of this coupon's 2 does not match its contents, so it was changed or cut short. Copy the coupon from your Unyt app again."
+		],
+		[
+			'from a signer the order does not list',
+			ensure('Wrong signer'),
+			`This coupon was signed by a key this bridge does not accept. ${REISSUE_IF_UNPAID}`
+		],
+		['that panics for another reason', panic(0x11n), REFUSED]
+	] as const)('%s is not sent, and says why', async (_case, data, message) => {
+		const { asked, claim } = await wallet({
+			ethCallAnswers: [metaMaskRevert(data)],
+			coupon: TWO_SEATS,
+			build: TWO_OF_THREE
+		})
+
+		await expect(claim()).rejects.toMatchObject({ message })
+		expect(asked).not.toContain('eth_sendTransaction')
+	})
+
+	it('with fewer signatures than the order needs says so, and logs the panic', async () => {
+		const refusal = nodeRevert(panic(0x32n))
+		const { asked, claim, logs } = await wallet({
+			ethCallAnswers: [refusal],
+			build: TWO_OF_THREE
+		})
+
+		await expect(claim()).rejects.toMatchObject({
+			message: `This coupon carries one signature, and this bridge needs 2 signatures, so part of it is missing. Copy the coupon from your Unyt app again. ${REISSUE_IF_UNPAID}`
+		})
+		expect(asked).not.toContain('eth_sendTransaction')
+		expect(logs()[0][1]).toMatchObject({
+			couponSigners: [COUPON.seats[0].signer],
+			revert: { reason: 'Panic', errorName: 'Panic', args: [0x32n] }
+		})
 	})
 })
 
@@ -559,7 +671,7 @@ describe('a claim the wallet cannot check', () => {
 	it('for a cause the site does not know says so in general terms, and logs the cause', async () => {
 		const { claim, logs } = await wallet({
 			ethCallAnswers: [],
-			coupon: deserializeSignedContext(`${COUPON.signer},${COUPON.signature},1`)
+			coupon: { ...COUPON, context: [1n] }
 		})
 
 		await expect(claim()).rejects.toMatchObject({ message: FAILED })
