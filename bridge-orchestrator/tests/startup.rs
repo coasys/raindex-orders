@@ -56,7 +56,11 @@ fn signer() -> Vec<(&'static str, String)> {
             "SIGNER_PRIVATE_KEY",
             "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
         ),
-        ("CLAIM_SIGNER", "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+        (
+            "CLAIM_SIGNERS",
+            "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+        ),
+        ("CLAIM_THRESHOLD", "1"),
         (
             "CLAIM_INTERPRETER",
             "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
@@ -341,7 +345,11 @@ fn run_with_nothing_set_but_its_key_and_bridge_takes_testnet_values_and_says_so(
         "{logged}"
     );
     assert!(
-        logged.contains("using TestNet's values for ORDERBOOK_ADDRESS, VAULT_ID, CLAIM_SIGNER, CLAIM_INTERPRETER, CLAIM_STORE"),
+        logged.contains("using TestNet's values for ORDERBOOK_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE"),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("using TestNet's coupon signer: the test signer 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37 alone"),
         "{logged}"
     );
     assert!(
