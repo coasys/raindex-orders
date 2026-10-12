@@ -175,9 +175,14 @@ deploy_order_via_vault() {
 
     # TestNet coupons are signed by the test signer alone, whose key is in
     # src/Constants.sol, unless VALID_SIGNERS and SIGNER_THRESHOLD name others.
+    # They come as a pair, as the website takes them: one given alone never
+    # pairs with the other's default.
     [ -z "${VALID_SIGNER:-}" ] || die "VALID_SIGNER is replaced by VALID_SIGNERS and SIGNER_THRESHOLD: unset it"
-    VALID_SIGNERS="${VALID_SIGNERS:-0x8E72b7568738da52ca3DCd9b24E178127A4E7d37}"
-    SIGNER_THRESHOLD="${SIGNER_THRESHOLD:-1}"
+    if [ -z "${VALID_SIGNERS:-}" ] && [ -z "${SIGNER_THRESHOLD:-}" ]; then
+        VALID_SIGNERS=0x8E72b7568738da52ca3DCd9b24E178127A4E7d37 SIGNER_THRESHOLD=1
+    fi
+    [ -n "${VALID_SIGNERS:-}" ] || die "SIGNER_THRESHOLD is set and VALID_SIGNERS is not: set both, or neither for the test signer alone"
+    [ -n "${SIGNER_THRESHOLD:-}" ] || die "VALID_SIGNERS is set and SIGNER_THRESHOLD is not: set both, or neither for the test signer alone"
     echo "Using vault: $BASE_SEPOLIA_LOCK_VAULT_ADDRESS"
     echo "Claim input token: $CLAIM_INPUT_TOKEN"
     echo "Coupon signers: $SIGNER_THRESHOLD of $VALID_SIGNERS"
