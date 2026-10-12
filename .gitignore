@@ -26,3 +26,5 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
 target/
+# test/local-ui.sh: its anvil, keystore and deploy logs
+/.local-ui/
