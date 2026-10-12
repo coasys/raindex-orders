@@ -69,6 +69,8 @@ npm run dev
 # Open http://localhost:5173
 ```
 
+To try Lock and Claim with MetaMask before deploying, `test/local-ui.sh <your address>` deploys the TestNet on a local anvil fork of Base Sepolia and points the dev server at it, and `npm run make-coupon` in `ui/` makes a coupon to claim: [DEPLOY.md](./DEPLOY.md#test-the-website-locally).
+
 ### 3. Run the bridge orchestrator
 
 ```bash

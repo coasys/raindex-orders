@@ -129,6 +129,27 @@ The website waits for a sent transaction by polling every 2 seconds, Base's bloc
 
 ## Testing the Complete Flow
 
+### Test the website locally
+
+`test/local-ui.sh` deploys the TestNet on an anvil fork of Base Sepolia on your machine, so you can lock mock HOT and claim it back in the website with MetaMask before deploying to Base Sepolia. Nothing goes to a live chain. It needs Foundry, and `npm ci` run at the top of the repo and in `ui/`.
+
+```bash
+test/local-ui.sh 0xYourMetaMaskAddress
+```
+
+It starts anvil on `127.0.0.1:8545`, forking `FORK_URL` (`https://sepolia.base.org` by default), so the chain ID stays 84532 and Raindex V6 and Rainlang are there. Then it runs `deploy-base-sepolia.sh all` (mock HOT, HoloLockVault, ClaimInputToken, and the claim order accepting the test signer's coupons) signed by anvil's published account 0, with its addresses in `.local-ui/deploy.env`, not your `.env`. It reads the deploy record back with `rotate-claim-signer.sh record`, gives your address 100 ETH and 10000 mock HOT, and writes `ui/.env.development.local`: the record's `PUBLIC_*` lines, `BASE_SEPOLIA_RPC_URL=http://127.0.0.1:8545`, and account 0 as the faucet's key. Only `npm run dev` reads that file; `npm run build` never does. Then it prints the next steps:
+
+1. `cd ui && npm run dev`, and open http://localhost:5173.
+2. In MetaMask, add a network with RPC URL `http://127.0.0.1:8545` and chain ID 84532 (or add that RPC URL to an existing Base Sepolia network and select it), and import the mock HOT token it prints.
+3. Lock on `/lock`. Then make a coupon, from `ui/`, and open the claim link it prints:
+
+   ```bash
+   npm run make-coupon -- --recipient 0xYourMetaMaskAddress --amount 5
+   ```
+
+   `make-coupon` signs as the test signer, whose key is public in `src/Constants.sol`, for the claim order in `ui/.env.development.local`. `--expiry <unix seconds>` and `--nonce <n>` override its defaults: a week from the chain's time, and a random nonce. It refuses mainnet (chain 1, or `PUBLIC_NETWORK=mainnet`), and any chain but Base Sepolia. A claim pays out of what has been locked, so lock at least the coupon's amount first.
+4. `test/local-ui.sh stop` stops anvil. Each start deploys afresh, so run the script again after a stop, and clear MetaMask's activity for the account (Settings > Advanced > Clear activity tab data), whose nonces are then stale.
+
 ### Lock Flow (HOT -> Bridged HOT)
 
 1. **Start the bridge orchestrator:**
