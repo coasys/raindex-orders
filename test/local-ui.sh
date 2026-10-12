@@ -60,6 +60,10 @@ for tool in anvil cast forge jq node; do
 done
 [[ -d node_modules ]] || fail "run npm ci at the top of the repo first: the deploy composes the claim expression with node"
 [[ -d ui/node_modules ]] || fail "run npm ci in ui/ first"
+# The Solidity dependencies are Soldeer packages, not in git: dependencies/<name>-<version>.
+while read -r dep; do
+	[[ -d dependencies/$dep ]] || fail "dependencies/$dep is missing: run forge soldeer install at the top of the repo first"
+done < <(awk -F'"' '/^\[\[dependencies\]\]/{n=""} /^name = /{n=$2} /^version = "/ && n {print n "-" $2}' soldeer.lock)
 
 # Nothing inherited may point the deploy at a real chain.
 unset ETH_RPC_URL BASE_SEPOLIA_RPC_URL NETWORK VALID_SIGNER PRIVATE_KEY
