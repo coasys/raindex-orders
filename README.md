@@ -137,7 +137,8 @@ forge soldeer install
 forge build
 
 # Run tests: the unit tests, and the claim order on forks of Ethereum mainnet
-# (RPC_URL_ETH) and Base Sepolia (RPC_URL_BASE_SEPOLIA), public RPCs by default
+# (RPC_URL_ETH) and Base Sepolia (RPC_URL_BASE_SEPOLIA), public RPCs by default,
+# at the latest block unless FORK_BLOCK_ETH / FORK_BLOCK_BASE_SEPOLIA pins one
 forge test
 
 # Build the bridge orchestrator

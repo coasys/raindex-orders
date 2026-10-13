@@ -43,7 +43,12 @@ contract TestClaim is Test, SignContext {
     bytes32 internal orderHash;
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("RPC_URL_ETH", string("https://ethereum-rpc.publicnode.com")));
+        // FORK_BLOCK_ETH pins the fork to a block (an archive RPC serves an old one);
+        // unset, it is the latest.
+        string memory rpc = vm.envOr("RPC_URL_ETH", string("https://ethereum-rpc.publicnode.com"));
+        uint256 forkBlock = vm.envOr("FORK_BLOCK_ETH", uint256(0));
+        if (forkBlock == 0) vm.createSelectFork(rpc);
+        else vm.createSelectFork(rpc, forkBlock);
 
         (signer, signerKey) = makeAddrAndKey("coupon signer");
         inputToken = new ClaimInputToken();
@@ -218,6 +223,9 @@ contract TestClaim is Test, SignContext {
         Float io = LibDecimalFloat.fromFixedDecimalLosslessPacked(40e18, 18);
 
         // The order reads the signer, and a claim with no coupon has no signers column.
+        // The out-of-bounds panic is the pinned interpreter's, not a contract: it pins
+        // that the claim fails there rather than at a later check, and a Rainlang
+        // release that answers otherwise shows up here.
         vm.prank(claimer);
         vm.expectRevert(stdError.indexOOBError);
         RAINDEX.takeOrders4(TakeOrdersConfigV5(io, io, CLAIM_IO_RATIO, true, orders, ""));
