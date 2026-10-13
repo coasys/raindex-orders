@@ -32,21 +32,31 @@ refuses to start, naming each variable at fault, when:
 - the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
   `CLAIM_*` values describe does not hash to `ORDER_HASH`
 - `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
-- `SIGNER_PRIVATE_KEY` and `SAFE_OWNER_KEYS` are both set, or neither
-- `CLAIM_SIGNER` is a contract, such as a Safe, and `SIGNER_PRIVATE_KEY` is
-  set: a key cannot sign for it
-- `CLAIM_SIGNER` is a key and `SAFE_OWNER_KEYS` is set
-- `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
-- `CLAIM_SIGNER` is a Safe and `SAFE_OWNER_KEYS` does not hold as many keys as
-  its threshold, holds a key that is not one of its owners, or holds one
-  twice; or `CLAIM_SIGNER` does not answer as a Safe, or does not sign under
-  the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s chain
-- the claim order does not accept a coupon signed with that key, or by those
-  owners for the Safe. `run` simulates `takeOrders4` with a one-wei coupon to
-  the signer, and starts only if the order pays it, or answers `MinimumIO`
-  because its vault is empty. For a Safe, that simulation runs the Safe's own
-  `isValidSignature` over the owners' signatures.
-- on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
+- `CLAIM_SIGNER`, the one signer before M-of-N, is set: `CLAIM_SIGNERS` and
+  `CLAIM_THRESHOLD` replace it
+- none of `SIGNER_PRIVATE_KEY`, `SAFE_OWNER_KEYS` and `SIGNER_SERVICES` is set,
+  or the signers they sign for are fewer than `CLAIM_THRESHOLD`
+- one of them signs for a signer `CLAIM_SIGNERS` does not list, or two sign for
+  the same signer
+- `CLAIM_SIGNERS` lists a key with an EIP-7702 delegation, or a contract that
+  `SIGNER_PRIVATE_KEY` holds a key for
+- `SAFE_OWNER_KEYS` is set without `SAFE_SIGNER` while `CLAIM_SIGNERS` lists
+  more than one signer, or `SAFE_SIGNER` without `SAFE_OWNER_KEYS`
+- `SAFE_SIGNER` has no contract; does not answer as a Safe, or does not sign
+  under the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s chain; or
+  `SAFE_OWNER_KEYS` does not hold as many keys as its threshold, holds a key
+  that is not one of its owners, or holds one twice
+- a signer service answers `GET /signer` for another signer or chain. One that
+  does not answer is logged, and startup passes while the signers that can
+  sign are at least `CLAIM_THRESHOLD`
+- the claim order does not take a coupon signed here by `CLAIM_THRESHOLD`
+  signers, or takes one signed by one fewer. `run` simulates `takeOrders4` with
+  one-wei coupons to the first signer, and starts only if the order pays the
+  first, or answers `MinimumIO` because its vault is empty, and refuses the
+  second for reading a seat it does not carry. With fewer signers here than
+  `CLAIM_THRESHOLD`, it simulates as many as there are, which the order must
+  refuse in the same way. A Safe's seat runs the Safe's own `isValidSignature`.
+- on `mainnet`, one of `SIGNER_PRIVATE_KEY` or `SAFE_OWNER_KEYS` is the test
   signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
@@ -346,14 +356,17 @@ rest is required on `base-sepolia` as on `mainnet`.
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
-| `SIGNER_PRIVATE_KEY` | One of the two | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
-| `SAFE_OWNER_KEYS` | One of the two | -- The keys of as many owners of `CLAIM_SIGNER` as its threshold, separated by commas, when it is a Safe. The orchestrator signs each coupon as all of them: it is one party, however many keys it holds ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SIGNER_PRIVATE_KEY` | One of the three | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). Keys of signers `CLAIM_SIGNERS` lists, separated by commas |
+| `SAFE_SIGNER` | With `SAFE_OWNER_KEYS` | -- The Safe of `CLAIM_SIGNERS` that `SAFE_OWNER_KEYS` signs for; may be left out when `CLAIM_SIGNERS` lists only that Safe |
+| `SAFE_OWNER_KEYS` | One of the three | -- The keys of as many owners of `SAFE_SIGNER` as its threshold, separated by commas. The orchestrator signs each coupon as all of them: it is one party, however many keys it holds ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SIGNER_SERVICES` | One of the three | -- `<signer>=<base URL>` entries, separated by commas: an independent party's signer service for each listed signer ([docs/signer-service.md](../docs/signer-service.md)). On `mainnet`, https, or http to this machine |
 | `ORDER_HASH` | Yes | -- |
 | `ORDER_OWNER` | Yes | -- (the vault) |
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |
 | `TOKEN_ADDRESS` | Yes | -- (the mock HOT deploy-base-sepolia.sh deployed) |
 | `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
-| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address, or the Safe) |
+| `CLAIM_SIGNERS` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, the test signer alone, only when `CLAIM_THRESHOLD` is not set either (the claim order's N signers, keys or Safes, separated by commas, in the deploy record's order) |
+| `CLAIM_THRESHOLD` | mainnet | `1`, only when `CLAIM_SIGNERS` is not set either (M: how many of them sign each coupon) |
 | `CLAIM_INTERPRETER` | mainnet | `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_STORE` | mainnet | `0x1Aa775533E28B1D843e1A589034984E3a62005DC` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_BYTECODE` | Yes | -- (the claim order's parsed expression, as hex; a V6 order carries its bytecode in place of an expression address) |

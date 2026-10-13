@@ -2,15 +2,17 @@
 # Deploys the HOT bridge on Ethereum mainnet, in one transaction, with a Safe as
 # the vault admin from the start. DEPLOY.md, "Mainnet deploy":
 #   ETH_RPC_URL=... ADMIN_ADDRESS=<the Safe> ADMIN_SAFE_THRESHOLD=2 ADMIN_SAFE_OWNERS=0x..,0x..,0x.. \
-#   VALID_SIGNER=0x... ./deploy-mainnet.sh --ledger
-# One key as the admin needs UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes.
+#   VALID_SIGNERS=0x..,0x..,0x.. SIGNER_THRESHOLD=2 ./deploy-mainnet.sh --ledger
+# VALID_SIGNERS are the coupon signers, keys or Safes, and SIGNER_THRESHOLD how many
+# of them sign each coupon. One key as the admin needs UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes.
 set -euo pipefail
 cd "$(dirname "$0")"
 source script/forge-broadcast.sh
 
 : "${ETH_RPC_URL:?ETH_RPC_URL is required}"
 : "${ADMIN_ADDRESS:?ADMIN_ADDRESS is required}"
-: "${VALID_SIGNER:?VALID_SIGNER is required}"
+: "${VALID_SIGNERS:?VALID_SIGNERS is required: the coupon signers, separated by commas}"
+: "${SIGNER_THRESHOLD:?SIGNER_THRESHOLD is required: how many of VALID_SIGNERS sign each coupon}"
 require_wallet "$@"
 
 script=script/DeployMainnet.s.sol:DeployMainnet

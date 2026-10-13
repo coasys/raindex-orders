@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CAL
 pragma solidity =0.8.25;
 
-import {Test, Vm, console2} from "forge-std/Test.sol";
+import {Test, Vm, console2, stdError} from "forge-std/Test.sol";
 import {
     OrderV4,
     IOV2,
@@ -119,20 +119,66 @@ abstract contract ForkRehearsal is Test, SignContext {
         return block.timestamp + 7 days;
     }
 
-    /// The claim as the website sends it: takeOrders4 for exactly the coupon's amount.
-    function claimConfig(SignedContextV1 memory coupon) internal view returns (TakeOrdersConfigV5 memory) {
-        SignedContextV1[] memory signed = new SignedContextV1[](1);
-        signed[0] = coupon;
+    /// Key `i` of REHEARSAL_SIGNER_KEYS, the three keys the launch's claim order
+    /// lists, in its order.
+    function signerKey(uint256 i) internal view returns (uint256) {
+        return vm.envUint("REHEARSAL_SIGNER_KEYS", ",")[i];
+    }
+
+    /// Seat `i` of a claim: `c` signed by key `i` of REHEARSAL_SIGNER_KEYS.
+    function keySeat(uint256 i, bytes32[] memory c) internal view returns (SignedContextV1 memory) {
+        return signContext(signerKey(i), c);
+    }
+
+    function seats(SignedContextV1 memory a) internal pure returns (SignedContextV1[] memory s) {
+        s = new SignedContextV1[](1);
+        s[0] = a;
+    }
+
+    function seats(SignedContextV1 memory a, SignedContextV1 memory b)
+        internal
+        pure
+        returns (SignedContextV1[] memory s)
+    {
+        s = new SignedContextV1[](2);
+        (s[0], s[1]) = (a, b);
+    }
+
+    function seats(SignedContextV1 memory a, SignedContextV1 memory b, SignedContextV1 memory c)
+        internal
+        pure
+        returns (SignedContextV1[] memory s)
+    {
+        s = new SignedContextV1[](3);
+        (s[0], s[1], s[2]) = (a, b, c);
+    }
+
+    /// The claim as the website sends it: takeOrders4 for exactly the coupon's
+    /// amount, every seat a signed context, in order.
+    function claimConfig(SignedContextV1[] memory signed) internal view returns (TakeOrdersConfigV5 memory) {
         TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
         orders[0] = TakeOrderConfigV4(order(), 0, 0, signed);
-        Float amount = Float.wrap(coupon.context[1]);
+        Float amount = Float.wrap(signed[0].context[1]);
         return TakeOrdersConfigV5(amount, amount, CLAIM_IO_RATIO, true, orders, "");
     }
 
-    function claim(SignedContextV1 memory coupon) internal {
-        TakeOrdersConfigV5 memory config = claimConfig(coupon);
+    function claim(SignedContextV1[] memory signed) internal {
+        TakeOrdersConfigV5 memory config = claimConfig(signed);
         vm.prank(claimer);
         RAINDEX.takeOrders4(config);
+    }
+
+    /// `signer1,signature1,...,signerK,signatureK,c0..c8` as the orchestrator
+    /// writes a coupon, the words as decimal numbers.
+    function serialized(SignedContextV1[] memory signed) internal pure returns (string memory text) {
+        for (uint256 i = 0; i < signed.length; i++) {
+            text = string.concat(
+                text, i == 0 ? "" : ",", vm.toString(signed[i].signer), ",", vm.toString(signed[i].signature)
+            );
+        }
+        for (uint256 i = 0; i < signed[0].context.length; i++) {
+            text = string.concat(text, ",", vm.toString(uint256(signed[0].context[i])));
+        }
     }
 
     /// The vault's admin changed once since `fromBlock`: from `bridge`, the
@@ -190,12 +236,8 @@ abstract contract ForkRehearsal is Test, SignContext {
 
 /// The bridge as deploy-mainnet.sh launches it: a Safe of three owners that
 /// needs two signatures is the vault admin from the deploy's one transaction,
-/// and a key is the coupon signer.
+/// and the claim order takes coupons signed by 2 of 3 keys, REHEARSAL_SIGNER_KEYS.
 contract LaunchRehearsal is ForkRehearsal {
-    function signed(bytes32[] memory c) private view returns (SignedContextV1 memory) {
-        return signContext(vm.envUint("REHEARSAL_SIGNER_KEY"), c);
-    }
-
     function testTheVaultHoldsWhatTheDeployRecordSays() external onFork {
         assertEq(address(vault.token()), address(MAINNET_HOT));
         assertEq(address(vault.orderbook()), address(RAINDEX));
@@ -217,35 +259,82 @@ contract LaunchRehearsal is ForkRehearsal {
         assertEq(vault.vaultBalance(), before + 250e18);
     }
 
-    function testACouponSignedAsTheOrchestratorSignsClaimsTheLockedHot() external onFork {
+    function testACouponSignedByTwoOfTheThreeKeysClaimsTheLockedHot() external onFork {
         lock(100e18);
         uint256 before = vault.vaultBalance();
+        bytes32[] memory c = context(40e18, inAWeek(), 1);
 
-        claim(signed(context(40e18, inAWeek(), 1)));
+        claim(seats(keySeat(0, c), keySeat(1, c)));
 
         assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
         assertEq(vault.vaultBalance(), before - 40e18);
     }
 
-    function testASecondClaimWithTheSameNonceFails() external onFork {
+    function testAnyTwoOfTheThreeClaimInAnyOrder() external onFork {
         lock(100e18);
-        claim(signed(context(40e18, inAWeek(), 2)));
+        bytes32[] memory c = context(10e18, inAWeek(), 2);
+        claim(seats(keySeat(2, c), keySeat(0, c)));
+        c = context(10e18, inAWeek(), 3);
+        claim(seats(keySeat(1, c), keySeat(2, c)));
 
-        vm.expectRevert(bytes("Nonce already used"));
-        claim(signed(context(40e18, inAWeek() + 1, 2)));
+        assertEq(MAINNET_HOT.balanceOf(claimer), 20e18);
     }
 
-    function testACouponFromAnotherSignerFails() external onFork {
+    function testACouponSignedByAllThreeClaims() external onFork {
         lock(100e18);
-        (, uint256 otherKey) = makeAddrAndKey("not the coupon signer");
+        bytes32[] memory c = context(40e18, inAWeek(), 4);
+
+        claim(seats(keySeat(0, c), keySeat(1, c), keySeat(2, c)));
+
+        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+    }
+
+    function testACouponSignedByOneKeyFails() external onFork {
+        lock(100e18);
+
+        vm.expectRevert(stdError.indexOOBError);
+        claim(seats(keySeat(0, context(40e18, inAWeek(), 5))));
+    }
+
+    function testOneKeyInBothSeatsFails() external onFork {
+        lock(100e18);
+        bytes32[] memory c = context(40e18, inAWeek(), 6);
+
+        vm.expectRevert(bytes("Duplicate signer"));
+        claim(seats(keySeat(1, c), keySeat(1, c)));
+    }
+
+    function testAKeyTheOrderDoesNotListFails() external onFork {
+        lock(100e18);
+        (, uint256 otherKey) = makeAddrAndKey("not a coupon signer");
+        bytes32[] memory c = context(40e18, inAWeek(), 7);
 
         vm.expectRevert(bytes("Wrong signer"));
-        claim(signContext(otherKey, context(40e18, inAWeek(), 3)));
+        claim(seats(keySeat(0, c), signContext(otherKey, c)));
+    }
+
+    function testSeatsSigningDifferentCouponsFail() external onFork {
+        lock(100e18);
+        bytes32[] memory c = context(40e18, inAWeek(), 8);
+
+        vm.expectRevert(bytes("Coupons differ"));
+        claim(seats(keySeat(0, c), keySeat(1, context(80e18, inAWeek(), 8))));
+    }
+
+    function testASecondClaimWithTheSameNonceFails() external onFork {
+        lock(100e18);
+        bytes32[] memory c = context(40e18, inAWeek(), 9);
+        claim(seats(keySeat(0, c), keySeat(1, c)));
+
+        c = context(40e18, inAWeek() + 1, 9);
+        vm.expectRevert(bytes("Nonce already used"));
+        claim(seats(keySeat(1, c), keySeat(2, c)));
     }
 
     function testAnExpiredCouponFails() external onFork {
         lock(100e18);
-        SignedContextV1 memory coupon = signed(context(40e18, block.timestamp + 60, 4));
+        bytes32[] memory c = context(40e18, block.timestamp + 60, 10);
+        SignedContextV1[] memory coupon = seats(keySeat(0, c), keySeat(1, c));
         vm.warp(block.timestamp + 60);
 
         vm.expectRevert(bytes("Order expired"));
@@ -276,8 +365,10 @@ contract LaunchRehearsal is ForkRehearsal {
     }
 }
 
-/// The bridge after the coupon signer's rotation: the vault admin and the
-/// coupon signer are each a Safe of three owners that needs two signatures.
+/// The bridge after the rotation of its claim order: the vault admin is a Safe
+/// of three owners that needs two signatures, and the claim order takes coupons
+/// signed by 2 of keys 0 and 1 of REHEARSAL_SIGNER_KEYS and SIGNER_SAFE, a Safe
+/// of three owners that needs two signatures. Key 2 is no longer listed.
 contract SafeSignerRehearsal is ForkRehearsal {
     error InvalidSignature(uint256 i);
 
@@ -285,18 +376,25 @@ contract SafeSignerRehearsal is ForkRehearsal {
         return vm.envAddress("SIGNER_SAFE");
     }
 
-    function safeSigned(bytes32[] memory c, uint256[] memory ownerKeys) private view returns (SignedContextV1 memory) {
+    function safeSeat(bytes32[] memory c, uint256[] memory ownerKeys) private view returns (SignedContextV1 memory) {
         return SignedContextV1(safe(), c, LibSafe.couponSignature(vm, safe(), ownerKeys, LibCoupon.digest(c)));
     }
 
-    function safeSigned(bytes32[] memory c, string memory ownerKeys) private view returns (SignedContextV1 memory) {
-        return safeSigned(c, vm.envUint(ownerKeys, ","));
+    function safeSeat(bytes32[] memory c, string memory ownerKeys) private view returns (SignedContextV1 memory) {
+        return safeSeat(c, vm.envUint(ownerKeys, ","));
     }
 
-    function expectInvalidSignature(SignedContextV1 memory coupon) private {
+    function oneOwnerAndAStranger() private returns (uint256[] memory keys) {
+        (, uint256 stranger) = makeAddrAndKey("not an owner");
+        keys = new uint256[](2);
+        (keys[0], keys[1]) = (vm.envUint("REHEARSAL_SIGNER_ONE_OWNER_KEY"), stranger);
+    }
+
+    /// A claim whose seat 1, the Safe's, carries a signature the Safe refuses.
+    function expectSafeSeatRefused(bytes32[] memory c, SignedContextV1 memory safeSeat_) private {
         lock(100e18);
-        vm.expectRevert(abi.encodeWithSelector(InvalidSignature.selector, 0));
-        claim(coupon);
+        vm.expectRevert(abi.encodeWithSelector(InvalidSignature.selector, 1));
+        claim(seats(keySeat(0, c), safeSeat_));
     }
 
     function testTheAdminIsASafeWhoseOwnersActedThroughIt() external onFork {
@@ -313,82 +411,126 @@ contract SafeSignerRehearsal is ForkRehearsal {
         assertFalse(RAINDEX.orderExists(vm.envBytes32("PREVIOUS_ORDER_HASH")));
     }
 
-    function testACouponCarryingTwoOwnerSignaturesClaims() external onFork {
+    function testAKeyAndTheSafeWithTwoOwnerSignaturesClaim() external onFork {
         lock(100e18);
         uint256 before = vault.vaultBalance();
+        bytes32[] memory c = context(40e18, inAWeek(), 20);
 
-        claim(safeSigned(context(40e18, inAWeek(), 5), "REHEARSAL_SIGNER_OWNER_KEYS"));
+        claim(seats(keySeat(0, c), safeSeat(c, "REHEARSAL_SIGNER_OWNER_KEYS")));
 
         assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
         assertEq(vault.vaultBalance(), before - 40e18);
     }
 
-    function testACouponCarryingOneOwnerSignatureFails() external onFork {
-        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 6), "REHEARSAL_SIGNER_ONE_OWNER_KEY"));
+    function testTheSafeInSeatZeroAndTheTwoKeysClaim() external onFork {
+        lock(100e18);
+        bytes32[] memory c = context(10e18, inAWeek(), 21);
+        claim(seats(safeSeat(c, "REHEARSAL_SIGNER_OWNER_KEYS"), keySeat(1, c)));
+        c = context(10e18, inAWeek(), 22);
+        claim(seats(keySeat(1, c), keySeat(0, c)));
+
+        assertEq(MAINNET_HOT.balanceOf(claimer), 20e18);
     }
 
-    function testACouponCarryingAnOwnersAndANonOwnersSignatureFails() external onFork {
-        (, uint256 stranger) = makeAddrAndKey("not an owner");
-        uint256[] memory keys = new uint256[](2);
-        (keys[0], keys[1]) = (vm.envUint("REHEARSAL_SIGNER_ONE_OWNER_KEY"), stranger);
-
-        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 7), keys));
+    function testTheSafeWithOneOwnerSignatureFails() external onFork {
+        bytes32[] memory c = context(40e18, inAWeek(), 23);
+        expectSafeSeatRefused(c, safeSeat(c, "REHEARSAL_SIGNER_ONE_OWNER_KEY"));
     }
 
-    function testACouponCarryingOneOwnersSignatureTwiceFails() external onFork {
+    function testTheSafeWithAnOwnersAndANonOwnersSignatureFails() external onFork {
+        bytes32[] memory c = context(40e18, inAWeek(), 24);
+        expectSafeSeatRefused(c, safeSeat(c, oneOwnerAndAStranger()));
+    }
+
+    function testTheSafeWithOneOwnersSignatureTwiceFails() external onFork {
         uint256[] memory keys = new uint256[](2);
         keys[0] = vm.envUint("REHEARSAL_SIGNER_ONE_OWNER_KEY");
         keys[1] = keys[0];
-
-        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 8), keys));
+        bytes32[] memory c = context(40e18, inAWeek(), 25);
+        expectSafeSeatRefused(c, safeSeat(c, keys));
     }
 
     function testTheOwnersOfTheAdminSafeCannotSignForTheSignerSafe() external onFork {
-        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 9), "REHEARSAL_ADMIN_OWNER_KEYS"));
+        bytes32[] memory c = context(40e18, inAWeek(), 26);
+        expectSafeSeatRefused(c, safeSeat(c, "REHEARSAL_ADMIN_OWNER_KEYS"));
     }
 
-    function testACouponFromThePreviousSignerFails() external onFork {
+    function testTheSafeInBothSeatsFails() external onFork {
         lock(100e18);
+        bytes32[] memory c = context(40e18, inAWeek(), 27);
+        SignedContextV1 memory seat = safeSeat(c, "REHEARSAL_SIGNER_OWNER_KEYS");
+
+        vm.expectRevert(bytes("Duplicate signer"));
+        claim(seats(seat, seat));
+    }
+
+    function testAKeyThePreviousOrderListedAndThisOneDoesNotFails() external onFork {
+        lock(100e18);
+        bytes32[] memory c = context(40e18, inAWeek(), 28);
 
         vm.expectRevert(bytes("Wrong signer"));
-        claim(signContext(vm.envUint("REHEARSAL_SIGNER_KEY"), context(40e18, inAWeek(), 10)));
+        claim(seats(keySeat(0, c), keySeat(2, c)));
     }
 
     /// Coupons for the website's coupon-status proof, in the form the
-    /// orchestrator writes them, paying REHEARSAL_WEBSITE_CLAIMER, and the
-    /// claim of the first as calldata for it to send. The first is the one the
-    /// Safe accepts; the other two it refuses.
+    /// orchestrator writes them, each paying REHEARSAL_WEBSITE_CLAIMER, and the
+    /// claim of WEBSITE_ACCEPTED as calldata for the rehearsal to send.
+    /// WEBSITE_ACCEPTED and WEBSITE_UNCLAIMED_* the order takes; WEBSITE_REFUSED_*
+    /// it refuses, as the website must read them.
     function testPrintsCouponsForTheWebsite() external onFork {
         address recipient = vm.envAddress("REHEARSAL_WEBSITE_CLAIMER");
         bytes32[] memory c = contextFor(recipient, 40e18, inAWeek(), 100);
-        SignedContextV1 memory accepted = safeSigned(c, "REHEARSAL_SIGNER_OWNER_KEYS");
-        (, uint256 stranger) = makeAddrAndKey("not an owner");
-        uint256[] memory keys = new uint256[](2);
-        (keys[0], keys[1]) = (vm.envUint("REHEARSAL_SIGNER_ONE_OWNER_KEY"), stranger);
-        console2.log(string.concat("SAFE_COUPON=", serialized(accepted)));
-        console2.log(string.concat("ONE_OWNER_COUPON=", serialized(safeSigned(c, "REHEARSAL_SIGNER_ONE_OWNER_KEY"))));
-        console2.log(string.concat("NON_OWNER_COUPON=", serialized(safeSigned(c, keys))));
+        SignedContextV1 memory key0 = keySeat(0, c);
+        SignedContextV1 memory safeOk = safeSeat(c, "REHEARSAL_SIGNER_OWNER_KEYS");
+        SignedContextV1[] memory accepted = seats(key0, safeOk);
+        // Seat 1 names key 1, a listed signer, and carries another key's signature.
+        (, uint256 otherKey) = makeAddrAndKey("not a coupon signer");
+        SignedContextV1 memory forged = signContext(otherKey, c);
+        forged.signer = vm.addr(signerKey(1));
+
+        console2.log(string.concat("WEBSITE_ACCEPTED=", serialized(accepted)));
+        console2.log(
+            string.concat(
+                "WEBSITE_REFUSED_ONE_OWNER=", serialized(seats(key0, safeSeat(c, "REHEARSAL_SIGNER_ONE_OWNER_KEY")))
+            )
+        );
+        console2.log(
+            string.concat("WEBSITE_REFUSED_NON_OWNER=", serialized(seats(key0, safeSeat(c, oneOwnerAndAStranger()))))
+        );
+        console2.log(string.concat("WEBSITE_REFUSED_ONE_SEAT=", serialized(seats(key0))));
+        console2.log(string.concat("WEBSITE_REFUSED_KEY_TWICE=", serialized(seats(key0, key0))));
+        console2.log(string.concat("WEBSITE_REFUSED_UNLISTED=", serialized(seats(key0, keySeat(2, c)))));
+        console2.log(string.concat("WEBSITE_REFUSED_FORGED=", serialized(seats(key0, forged))));
+        bytes32[] memory other = contextFor(recipient, 10e18, inAWeek(), 101);
+        console2.log(string.concat("WEBSITE_UNCLAIMED_KEYS=", serialized(seats(keySeat(1, other), keySeat(0, other)))));
+        other = contextFor(recipient, 10e18, inAWeek(), 102);
+        console2.log(
+            string.concat(
+                "WEBSITE_UNCLAIMED_THREE_SEATS=",
+                serialized(seats(safeSeat(other, "REHEARSAL_SIGNER_OWNER_KEYS"), keySeat(0, other), keySeat(1, other)))
+            )
+        );
         console2.log(
             string.concat("CLAIM_CALLDATA=", vm.toString(abi.encodeCall(RAINDEX.takeOrders4, (claimConfig(accepted)))))
         );
+
+        // On this test's own fork: the order refuses the forged seat and takes the
+        // accepted coupon.
         lock(100e18);
-        TakeOrdersConfigV5 memory config = claimConfig(accepted);
+        TakeOrdersConfigV5 memory config = claimConfig(seats(key0, forged));
+        vm.prank(recipient);
+        vm.expectRevert(abi.encodeWithSelector(InvalidSignature.selector, 1));
+        RAINDEX.takeOrders4(config);
+        config = claimConfig(accepted);
         vm.prank(recipient);
         RAINDEX.takeOrders4(config);
         assertEq(MAINNET_HOT.balanceOf(recipient), 40e18);
     }
-
-    /// `signer,signature,c0..c8`, the words as decimal numbers.
-    function serialized(SignedContextV1 memory coupon) private pure returns (string memory text) {
-        text = string.concat(vm.toString(coupon.signer), ",", vm.toString(coupon.signature));
-        for (uint256 i = 0; i < coupon.context.length; i++) {
-            text = string.concat(text, ",", vm.toString(uint256(coupon.context[i])));
-        }
-    }
 }
 
 /// The bridge deployed with UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes: a key is the
-/// vault admin, and the signer Safe is the coupon signer from the deploy.
+/// vault admin, and the claim order lists keys 0 and 1 of REHEARSAL_SIGNER_KEYS
+/// and SIGNER_SAFE, 2 of them signing each coupon, from the deploy.
 contract SingleKeyAdminRehearsal is ForkRehearsal {
     function testTheAdminIsTheKeyFromTheDeploysBlock() external onFork {
         address admin = vm.envAddress("ADMIN_ADDRESS");
@@ -400,14 +542,29 @@ contract SingleKeyAdminRehearsal is ForkRehearsal {
         assertOnlyAdmin(vm.envAddress("HOLO_BRIDGE_DEPLOYER"));
     }
 
-    function testACouponCarryingTwoOwnerSignaturesOfTheSignerSafeClaims() external onFork {
+    function testTheSignerSafeAndAKeyClaim() external onFork {
         lock(100e18);
         address safe = vm.envAddress("SIGNER_SAFE");
-        bytes32[] memory c = context(40e18, inAWeek(), 11);
+        bytes32[] memory c = context(40e18, inAWeek(), 30);
         uint256[] memory keys = vm.envUint("REHEARSAL_SIGNER_OWNER_KEYS", ",");
 
-        claim(SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, keys, LibCoupon.digest(c))));
+        claim(
+            seats(SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, keys, LibCoupon.digest(c))), keySeat(1, c))
+        );
 
         assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+    }
+
+    function testTheSignerSafeAloneFails() external onFork {
+        lock(100e18);
+        address safe = vm.envAddress("SIGNER_SAFE");
+        bytes32[] memory c = context(40e18, inAWeek(), 31);
+        uint256[] memory keys = vm.envUint("REHEARSAL_SIGNER_OWNER_KEYS", ",");
+        // Signed before expectRevert: the Safe's signature reads the Safe.
+        SignedContextV1[] memory one =
+            seats(SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, keys, LibCoupon.digest(c))));
+
+        vm.expectRevert(stdError.indexOOBError);
+        claim(one);
     }
 }

@@ -17,18 +17,19 @@ const VECTOR_ORDER = {
 	PUBLIC_CLAIM_INPUT_TOKEN: '0x1234567890123456789012345678901234567890'
 }
 
-/** A TestNet Worker's build variables: the vector's order, accepting the test signer. */
+/** A TestNet Worker's build variables: the vector's order, accepting the test signer alone. */
 export const BASE_SEPOLIA_BUILD: Record<string, string> = {
 	PUBLIC_NETWORK: 'base-sepolia',
 	...(BASE_SEPOLIA_DEFAULTS as Record<string, string>),
 	...VECTOR_ORDER
 }
 
-/** A MainNet Worker's build variables: the vector's order, accepting anvil's third account. */
+/** A MainNet Worker's build variables: the vector's order, accepting anvil's third account alone. */
 export const MAINNET_BUILD: Record<string, string> = {
 	PUBLIC_NETWORK: 'mainnet',
 	...VECTOR_ORDER,
-	PUBLIC_CLAIM_SIGNER: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
+	PUBLIC_CLAIM_SIGNERS: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
+	PUBLIC_CLAIM_THRESHOLD: '1'
 }
 
 /** `build` with another store, so another claim order, hashed to its own hash. */

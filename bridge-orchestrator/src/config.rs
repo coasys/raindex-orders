@@ -67,8 +67,10 @@ impl Network {
 /// so a mainnet run names every value it lacks. Raindex V6 and the Rainlang
 /// contracts are at the same address on every chain, Base Sepolia included.
 /// TestNet's mock HOT, vault and claim order are not deployed on Base Sepolia
-/// yet, so a base-sepolia run names those too.
-const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
+/// yet, so a base-sepolia run names those too. TestNet's coupon signer, the test
+/// signer alone, is CLAIM_SIGNERS and CLAIM_THRESHOLD together, which
+/// src/signer.rs defaults as a pair.
+const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 5] = [
     ("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),
     (
         "ORDERBOOK_ADDRESS",
@@ -78,7 +80,6 @@ const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
         "VAULT_ID",
         "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
     ),
-    ("CLAIM_SIGNER", "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"),
     (
         "CLAIM_INTERPRETER",
         "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",

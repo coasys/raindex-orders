@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ConfigEnv, UserConfig } from 'vite'
-import { BASE_SEPOLIA_DEFAULTS, BUILD_VARIABLES } from '../network'
+import { BASE_SEPOLIA_DEFAULTS, BUILD_VARIABLES, REPLACED_VARIABLES } from '../network'
 import { BASE_SEPOLIA_BUILD, BUILDS, MAINNET_BUILD } from '../testing/builds'
 import { bridgeConfig } from './bridgeConfig'
 
 // No .env file is read: the build variables are the process's alone.
 const envDir = '/nonexistent/bridge-build'
 let outside: Record<string, string | undefined>
+const VARIABLES = [...BUILD_VARIABLES, ...Object.keys(REPLACED_VARIABLES)]
 
 /** Runs the plugin as `vite build` does. */
 function build() {
@@ -17,8 +18,8 @@ function build() {
 }
 
 beforeEach(() => {
-	outside = Object.fromEntries(BUILD_VARIABLES.map(key => [key, process.env[key]]))
-	for (const key of BUILD_VARIABLES) delete process.env[key]
+	outside = Object.fromEntries(VARIABLES.map(key => [key, process.env[key]]))
+	for (const key of VARIABLES) delete process.env[key]
 })
 
 afterEach(() => {
@@ -49,7 +50,7 @@ describe('the build', () => {
 		expect(build).not.toThrow()
 		expect(info).toHaveBeenCalledWith(
 			expect.stringContaining(
-				"bridge build: TestNet's values for PUBLIC_NETWORK, PUBLIC_ORDERBOOK_ADDRESS, PUBLIC_CLAIM_SIGNER, PUBLIC_CLAIM_INTERPRETER, PUBLIC_CLAIM_STORE"
+				"bridge build: TestNet's values for PUBLIC_NETWORK, PUBLIC_ORDERBOOK_ADDRESS, PUBLIC_CLAIM_SIGNERS, PUBLIC_CLAIM_THRESHOLD, PUBLIC_CLAIM_INTERPRETER, PUBLIC_CLAIM_STORE"
 			)
 		)
 		info.mockRestore()
@@ -62,12 +63,34 @@ describe('the build', () => {
 		expect(build).toThrow('PUBLIC_CLAIM_BYTECODE is required')
 	})
 
-	it('fails on mainnet with the test signer', () => {
+	it('fails on mainnet with the test signer among the signers', () => {
 		for (const [key, value] of Object.entries(MAINNET_BUILD)) vi.stubEnv(key, value)
-		vi.stubEnv('PUBLIC_CLAIM_SIGNER', '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37')
+		vi.stubEnv(
+			'PUBLIC_CLAIM_SIGNERS',
+			`${MAINNET_BUILD.PUBLIC_CLAIM_SIGNERS},0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`
+		)
 
-		expect(build).toThrow('PUBLIC_CLAIM_SIGNER is the test signer')
+		expect(build).toThrow('PUBLIC_CLAIM_SIGNERS lists the test signer')
 	})
+
+	it('fails on base-sepolia given the signers without the threshold', () => {
+		for (const [key, value] of Object.entries(BASE_SEPOLIA_BUILD)) vi.stubEnv(key, value)
+		vi.stubEnv('PUBLIC_CLAIM_THRESHOLD', '')
+
+		expect(build).toThrow('PUBLIC_CLAIM_THRESHOLD is required')
+	})
+
+	it.each(Object.entries(BUILDS))(
+		'fails on %s while PUBLIC_CLAIM_SIGNER is set, naming what replaced it',
+		(_, variables) => {
+			for (const [key, value] of Object.entries(variables)) vi.stubEnv(key, value)
+			vi.stubEnv('PUBLIC_CLAIM_SIGNER', variables.PUBLIC_CLAIM_SIGNERS)
+
+			expect(build).toThrow(
+				'PUBLIC_CLAIM_SIGNER is replaced by PUBLIC_CLAIM_SIGNERS and PUBLIC_CLAIM_THRESHOLD'
+			)
+		}
+	)
 })
 
 describe('vite.config.ts', () => {

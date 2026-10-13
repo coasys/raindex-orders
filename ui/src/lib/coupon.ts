@@ -19,11 +19,30 @@ export type CouponConfig = {
 	expiryTimestamp: number
 }
 
-export type SignedContextV1Struct = {
-	signer: Hex
+/** One signer's signature over a coupon's nine context words. */
+export type Seat = {
+	signer: Address
 	signature: Hex
+}
+
+/**
+ * A coupon as the claim order takes it: the nine context words, signed by each of its
+ * seats. A claim passes seat i as signed context i, each with the same words.
+ */
+export type SignedCoupon = {
+	seats: Seat[]
 	context: bigint[]
 }
+
+/** Raindex V6's SignedContextV1, as takeOrders4 takes one. */
+export type SignedContextV1Struct = {
+	signer: Address
+	signature: Hex
+	context: Hex[]
+}
+
+/** The words of a coupon's context. */
+export const COUPON_WORDS = 9
 
 /** HOT's decimals on Ethereum, the exponent of a coupon's amount float. */
 const HOT_DECIMALS = 18n
@@ -73,7 +92,7 @@ export function amountWord(wei: bigint): Hex {
 	return numberToHex((exponent << COEFFICIENT_BITS) | wei, { size: 32 })
 }
 
-export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig => {
+export const parseCoupon = (coupon: SignedCoupon): CouponConfig => {
 	const [
 		recipient,
 		amount,
@@ -84,7 +103,7 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 		claimTokenAddress,
 		outputVaultId,
 		nonce
-	] = signedContext.context
+	] = coupon.context
 
 	const address = (word: bigint) => numberToHex(word, { size: 20 })
 	return {
@@ -101,21 +120,54 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 	}
 }
 
-export const serializeSignedContext = (signedContext: SignedContextV1Struct): string => {
-	// we can't use JSON.stringify because the context is an array of BigInts
-	// but we need to serialize all of it as a string
-	const serialized = signedContext.context.map(n => n.toString()).join(',')
-	return `${signedContext.signer},${signedContext.signature},${serialized}`
-}
-
-export const deserializeSignedContext = (serialized: string): SignedContextV1Struct => {
-	const [signer, signature, ...context] = serialized.split(',')
-	if (!isAddress(signer, { strict: false }) || !isHex(signature, { strict: true })) {
-		throw new Error('Not a coupon: its signer or signature is malformed')
-	}
-	return {
-		signer: signer.toLowerCase() as Address,
+/** The signed contexts a claim passes: one per seat, every one with the coupon's words. */
+export const signedContexts = (coupon: SignedCoupon): SignedContextV1Struct[] =>
+	coupon.seats.map(({ signer, signature }) => ({
+		signer,
 		signature,
-		context: context.map(n => BigInt(n))
+		context: coupon.context.map(word => numberToHex(word, { size: 32 }))
+	}))
+
+/**
+ * A coupon as the orchestrator writes it (bridge-orchestrator/src/signer.rs):
+ * `signer1,signature1,...,signerK,signatureK,c0,...,c8`, K >= 1 seats then the nine
+ * context words in decimal. One seat is the format of a coupon from before M-of-N.
+ */
+export const serializeCoupon = (coupon: SignedCoupon): string =>
+	[
+		...coupon.seats.flatMap(({ signer, signature }) => [signer, signature]),
+		...coupon.context.map(word => word.toString())
+	].join(',')
+
+const UINT256_DIGITS = (2n ** 256n - 1n).toString().length
+
+/**
+ * The coupon `serialized` holds, or an error saying how it is malformed. Whitespace
+ * around it, as a paste may carry, is not part of it.
+ */
+export const deserializeCoupon = (serialized: string): SignedCoupon => {
+	const fields = serialized.trim().split(',')
+	const seatFields = fields.length - COUPON_WORDS
+	if (seatFields < 2 || seatFields % 2 !== 0) {
+		throw new Error(
+			`Not a coupon: it holds ${fields.length} fields, and a coupon is one or more signers each with its signature, then ${COUPON_WORDS} numbers`
+		)
 	}
+	const seats: Seat[] = []
+	for (let i = 0; i < seatFields; i += 2) {
+		const [signer, signature] = fields.slice(i, i + 2)
+		if (!isAddress(signer, { strict: false }) || !isHex(signature, { strict: true })) {
+			throw new Error(`Not a coupon: signer ${i / 2 + 1}'s address or signature is malformed`)
+		}
+		seats.push({ signer: signer.toLowerCase() as Address, signature })
+	}
+	const words = fields.slice(seatFields)
+	if (!words.every(word => /^[0-9]+$/.test(word) && word.length <= UINT256_DIGITS)) {
+		throw new Error(`Not a coupon: its last ${COUPON_WORDS} fields must be whole numbers`)
+	}
+	const context = words.map(word => BigInt(word))
+	if (context.some(word => word >= 2n ** 256n)) {
+		throw new Error('Not a coupon: a number in it is larger than a word')
+	}
+	return { seats, context }
 }

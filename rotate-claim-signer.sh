@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Replaces the vault's claim order with one that accepts coupons from
-# VALID_SIGNER, as docs/enable-multisig.md describes. Source the current deploy
-# record first. Then:
+# Replaces the vault's claim order with one that accepts coupons signed by
+# SIGNER_THRESHOLD of VALID_SIGNERS, as docs/enable-multisig.md describes: the
+# signer list and the threshold are part of the order, so changing either is a
+# new order. Source the current deploy record first. Then:
 #   ./rotate-claim-signer.sh --ledger      an admin key signs and sends the calls
 #   ./rotate-claim-signer.sh               a Safe admin: prints the calls for the Safe to execute
 #   ./rotate-claim-signer.sh record BLOCK  prints the new deploy record once they have run

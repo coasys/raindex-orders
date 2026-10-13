@@ -14,7 +14,13 @@ import {
 } from 'viem'
 import { orderbookAbi } from '../generated'
 import { bridge } from './config'
-import { floatToWei, parseCoupon, type CouponConfig, type SignedContextV1Struct } from './coupon'
+import {
+	floatToWei,
+	parseCoupon,
+	signedContexts,
+	type CouponConfig,
+	type SignedCoupon
+} from './coupon'
 import {
 	ethereumStore,
 	getEthereum,
@@ -61,7 +67,15 @@ const CLAIM_NOT_CONNECTED =
 const CLAIM_NOT_SENT =
 	"Your wallet did not send the claim. If your wallet's activity shows no claim, claim again."
 
-function refusalMessage(reason: string, coupon: CouponConfig) {
+// Solidity's Panic code for an array read past its end: the claim order reads seat
+// M-1 of a claim that carries fewer than M signed contexts.
+const PANIC_OUT_OF_BOUNDS = 0x32n
+
+const THRESHOLD = bridge.claimOrder.threshold
+const signatures = (n: number) => (n === 1 ? 'one signature' : `${n} signatures`)
+
+/** What to tell the user of a claim the orderbook refuses, carrying `seats` signatures. */
+function refusalMessage({ reason, args }: Revert, coupon: CouponConfig, seats: number) {
 	switch (reason) {
 		case 'Nonce already used':
 			return `This coupon has already been claimed, so there is nothing left to claim. Its ${bridge.tokenName} went to ${coupon.recipient}.`
@@ -71,8 +85,18 @@ function refusalMessage(reason: string, coupon: CouponConfig) {
 			return `This coupon pays ${coupon.recipient}, not the connected wallet. Switch your wallet to that account and claim again.`
 		case 'Wrong signer':
 			return `This coupon was signed by a key this bridge does not accept. ${REISSUE_IF_UNPAID}`
-		case 'InvalidSignature':
-			return "This coupon's signature does not match its contents, so it was changed or cut short. Copy the coupon from your Unyt app again."
+		case 'Duplicate signer':
+			return `This coupon carries one signer's signature twice, and this bridge needs the signatures of ${THRESHOLD} different signers. ${REISSUE_IF_UNPAID}`
+		case 'Coupons differ':
+			return `The signatures on this coupon do not all sign the same coupon. ${REISSUE_IF_UNPAID}`
+		case 'Panic':
+			if (args?.[0] !== PANIC_OUT_OF_BOUNDS) break
+			return `This coupon carries ${signatures(seats)}, and this bridge needs ${signatures(THRESHOLD)}, so part of it is missing. Copy the coupon from your Unyt app again. ${REISSUE_IF_UNPAID}`
+		case 'InvalidSignature': {
+			const seat = typeof args?.[0] === 'bigint' && seats > 1 ? Number(args[0]) + 1 : undefined
+			const which = seat ? `Signature ${seat} of this coupon's ${seats}` : "This coupon's signature"
+			return `${which} does not match its contents, so it was changed or cut short. Copy the coupon from your Unyt app again.`
+		}
 		case 'Wrong order hash':
 		case 'Wrong order owner':
 		case 'Wrong orderbook':
@@ -82,9 +106,8 @@ function refusalMessage(reason: string, coupon: CouponConfig) {
 		case 'Wrong output amount':
 		case 'MinimumIO':
 			return 'The bridge cannot pay this claim right now, and your coupon was not used. Try again later, and contact Unyt support if it keeps failing.'
-		default:
-			return 'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
 	}
+	return 'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
 }
 
 type WalletError = { data?: unknown; message?: unknown }
@@ -145,10 +168,12 @@ async function refusalOf(eth: Eip1193Provider, account: Address, data: Hex, amou
 
 /**
  * The takeOrders4 call of a claim: the taker's input is the order's output, exactly
- * the coupon's amount, at the claim order's ratio.
+ * the coupon's amount, at the claim order's ratio. It carries every seat of the
+ * coupon, in its order, as a signed context: the order reads seats 0 to M-1, and
+ * Raindex checks the signature of each one carried.
  */
-function takeOrdersConfig(signedContext: SignedContextV1Struct) {
-	const amount = numberToHex(signedContext.context[1], { size: 32 })
+function takeOrdersConfig(coupon: SignedCoupon) {
+	const amount = numberToHex(coupon.context[1], { size: 32 })
 	return {
 		minimumIO: amount,
 		maximumIO: amount,
@@ -159,13 +184,7 @@ function takeOrdersConfig(signedContext: SignedContextV1Struct) {
 				order: claimOrderStruct(bridge),
 				inputIOIndex: 0n,
 				outputIOIndex: 0n,
-				signedContext: [
-					{
-						signer: signedContext.signer,
-						context: signedContext.context.map(word => numberToHex(word, { size: 32 })),
-						signature: signedContext.signature
-					}
-				]
+				signedContext: signedContexts(coupon)
 			}
 		],
 		data: '0x' as Hex
@@ -178,6 +197,7 @@ type ClaimTrace = {
 	chainId?: number
 	couponNonce?: Hex
 	couponExpiry?: number
+	couponSigners?: Address[]
 	sentHash?: string
 	hash?: string
 	outcome?: string
@@ -195,14 +215,18 @@ class ClaimError extends Error {
 	}
 }
 
-function sendFailure(err: unknown, coupon: CouponConfig): { message: string; revert?: Revert } {
+function sendFailure(
+	err: unknown,
+	coupon: CouponConfig,
+	seats: number
+): { message: string; revert?: Revert } {
 	const unsent = whyUnsent(err, CLAIM_DECLINED)
 	if (unsent) return { message: unsent }
 	const revert = revertIn(err)
-	return { message: revert ? refusalMessage(revert.reason, coupon) : CLAIM_NOT_SENT, revert }
+	return { message: revert ? refusalMessage(revert, coupon, seats) : CLAIM_NOT_SENT, revert }
 }
 
-async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): Promise<string> {
+async function claim(signed: SignedCoupon, trace: ClaimTrace): Promise<string> {
 	const eth = getEthereum()
 	const account = get(ethereumStore).account as Address | null
 	if (!eth || !account) throw new ClaimError(CLAIM_NOT_CONNECTED)
@@ -213,10 +237,12 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	if (trace.chainId !== bridge.chain.id) throw new ClaimError(SWITCH_NETWORK)
 
 	trace.step = 'reading the coupon'
-	const coupon = parseCoupon(signedContext)
+	const coupon = parseCoupon(signed)
+	const seats = signed.seats.length
 	trace.couponNonce = numberToHex(coupon.nonce)
 	trace.couponExpiry = coupon.expiryTimestamp
-	const args = [takeOrdersConfig(signedContext)] as const
+	trace.couponSigners = signed.seats.map(seat => seat.signer)
+	const args = [takeOrdersConfig(signed)] as const
 	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders4', args })
 	const check = () => refusalOf(eth, account, data, coupon.withdrawAmount)
 
@@ -226,7 +252,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	})
 	if (refusal) {
 		trace.revert = refusal.revert
-		throw new ClaimError(refusalMessage(refusal.revert.reason, coupon), { cause: refusal.cause })
+		throw new ClaimError(refusalMessage(refusal.revert, coupon, seats), { cause: refusal.cause })
 	}
 
 	trace.step = 'asking the wallet to send'
@@ -238,7 +264,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 		args,
 		from: account
 	}).catch(err => {
-		const { message, revert } = sendFailure(err, coupon)
+		const { message, revert } = sendFailure(err, coupon, seats)
 		trace.revert = revert
 		throw new ClaimError(message, { cause: err })
 	})
@@ -269,7 +295,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 		})
 		if (refusalAfter) {
 			trace.recheck = refusalAfter.revert
-			throw new ClaimError(refusalMessage(refusalAfter.revert.reason, coupon), { cause: err })
+			throw new ClaimError(refusalMessage(refusalAfter.revert, coupon, seats), { cause: err })
 		}
 		if (refusalAfter === null) trace.recheck = 'would pay'
 		throw new ClaimError(err.outcome === 'replaced' ? CLAIM_REPLACED : CLAIM_REVERTED, {
@@ -278,11 +304,11 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	}
 }
 
-export async function claimCoupon(signedContext: SignedContextV1Struct): Promise<string> {
+export async function claimCoupon(coupon: SignedCoupon): Promise<string> {
 	const trace: ClaimTrace = { step: 'starting' }
 	transactionStore.awaitCheck()
 	try {
-		const hash = await claim(signedContext, trace)
+		const hash = await claim(coupon, trace)
 		transactionStore.transactionSuccess(hash)
 		return hash
 	} catch (err) {

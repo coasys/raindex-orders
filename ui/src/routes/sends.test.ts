@@ -4,7 +4,7 @@ import { encodeFunctionResult, maxUint256, numberToHex } from 'viem'
 import type { SvelteComponent } from 'svelte'
 import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
 import { ACCOUNT, CHAIN, connected, injectWallet } from '$lib/testing/wallet'
-import { deserializeSignedContext } from '$lib/coupon'
+import { deserializeCoupon } from '$lib/coupon'
 import { orderbookAbi } from '../generated'
 import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
 import { TESTNET_COUPONS } from './api/coupon-status/fixtures'
@@ -480,7 +480,7 @@ describe('Claim', () => {
 	it('sends with no status request, paused or not', async () => {
 		const fetch = stubFetch(PAUSED)
 		const coupon = TESTNET_COUPONS[0]
-		const amount = numberToHex(deserializeSignedContext(coupon).context[1], { size: 32 })
+		const amount = numberToHex(deserializeCoupon(coupon).context[1], { size: 32 })
 		const pays = encodeFunctionResult({
 			abi: orderbookAbi,
 			functionName: 'takeOrders4',

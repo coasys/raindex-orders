@@ -5,8 +5,10 @@ import { HOLO_VAULT_ID } from './network'
 export interface OrderConfig {
 	orderHash: Hex
 	owner: Address
-	// The only signer whose coupons the order accepts.
-	signer: Address
+	// The N signers the order lists: a claim carries a coupon signed by `threshold`
+	// of them, each a different one.
+	signers: Address[]
+	threshold: number
 	store: Address
 	outputToken: Address
 	outputVaultId: Hex
@@ -16,7 +18,8 @@ export interface OrderConfig {
 export const CLAIM_ORDER: OrderConfig = {
 	orderHash: bridge.claimOrder.orderHash,
 	owner: bridge.lockVaultAddress,
-	signer: bridge.claimOrder.signer,
+	signers: bridge.claimOrder.signers,
+	threshold: bridge.claimOrder.threshold,
 	store: bridge.claimOrder.store,
 	outputToken: bridge.tokenAddress,
 	outputVaultId: HOLO_VAULT_ID

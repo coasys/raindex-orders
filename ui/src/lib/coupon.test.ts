@@ -1,18 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import {
 	amountWord,
-	deserializeSignedContext,
+	deserializeCoupon,
 	floatToWei,
 	parseCoupon,
+	serializeCoupon,
+	signedContexts,
 	unpackFloat
 } from './coupon'
 
 const word = (hex: string) => BigInt(hex).toString()
 
+// Anvil's third and fourth accounts, and nine context words.
+const SIGNER_A = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
+const SIGNER_B = '0x90F79bf6EB2c4f870365E785982E1f101E93b906'
+const NINE = ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+
 describe('parseCoupon', () => {
 	it('keeps the leading zeros of addresses and hashes', () => {
 		const coupon = parseCoupon(
-			deserializeSignedContext(
+			deserializeCoupon(
 				[
 					'0x8E72b7568738da52ca3DCd9b24E178127A4E7d37',
 					'0x00',
@@ -45,17 +52,68 @@ describe('parseCoupon', () => {
 		['a signer one character short', '0x8E72b7568738da52ca3DCd9b24E178127A4E7d3'],
 		['a signature that is not hex', '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37', '0xzz']
 	])('refuses %s, so the page calls it malformed', (_case, signer, signature = '0x00') => {
-		expect(() => deserializeSignedContext([signer, signature, '1', '2'].join(','))).toThrow(
-			'Not a coupon'
-		)
+		expect(() => deserializeCoupon([signer, signature, ...NINE].join(','))).toThrow('Not a coupon')
 	})
 
 	it('takes a signer in any letter case, as the orderbook does', () => {
-		const { signer } = deserializeSignedContext(
-			'0x8e72b7568738da52ca3DCd9b24E178127A4E7d37,0x00,1,2'
+		const { seats } = deserializeCoupon(
+			['0x8e72b7568738da52ca3DCd9b24E178127A4E7d37', '0x00', ...NINE].join(',')
 		)
 
-		expect(signer).toBe('0x8e72b7568738da52ca3dcd9b24e178127a4e7d37')
+		expect(seats).toEqual([
+			{ signer: '0x8e72b7568738da52ca3dcd9b24e178127a4e7d37', signature: '0x00' }
+		])
+	})
+})
+
+describe('a coupon of several seats', () => {
+	const text = [SIGNER_A, '0xaa', SIGNER_B, '0xbbbb', ...NINE].join(',')
+
+	it('reads each signer with its signature, in order, then the nine words', () => {
+		expect(deserializeCoupon(text)).toEqual({
+			seats: [
+				{ signer: SIGNER_A.toLowerCase(), signature: '0xaa' },
+				{ signer: SIGNER_B.toLowerCase(), signature: '0xbbbb' }
+			],
+			context: [1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n, 9n]
+		})
+	})
+
+	it('writes back as it reads, and ignores whitespace around it, as a paste carries', () => {
+		expect(serializeCoupon(deserializeCoupon(` ${text}\n`))).toBe(text.toLowerCase())
+	})
+
+	it('is one signed context per seat, each with the same nine words', () => {
+		const contexts = signedContexts(deserializeCoupon(text))
+
+		expect(contexts.map(c => [c.signer, c.signature])).toEqual([
+			[SIGNER_A.toLowerCase(), '0xaa'],
+			[SIGNER_B.toLowerCase(), '0xbbbb']
+		])
+		for (const { context } of contexts) {
+			expect(context).toHaveLength(9)
+			expect(context[8]).toBe(`0x${'0'.repeat(63)}9`)
+		}
+	})
+
+	it.each([
+		['no seat', NINE.join(',')],
+		['a signer without its signature', [SIGNER_A, '0xaa', SIGNER_B, ...NINE].join(',')],
+		['eight words', [SIGNER_A, '0xaa', ...NINE.slice(1)].join(',')],
+		['ten words', [SIGNER_A, '0xaa', ...NINE, '10'].join(',')],
+		[
+			'a second signer that is not an address',
+			[SIGNER_A, '0xaa', '0x1234', '0xbb', ...NINE].join(',')
+		],
+		['a second signature that is not hex', [SIGNER_A, '0xaa', SIGNER_B, 'bb', ...NINE].join(',')],
+		['a word in hex', [SIGNER_A, '0xaa', ...NINE.slice(1), '0x10'].join(',')],
+		['an empty word', [SIGNER_A, '0xaa', ...NINE.slice(1), ''].join(',')],
+		[
+			'a word above uint256',
+			[SIGNER_A, '0xaa', ...NINE.slice(1), (2n ** 256n).toString()].join(',')
+		]
+	])('refuses %s', (_, malformed) => {
+		expect(() => deserializeCoupon(malformed)).toThrow('Not a coupon')
 	})
 })
 
@@ -89,7 +147,7 @@ describe('the amount word', () => {
 
 	it('is what parseCoupon reads the withdraw amount from', () => {
 		const coupon = parseCoupon(
-			deserializeSignedContext(
+			deserializeCoupon(
 				[
 					'0x8E72b7568738da52ca3DCd9b24E178127A4E7d37',
 					'0x00',

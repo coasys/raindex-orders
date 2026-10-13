@@ -45,6 +45,14 @@ struct AdminInputs {
     address[] owners;
 }
 
+/// The claim order's coupon signers: the N addresses whose coupons it accepts,
+/// and the threshold M of them whose signatures each claim carries. Both are
+/// written into the order's expression, so changing either is a new order.
+struct ClaimSigners {
+    address[] list;
+    uint256 threshold;
+}
+
 /// One network's claim order: its name, chain, and the variable its lock vault
 /// is passed as. Raindex V6 and the Rainlang contracts are at the same address on
 /// every chain, so the network names nothing else. The TestNet is Base Sepolia.
@@ -131,26 +139,97 @@ abstract contract ClaimOrderScript is Script {
         return account.code.length > 0 && !isDelegatedKey(account);
     }
 
+    /// The most coupon signers a claim order lists: compose-rainlang.mjs writes
+    /// one `any` input per signer, and a Rainlang word takes at most 15.
+    uint256 internal constant MAX_SIGNERS = 15;
+
+    /// The claim order's coupon signers, VALID_SIGNERS separated by commas, and
+    /// SIGNER_THRESHOLD, how many of them sign each coupon. On base-sepolia,
+    /// with neither set, the test signer alone. VALID_SIGNER, the one signer
+    /// before M-of-N, is refused rather than ignored.
+    function signersFromEnv(ClaimNetwork memory net) internal view returns (ClaimSigners memory signers) {
+        require(
+            !vm.envExists("VALID_SIGNER"),
+            "VALID_SIGNER is replaced by VALID_SIGNERS, the coupon signers separated by commas, and SIGNER_THRESHOLD, how many of them sign each coupon: unset it"
+        );
+        bool listed = vm.envExists("VALID_SIGNERS");
+        bool counted = vm.envExists("SIGNER_THRESHOLD");
+        if (net.chainId == 84532 && !listed && !counted) {
+            signers.list = new address[](1);
+            signers.list[0] = TEST_SIGNER_ADDRESS;
+            signers.threshold = 1;
+            return signers;
+        }
+        require(listed, "VALID_SIGNERS is required: the coupon signers, separated by commas");
+        require(counted, "SIGNER_THRESHOLD is required: how many of VALID_SIGNERS sign each coupon");
+        signers.list = vm.envAddress("VALID_SIGNERS", ",");
+        signers.threshold = vm.envUint("SIGNER_THRESHOLD");
+    }
+
+    /// Refuses a list of no signers or more than MAX_SIGNERS, one naming a signer
+    /// twice, a threshold of 0 or more than the signers listed, and each signer
+    /// requireSigner refuses. A threshold of 1 lets one signer alone sign
+    /// coupons, which is logged.
+    function requireSigners(ClaimNetwork memory net, ClaimSigners memory signers) internal view {
+        uint256 n = signers.list.length;
+        require(
+            n >= 1 && n <= MAX_SIGNERS,
+            string.concat("VALID_SIGNERS lists ", vm.toString(n), " signers: a claim order takes 1 to 15")
+        );
+        for (uint256 i = 0; i < n; i++) {
+            for (uint256 j = i + 1; j < n; j++) {
+                require(
+                    signers.list[i] != signers.list[j],
+                    string.concat("VALID_SIGNERS lists ", vm.toString(signers.list[i]), " twice")
+                );
+            }
+            requireSigner(net, signers.list[i]);
+        }
+        require(
+            signers.threshold >= 1 && signers.threshold <= n,
+            string.concat(
+                "SIGNER_THRESHOLD is ",
+                vm.toString(signers.threshold),
+                ", and must be 1 to the ",
+                vm.toString(n),
+                " signers VALID_SIGNERS lists"
+            )
+        );
+        if (signers.threshold == 1 && net.chainId == 1) {
+            console2.log(
+                string.concat(
+                    "SIGNER_THRESHOLD=1: any one of ",
+                    vm.toString(n),
+                    " signers alone signs coupons that pay out of the vault"
+                )
+            );
+        }
+    }
+
     /// Refuses the test signer on mainnet, a key with an EIP-7702 delegation, whose
     /// coupons Raindex V6 refuses (it asks any account with code through EIP-1271,
     /// never by the key's signature), and a contract signer whose signatures the
     /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
     /// as a key's.
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
-        require(signer != address(0), "VALID_SIGNER must be a nonzero address");
+        require(signer != address(0), "VALID_SIGNERS must be nonzero addresses");
+        string memory named = string.concat("VALID_SIGNERS names ", vm.toString(signer));
         require(
             net.chainId != 1 || signer != TEST_SIGNER_ADDRESS,
-            "VALID_SIGNER is the test signer, whose key is public: mainnet refuses it"
+            string.concat(named, ", the test signer, whose key is public: mainnet refuses it")
         );
         require(
             !isDelegatedKey(signer),
-            "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
+            string.concat(
+                named,
+                ", which has an EIP-7702 delegation: Raindex V6 asks its delegate for a coupon's signature in place of the key. Use a key with no delegation, or a Safe"
+            )
         );
         if (isContract(signer)) {
             (bool isSafe, uint256 threshold,) = safeOf(signer);
             require(
                 isSafe && threshold >= 2 && threshold <= 20,
-                "VALID_SIGNER is a contract but not a Safe whose threshold is 2 to 20"
+                string.concat(named, ", a contract but not a Safe whose threshold is 2 to 20")
             );
         }
     }
@@ -278,22 +357,33 @@ abstract contract ClaimOrderScript is Script {
         }
     }
 
+    /// `addresses` separated by commas alone, as VALID_SIGNERS and the deploy
+    /// record's CLAIM_SIGNERS write them.
+    function commaJoined(address[] memory addresses) internal pure returns (string memory list) {
+        for (uint256 i = 0; i < addresses.length; i++) {
+            list = string.concat(list, i == 0 ? "" : ",", vm.toString(addresses[i]));
+        }
+    }
+
     /// The claim order paying `token` out of HOLO_VAULT_ID against `inputToken`,
-    /// accepting coupons from `signer`, composed and parsed before anything is
-    /// sent.
-    function claimOrderConfig(ClaimNetwork memory net, address token, address inputToken, address signer)
+    /// accepting coupons that `signers.threshold` of `signers.list` sign,
+    /// composed and parsed before anything is sent.
+    function claimOrderConfig(ClaimNetwork memory net, address token, address inputToken, ClaimSigners memory signers)
         internal
         returns (OrderConfigV4 memory)
     {
         return OrderConfigV4(
-            claimEvaluable(net, signer), claimIO(inputToken), claimIO(token), CLAIM_ORDER_NONCE, bytes32(0), ""
+            claimEvaluable(net, signers), claimIO(inputToken), claimIO(token), CLAIM_ORDER_NONCE, bytes32(0), ""
         );
     }
 
     /// The claim order's evaluable: the network's interpreter and store, and the
-    /// claim expression accepting coupons from `signer`, parsed.
-    function claimEvaluable(ClaimNetwork memory net, address signer) internal returns (EvaluableV4 memory) {
-        return EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, parseClaim(net, signer));
+    /// claim expression accepting coupons from `signers`, parsed.
+    function claimEvaluable(ClaimNetwork memory net, ClaimSigners memory signers)
+        internal
+        returns (EvaluableV4 memory)
+    {
+        return EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, parseClaim(net, signers));
     }
 
     function claimOrder(address vault, address token, address inputToken, bytes memory bytecode)
@@ -319,18 +409,20 @@ abstract contract ClaimOrderScript is Script {
         io[0] = IOV2(token, HOLO_VAULT_ID);
     }
 
-    /// The claim expression for `signer`, composed by compose-rainlang.mjs and
+    /// The claim expression for `signers`, composed by compose-rainlang.mjs and
     /// parsed by the network's expression deployer into the order's bytecode.
-    function parseClaim(ClaimNetwork memory net, address signer) private returns (bytes memory) {
-        string[] memory command = new string[](8);
+    function parseClaim(ClaimNetwork memory net, ClaimSigners memory signers) private returns (bytes memory) {
+        string[] memory command = new string[](10);
         command[0] = "node";
         command[1] = "compose-rainlang.mjs";
         command[2] = "--network";
         command[3] = net.name;
         command[4] = "--subparser";
         command[5] = vm.toString(RAINDEX_SUBPARSER);
-        command[6] = "--signer";
-        command[7] = vm.toString(signer);
+        command[6] = "--signers";
+        command[7] = commaJoined(signers.list);
+        command[8] = "--threshold";
+        command[9] = vm.toString(signers.threshold);
         Vm.FfiResult memory composed = vm.tryFfi(command);
         require(composed.exitCode == 0, string.concat("compose-rainlang.mjs failed: ", string(composed.stderr)));
         return RAINLANG_DEPLOYER.parse2(composed.stdout);
@@ -381,12 +473,15 @@ abstract contract ClaimOrderScript is Script {
     /// and checked against it: the only order the vault added since that is still on
     /// the orderbook, paying the vault's token out of HOLO_VAULT_ID against a
     /// ClaimInputToken, run by the network's interpreter and store, and carrying
-    /// the claim expression that accepts coupons from `signer` and nothing else.
-    function findClaimOrder(ClaimNetwork memory net, HoloLockVault vault, address signer, uint256 fromBlock)
-        internal
-        returns (OrderV4 memory order, bytes32 orderHash)
-    {
-        requireSigner(net, signer);
+    /// the claim expression for `signers`, the signers and threshold stated, and
+    /// nothing else.
+    function findClaimOrder(
+        ClaimNetwork memory net,
+        HoloLockVault vault,
+        ClaimSigners memory signers,
+        uint256 fromBlock
+    ) internal returns (OrderV4 memory order, bytes32 orderHash) {
+        requireSigners(net, signers);
         bytes32[] memory topics = new bytes32[](1);
         topics[0] = ADD_ORDER_V3;
         Vm.EthGetLogs[] memory logs = vm.eth_getLogs(fromBlock, block.number, address(RAINDEX), topics);
@@ -424,8 +519,8 @@ abstract contract ClaimOrderScript is Script {
             "the claim order's input token is not a ClaimInputToken"
         );
         require(
-            keccak256(order.evaluable.bytecode) == keccak256(parseClaim(net, signer)),
-            "the claim order's expression is not the claim expression for VALID_SIGNER"
+            keccak256(order.evaluable.bytecode) == keccak256(parseClaim(net, signers)),
+            "the claim order's expression is not the claim expression for VALID_SIGNERS and SIGNER_THRESHOLD"
         );
     }
 
@@ -433,10 +528,12 @@ abstract contract ClaimOrderScript is Script {
     function printRecord(
         ClaimNetwork memory net,
         HoloLockVault vault,
-        address signer,
+        ClaimSigners memory signers,
         OrderV4 memory order,
         bytes32 orderHash
     ) internal view {
+        string memory signerList = commaJoined(signers.list);
+        string memory threshold = vm.toString(signers.threshold);
         string memory vaultAddress = vm.toString(address(vault));
         string memory token = vm.toString(order.validOutputs[0].token);
         string memory orderbook = vm.toString(address(vault.orderbook()));
@@ -451,7 +548,8 @@ abstract contract ClaimOrderScript is Script {
         console2.log(string.concat("VAULT_ID=", vm.toString(order.validOutputs[0].vaultId)));
         console2.log(string.concat("ORDER_HASH=", hash));
         console2.log(string.concat("ORDER_OWNER=", vm.toString(order.owner)));
-        console2.log(string.concat("CLAIM_SIGNER=", vm.toString(signer)));
+        console2.log(string.concat("CLAIM_SIGNERS=", signerList));
+        console2.log(string.concat("CLAIM_THRESHOLD=", threshold));
         console2.log(string.concat("CLAIM_INTERPRETER=", vm.toString(address(order.evaluable.interpreter))));
         console2.log(string.concat("CLAIM_STORE=", vm.toString(address(order.evaluable.store))));
         console2.log(string.concat("CLAIM_BYTECODE=", bytecode));
@@ -462,7 +560,8 @@ abstract contract ClaimOrderScript is Script {
         console2.log(string.concat("PUBLIC_LOCK_VAULT_ADDRESS=", vaultAddress));
         console2.log(string.concat("PUBLIC_ORDERBOOK_ADDRESS=", orderbook));
         console2.log(string.concat("PUBLIC_CLAIM_ORDER_HASH=", hash));
-        console2.log(string.concat("PUBLIC_CLAIM_SIGNER=", vm.toString(signer)));
+        console2.log(string.concat("PUBLIC_CLAIM_SIGNERS=", signerList));
+        console2.log(string.concat("PUBLIC_CLAIM_THRESHOLD=", threshold));
         console2.log(string.concat("PUBLIC_CLAIM_INTERPRETER=", vm.toString(address(order.evaluable.interpreter))));
         console2.log(string.concat("PUBLIC_CLAIM_STORE=", vm.toString(address(order.evaluable.store))));
         console2.log(string.concat("PUBLIC_CLAIM_BYTECODE=", bytecode));

@@ -95,8 +95,10 @@ async fn main() -> Result<()> {
                     info!(
                         event = "startup.checks_passed",
                         order = %signer.order().order_hash,
-                        signer = %signer.order().signer,
-                        "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
+                        signers = ?signer.order().signers,
+                        threshold = signer.order().threshold,
+                        "startup checks passed: the chain, vault and claim order match, and the order takes coupons from {} of its signers",
+                        signer.order().threshold
                     );
                     Some(EthereumSide { chain, signer })
                 }

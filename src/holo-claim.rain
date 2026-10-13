@@ -14,18 +14,24 @@
  *  [7] output vault id
  *  [8] nonce (to prevent replay attacks)
  *
+ *  A claim carries this coupon signed by M of the order's N signers: one
+ *  signed context per signer, each holding the same nine words. Signed context
+ *  i is seat i. compose-rainlang.mjs writes the signer checks from --signers
+ *  and --threshold where the comment below says, so the N signers and the
+ *  threshold M are part of the order: changing either is a new order.
+ *
  *  Addresses, hashes and the nonce are compared bit for bit (binary-equal-to);
  *  the amount and the expiry are compared as numbers.
  */
 
 #orderbook-subparser !subparser on this network
-#valid-signer !the coupon signer (docs/enable-multisig.md)
 
 #calculate-io
 using-words-from orderbook-subparser
 
-/* do the checks */
-:ensure(binary-equal-to(signer<0>() valid-signer) "Wrong signer"),
+/* M-of-N signer checks, written here by compose-rainlang.mjs */
+
+/* do the checks, on seat 0's coupon: the signer checks made every seat's the same */
 :ensure(binary-equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
 :ensure(less-than(block-timestamp() signed-context<0 2>()) "Order expired"),
 :ensure(binary-equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),

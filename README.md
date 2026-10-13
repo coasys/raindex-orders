@@ -111,10 +111,10 @@ The TestNet bridge (mock HOT, HoloLockVault, ClaimInputToken, claim order) is no
 ### Claim Flow (Bridged HOT -> HOT)
 
 1. User burns bridged HOT on Holochain
-2. The bridge orchestrator signs a coupon with the coupon signer ([docs/enable-multisig.md](./docs/enable-multisig.md))
+2. The bridge orchestrator has the coupon signed by M of the claim order's N signers ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon
-5. Rainlang expression validates coupon (signer, expiry, nonce)
+5. Rainlang expression validates coupon (M different listed signers over the same words, expiry, nonce)
 6. HOT transferred from vault to user's wallet. The claimer pays the order's input token at the order's ratio of 1e-30 per HOT, which the ClaimInputToken never moves
 
 ## Development
@@ -131,16 +131,17 @@ forge test
 # Build the bridge orchestrator
 (cd bridge-orchestrator && cargo build)
 
-# Rehearse the mainnet deploy, with a Safe as the vault admin, and the coupon
-# signer's move to a Safe on an anvil fork, after building the orchestrator above
+# Rehearse the mainnet deploy, with a Safe as the vault admin and a 2-of-3 claim
+# order, and its rotation to two keys and a Safe, on an anvil fork, after
+# building the orchestrator above
 nix develop -c test/fork-rehearsal.sh
 ```
 
 ## Security
 
 - Test signer key in repo is for testing only, and every mainnet input refuses it
-- The coupon signer is a key with no EIP-7702 delegation, or a Safe: Raindex V6 asks a delegated key's delegate for a coupon's signature, so the scripts and the orchestrator refuse one ([docs/enable-multisig.md](./docs/enable-multisig.md))
-- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the coupon signer is a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). A Safe coupon signer whose owner keys one orchestrator holds is still one party; M-of-N needs the signer service of [docs/signer-service.md](./docs/signer-service.md), which is not built
+- Each coupon signer is a key with no EIP-7702 delegation, or a Safe: Raindex V6 asks a delegated key's delegate for a coupon's signature, so the scripts and the orchestrator refuse one ([docs/enable-multisig.md](./docs/enable-multisig.md))
+- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the claim order takes coupons signed by M of its N signers, each a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). Keys that one orchestrator holds are one party, however many; M-of-N protects the vault once independent parties run the signer service of [docs/signer-service.md](./docs/signer-service.md), which is not built. The deployed Rainlang 0.1.9 takes at most 3 of 15 or 4 of 8
 - Each coupon has a unique nonce (prevents replay)
 - Coupons have expiry timestamps
 - Admin functions protected by access control
