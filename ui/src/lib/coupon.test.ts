@@ -80,10 +80,16 @@ describe('the amount word', () => {
 		expect(floatToWei(40n)).toBe(40n * 10n ** 18n)
 	})
 
+	it('reads zero at any exponent without raising 10 to it', () => {
+		expect(floatToWei((2n ** 31n - 1n) << 224n)).toBe(0n)
+		expect(floatToWei((2n ** 31n) << 224n)).toBe(0n)
+	})
+
 	it('refuses a float that is not a whole number of wei, negative, or too large', () => {
 		expect(() => floatToWei(((2n ** 32n - 19n) << 224n) | 1n)).toThrow('not a whole number of wei')
 		expect(() => floatToWei(((2n ** 32n - 18n) << 224n) | (2n ** 224n - 1n))).toThrow('negative')
 		expect(() => floatToWei((80n << 224n) | 1n)).toThrow('too large')
+		expect(() => floatToWei(((2n ** 31n) << 224n) | 1n)).toThrow('not a whole number of wei')
 		expect(() => amountWord(2n ** 223n)).toThrow('has no float')
 	})
 
