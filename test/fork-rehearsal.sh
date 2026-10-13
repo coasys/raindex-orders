@@ -258,8 +258,12 @@ expect_record_refusal() {
 	echo "refused: a record when $reason"
 }
 
+# The refusal must not rest on keys[2]'s live mainnet code, which its delegation's
+# owner can change or clear: give it a delegation designator on the fork.
+delegated=$(address_of "${keys[2]}")
+cast rpc anvil_setCode "$delegated" "0xef0100${deployer#0x}" --rpc-url "$fork" >/dev/null
 expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
-	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$(address_of "${keys[2]}")" ./deploy-mainnet.sh "${wallet[@]}"
+	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$delegated" ./deploy-mainnet.sh "${wallet[@]}"
 # A V6 order is its bytecode, so the same signer gives the same order, which the
 # orderbook already holds: the second order is for another signer.
 env "${rotation[@]}" VALID_SIGNER="$(address_of "$other_signer_key")" ./rotate-claim-signer.sh >"$work/rogue.log" ||
