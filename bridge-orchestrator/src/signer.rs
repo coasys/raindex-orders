@@ -263,8 +263,12 @@ impl CouponSigner {
     }
 }
 
-/// The largest integer a float of exponent 0 holds: its coefficient is an int224.
-const MAX_EXPIRY: U256 = U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 33]);
+/// The largest coefficient a decimal float holds: int224::MAX.
+const MAX_FLOAT_COEFFICIENT: U256 =
+    U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 33]);
+
+/// The largest integer a float of exponent 0 holds.
+const MAX_EXPIRY: U256 = MAX_FLOAT_COEFFICIENT;
 
 /// The coupon as the website reads it: the signer, the signature, then each
 /// context word as a decimal number, all separated by commas.
@@ -288,7 +292,7 @@ fn serialize(coupon: &SignedCoupon) -> String {
 /// coefficient is an int224, which no HOT amount comes near.
 pub(crate) fn amount_word(wei: U256) -> Result<B256> {
     anyhow::ensure!(
-        wei <= MAX_EXPIRY,
+        wei <= MAX_FLOAT_COEFFICIENT,
         "the amount {wei} wei is too large for a decimal float"
     );
     let exponent = (-(HOT_DECIMALS as i32)) as u32;

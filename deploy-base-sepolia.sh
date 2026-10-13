@@ -203,7 +203,7 @@ deploy_order_via_vault() {
         set_env ORDER_OWNER "$BASE_SEPOLIA_LOCK_VAULT_ADDRESS"
         echo -e "${GREEN}Updated $ENV_FILE with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
     else
-        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Etherscan, and set ORDER_OWNER to $BASE_SEPOLIA_LOCK_VAULT_ADDRESS."
+        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Basescan (https://sepolia.basescan.org), and set ORDER_OWNER to $BASE_SEPOLIA_LOCK_VAULT_ADDRESS."
     fi
 }
 

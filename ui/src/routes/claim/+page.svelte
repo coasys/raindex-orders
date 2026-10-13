@@ -173,7 +173,7 @@
 	{:else}
 		<h1 class="text-2xl font-bold">Claim {bridge.tokenName}</h1>
 		<p class="text-gray-600">
-			Redeem your {bridge.tokenName} claim coupon to receive {bridge.tokenName} tokens on Ethereum.
+			Redeem your {bridge.tokenName} claim coupon to receive {bridge.tokenName} tokens on {bridge.networkName}.
 		</p>
 
 		{#if !isConnected}
