@@ -285,7 +285,7 @@ fn mainnet_rpc() -> String {
 }
 
 /// A base-sepolia node given its RPC, the test signer's key, and the mock HOT,
-/// vault and claim order TestNet has no Base Sepolia values for yet.
+/// vault and claim order, which are chain-specific and have no defaults.
 fn sepolia_node(dir: &Path, rpc: String) -> Vec<(&'static str, String)> {
     let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
     vec![
@@ -351,8 +351,8 @@ fn run_with_nothing_set_but_its_key_and_bridge_takes_testnet_values_and_says_so(
     assert!(!db(dir.path()).exists());
 }
 
-/// TestNet's vault and claim order are not deployed on Raindex V6 yet, so a
-/// base-sepolia run names them when it lacks them, as a mainnet run does.
+/// TestNet's vault and claim order are chain-specific and have no defaults, so
+/// a base-sepolia run names them when it lacks them, as a mainnet run does.
 #[test]
 fn run_with_nothing_set_but_its_key_names_the_bridge_it_lacks() {
     let dir = tempfile::tempdir().unwrap();

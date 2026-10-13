@@ -678,7 +678,7 @@ mod tests {
 
     /// TestNet's values are the ones the same on every chain: the orderbook, the
     /// interpreter, the store, the vault ID and the test signer. Its mock HOT,
-    /// vault and claim order are not deployed on Base Sepolia yet, so a
+    /// vault and claim order are chain-specific and have no defaults, so a
     /// base-sepolia run names those as mainnet does.
     #[test]
     fn base_sepolia_takes_testnet_values_for_what_is_the_same_on_every_chain() {
