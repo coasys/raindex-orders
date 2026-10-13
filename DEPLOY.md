@@ -31,6 +31,7 @@ Raindex V6 counts every amount as a decimal float. The vault converts each lock 
 
 ```bash
 # Copy example env file. It holds addresses, never a private key.
+# .env.base-sepolia.example instead has the deployed TestNet's addresses.
 cp .env.example .env
 
 # Keep the deployer key in an encrypted keystore, entered at a prompt

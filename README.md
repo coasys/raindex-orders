@@ -102,7 +102,7 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 | Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
 | Claim order signer | the test signer |
 
-`deploy-base-sepolia.sh` wrote these to `.env`, and `broadcast/*/84532/run-latest.json` records each transaction. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. To fill a `.env` for this deploy, copy `.env.example` and set `TOKEN_ADDRESS`, `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `CLAIM_INPUT_TOKEN`, `ORDER_HASH` and `ORDER_OWNER` (the vault) from the table. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
+`deploy-base-sepolia.sh` wrote these to `.env`, and `broadcast/*/84532/run-latest.json` records each transaction. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
 
 ## Documentation
 
