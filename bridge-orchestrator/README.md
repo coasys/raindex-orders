@@ -173,7 +173,7 @@ variable set to an empty value counts as unset.
 |----------|----------|---------|
 | `NETWORK` | No | `base-sepolia` (`mainnet`, `base-sepolia` or `none`) |
 | `BASE_SEPOLIA_RPC_URL` | No, refused on mainnet | `https://sepolia.base.org` |
-| `BASE_SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (base-sepolia), refused on mainnet | -- (TestNet's vault is not deployed on Base Sepolia yet) |
+| `BASE_SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (base-sepolia), refused on mainnet | -- (TestNet's is in the [README](../README.md#testnet-on-base-sepolia)) |
 | `ETH_RPC_URL` | **Yes** (mainnet), refused on base-sepolia | -- |
 | `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet), refused on base-sepolia | -- |
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
@@ -333,8 +333,8 @@ which the lock read gives up on after 30 s.
 under these names. On `base-sepolia` the values that are the same on every chain
 default to TestNet's, and startup logs which ones it took: Raindex V6, the
 Rainlang interpreter and store, the vault ID and the test signer. TestNet's
-mock HOT, vault and claim order are not deployed on Base Sepolia yet, so the
-rest is required on `base-sepolia` as on `mainnet`.
+mock HOT, vault and claim order are not defaulted: the rest is required on
+`base-sepolia` as on `mainnet`, TestNet's from the [README](../README.md#testnet-on-base-sepolia).
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|

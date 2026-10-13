@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- the TestNet is deployed on Base Sepolia (README.md, TestNet on Base Sepolia), and a TestNet website build takes its mock HOT, vault, ClaimInputToken, claim order hash and bytecode as defaults.
 - `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
 - `ClaimInputToken`, the claim order's input token, deployed with the vault: Raindex V6 takes an order only at a positive io-ratio and pulls at least one unit of the input token from the taker, so the claim order's ratio is 1e-30 per HOT and this token's transfers move nothing.
 - `test/TestClaimBaseSepolia.t.sol` deploys the TestNet bridge on a fork of Base Sepolia and proves a lock and a claim against the Raindex V6 there.

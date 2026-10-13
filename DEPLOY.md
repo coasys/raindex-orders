@@ -94,7 +94,15 @@ npm run build
 
 ### Deployed Contract Addresses (Base Sepolia)
 
-The TestNet bridge is not deployed on Base Sepolia yet. Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). The test signer is `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`.
+| Contract | Address on Base Sepolia |
+|----------|---------|
+| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
+| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
+| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
+| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
+| Claim order signer | the test signer |
+
+Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). The test signer is `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`. `broadcast/*/84532/run-latest.json` records each transaction.
 
 The previous TestNet, on Ethereum Sepolia against OrderBookV3 (vault `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6`, orderbook `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe`), does not carry over: its vault, order and coupons are V3's.
 
@@ -131,7 +139,7 @@ The rehearsal runs the orchestrator binary, so build it first: `cargo build` in 
 
 ### Website
 
-One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_SIGNER`), and logs which; it must be given the rest, as TestNet is not deployed on Base Sepolia yet. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
+One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_SIGNER`), and for TestNet's deploy on Base Sepolia (`PUBLIC_TOKEN_ADDRESS`, `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_CLAIM_INPUT_TOKEN`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE`), and logs which. A build for a new TestNet deploy names all five: one given alone pairs with the old order's hash, which the order hash check refuses. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
 
 The website waits for a sent transaction by polling every 2 seconds, Base's block time, for up to 5 minutes, as before: that is about 150 Base blocks, and 25 on mainnet.
 

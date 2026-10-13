@@ -15,10 +15,8 @@ const without = (build: Record<string, string>, key: string) => {
 	return rest
 }
 
-/** The build variables TestNet has no default for: its own deploy's values. */
-const DEPLOYED = BUILD_VARIABLES.filter(
-	key => key !== 'PUBLIC_NETWORK' && !(key in BASE_SEPOLIA_DEFAULTS)
-)
+// A vault that is not TestNet's: the test vectors' order owner.
+const VECTOR_ORDER_VAULT = BASE_SEPOLIA_BUILD.PUBLIC_LOCK_VAULT_ADDRESS
 
 describe('parseBridgeConfig', () => {
 	it('reads a TestNet build: Base Sepolia, mock HOT, its explorer, the faucet', () => {
@@ -76,32 +74,32 @@ describe('parseBridgeConfig', () => {
 		).toBe('0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b')
 	})
 
-	it('reads a build with no network as TestNet, and takes TestNet values for what is the same on every chain', () => {
-		const testnet = parseBridgeConfig(BASE_SEPOLIA_BUILD)
-		const deployed = Object.fromEntries(DEPLOYED.map(key => [key, BASE_SEPOLIA_BUILD[key]]))
+	it('reads a build with nothing set as TestNet: its deploy on Base Sepolia, which the order hash check accepts', () => {
+		const config = parseBridgeConfig({})
 
-		expect(parseBridgeConfig(deployed)).toEqual(testnet)
-		expect(parseBridgeConfig({ ...deployed, PUBLIC_NETWORK: '', PUBLIC_CLAIM_STORE: '' })).toEqual(
-			testnet
+		expect(config.network).toBe('base-sepolia')
+		expect(config.tokenAddress).toBe('0x916A830d1603252152fE17258bb10A393F173a72')
+		expect(config.lockVaultAddress).toBe('0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937')
+		expect(config.claimOrder.orderHash).toBe(
+			'0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb'
 		)
-		expect(withTestnetDefaults(deployed).defaulted).toEqual([
+		expect(config.claimOrder.inputToken).toBe('0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928')
+		expect(config.claimOrder.signer).toBe(TEST_SIGNER)
+		expect(parseBridgeConfig({ PUBLIC_NETWORK: '', PUBLIC_CLAIM_STORE: '' })).toEqual(config)
+		expect(withTestnetDefaults({}).defaulted).toEqual([
 			'PUBLIC_NETWORK',
-			'PUBLIC_ORDERBOOK_ADDRESS',
-			'PUBLIC_CLAIM_SIGNER',
-			'PUBLIC_CLAIM_INTERPRETER',
-			'PUBLIC_CLAIM_STORE'
+			...Object.keys(BASE_SEPOLIA_DEFAULTS)
 		])
 	})
 
-	it('refuses a TestNet build missing its own deploy, naming each variable: none is deployed on Base Sepolia yet', () => {
-		expect(() => parseBridgeConfig({})).toThrow(
-			'Bridge build variables: PUBLIC_TOKEN_ADDRESS is required; PUBLIC_LOCK_VAULT_ADDRESS is required; PUBLIC_CLAIM_INPUT_TOKEN is required; PUBLIC_CLAIM_ORDER_HASH is required; PUBLIC_CLAIM_BYTECODE is required'
+	it('refuses a TestNet build that names part of a new deploy: the rest is the old one, and the order hash says so', () => {
+		const hashFault = 'PUBLIC_CLAIM_ORDER_HASH is not the hash of the order'
+		expect(() => parseBridgeConfig({ PUBLIC_LOCK_VAULT_ADDRESS: VECTOR_ORDER_VAULT })).toThrow(
+			hashFault
 		)
-		for (const key of DEPLOYED) {
-			expect(() => parseBridgeConfig(without(BASE_SEPOLIA_BUILD, key))).toThrow(
-				`${key} is required`
-			)
-		}
+		expect(() => parseBridgeConfig(without(BASE_SEPOLIA_BUILD, 'PUBLIC_CLAIM_ORDER_HASH'))).toThrow(
+			hashFault
+		)
 	})
 
 	it('refuses a mainnet build missing any variable, naming it, with no TestNet value', () => {
