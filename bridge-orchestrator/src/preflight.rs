@@ -863,7 +863,7 @@ mod tests {
         fn accepts(&self, chain_id: u64, safe: Address, digest: &B256, signature: &[u8]) -> bool {
             let hash = safe_message_hash(chain_id, safe, digest);
             let fits = if self.takes_one {
-                signature.len() >= 65 && signature.len() % 65 == 0
+                signature.len() >= 65 && signature.len().is_multiple_of(65)
             } else {
                 signature.len() == 65 * self.threshold as usize
             };
