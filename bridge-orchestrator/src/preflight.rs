@@ -1,5 +1,7 @@
 use crate::config::Network;
-use crate::signer::{safe_domain_separator, ClaimOrder, CouponSigner, SignedCoupon};
+use crate::signer::{
+    safe_domain_separator, ClaimOrder, CouponSigner, ISafe, Owner, SafeOwners, SignedCoupon,
+};
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
@@ -67,14 +69,6 @@ sol! {
         function takeOrders4(TakeOrdersConfigV5 calldata config)
             external
             returns (bytes32 totalTakerInput, bytes32 totalTakerOutput);
-    }
-
-    /// What a Safe answers about itself.
-    #[sol(rpc)]
-    interface ISafe {
-        function getThreshold() external view returns (uint256);
-        function getOwners() external view returns (address[] memory);
-        function domainSeparator() external view returns (bytes32);
     }
 }
 
@@ -237,11 +231,11 @@ async fn read_and_compare(
             order.signer
         );
     }
-    match signer.safe_owners() {
+    match signer.safe() {
         None => {
             if !signer_code.is_empty() {
                 bail!(
-                    "CLAIM_SIGNER {} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS to the keys of its threshold of owners instead",
+                    "CLAIM_SIGNER {} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES to its owners instead",
                     order.signer
                 );
             }
@@ -253,47 +247,88 @@ async fn read_and_compare(
                 );
             }
         }
-        Some(held) => {
+        Some(safe) => {
             if signer_code.is_empty() {
                 bail!(
-                    "CLAIM_SIGNER {} has no contract, so it is a key, not a Safe, and SAFE_OWNER_KEYS signs for a Safe. For a key, set SIGNER_PRIVATE_KEY instead",
+                    "CLAIM_SIGNER {} has no contract, so it is a key, not a Safe, and SAFE_OWNER_KEYS and SAFE_OWNER_SERVICES sign for a Safe. For a key, set SIGNER_PRIVATE_KEY instead",
                     order.signer
                 );
             }
-            check_safe(&provider, network, order.signer, &held, rpc_var).await?;
+            check_safe(&provider, network, safe, rpc_var).await?;
         }
     }
 
     let probe = signer.probe_coupon().await?;
-    let call = take_one(order, probe);
+    let fewer = signer.safe().map(|_| {
+        let mut fewer = probe.clone();
+        fewer.signature.truncate(probe.signature.len() - 65);
+        fewer
+    });
+    let refused = simulate(&provider, order, probe, rpc_var).await?;
+    accepts_signer(order.signer, refused)?;
+    if let Some(fewer) = fewer {
+        let owners = fewer.signature.len() / 65;
+        if simulate(&provider, order, fewer, rpc_var).await?.is_none() {
+            bail!(
+                "the claim order ORDER_HASH took a coupon carrying {owners} owner signatures for CLAIM_SIGNER {}, fewer than its threshold",
+                order.signer
+            );
+        }
+        tracing::info!(
+            event = "startup.probe",
+            "the claim order took the probe signed by {} owners of CLAIM_SIGNER {}, and refused it signed by {owners}",
+            owners + 1,
+            order.signer
+        );
+    }
+    Ok(())
+}
+
+/// Simulates the claim of `coupon` as the website sends it. Nothing when the
+/// claim order took it, or would have but for the vault's balance (MinimumIO);
+/// otherwise its revert data.
+async fn simulate<T, P>(
+    provider: &P,
+    order: &ClaimOrder,
+    coupon: SignedCoupon,
+    rpc_var: &str,
+) -> Result<Option<Bytes>>
+where
+    T: alloy::transports::Transport + Clone,
+    P: Provider<T>,
+{
+    let call = take_one(order, coupon);
     tracing::debug!(
         event = "startup.probe",
         calldata = %Bytes::from(IRaindexV6::takeOrders4Call { config: call.clone() }.abi_encode()),
         "simulating the claim order probe"
     );
-    let taken = IRaindexV6::new(order.orderbook, &provider)
+    let taken = IRaindexV6::new(order.orderbook, provider)
         .takeOrders4(call)
         .from(order.signer)
         .call()
         .await;
-    accepts_signer(order.signer, taken.map(|_| ()), rpc_var)
+    outcome(taken.map(|_| ()), rpc_var)
 }
 
-/// CLAIM_SIGNER `safe` must be a Safe on `network`'s chain whose threshold is
-/// the number of keys SAFE_OWNER_KEYS holds, each the key of one of its owners,
-/// and whose EIP-712 domain is the one the owners sign under: otherwise its
-/// `isValidSignature` refuses every coupon.
+/// CLAIM_SIGNER, a Safe, must be one on `network`'s chain whose EIP-712 domain
+/// is the one its owners sign under, or its `isValidSignature` refuses every
+/// coupon. Each owner key held here must be one of its owners, and no more of
+/// them than its threshold; each signer service must answer for its owner, this
+/// Safe and this chain. A service that does not answer is logged, and the check
+/// passes while the owners that can sign are at least the threshold: a
+/// withdrawal stays parked while fewer sign.
 async fn check_safe<T, P>(
     provider: &P,
     network: Network,
-    safe: Address,
-    held: &[Address],
+    signer: &SafeOwners,
     rpc_var: &str,
 ) -> Result<()>
 where
     T: alloy::transports::Transport + Clone,
     P: Provider<T>,
 {
+    let safe = signer.safe();
     let contract = ISafe::new(safe, provider);
     let not_a_safe = |what: &str, err: alloy::contract::Error| match err {
         alloy::contract::Error::TransportError(e) => rpc_failure(rpc_var, what, &e),
@@ -324,47 +359,100 @@ where
         );
     }
     let threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
-    if held.len() != threshold {
-        bail!(
-            "SAFE_OWNER_KEYS holds {} keys, and CLAIM_SIGNER {safe} is a Safe of threshold {threshold}: give the keys of that many of its owners",
-            held.len()
-        );
-    }
     let listed = owners
         .iter()
         .map(|owner| owner.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    for owner in held {
-        if !owners.contains(owner) {
-            bail!(
-                "SAFE_OWNER_KEYS holds the key of {owner}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}"
-            );
+    let keys = signer.local_keys();
+    if keys > threshold {
+        bail!(
+            "SAFE_OWNER_KEYS holds {keys} keys, and CLAIM_SIGNER {safe} is a Safe of threshold {threshold}: give the keys of that many of its owners"
+        );
+    }
+    let mut able = Vec::new();
+    for owner in signer.owners() {
+        let address = owner.address();
+        match owner {
+            Owner::Key(_) => {
+                if !owners.contains(&address) {
+                    bail!(
+                        "SAFE_OWNER_KEYS holds the key of {address}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}"
+                    );
+                }
+                able.push(format!("{address}, a key held here"));
+            }
+            Owner::Service(service) => {
+                if !owners.contains(&address) {
+                    bail!(
+                        "SAFE_OWNER_SERVICES names {address}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}"
+                    );
+                }
+                match service.identity().await {
+                    Ok(identity) => {
+                        if identity.owner != address
+                            || identity.safe != safe
+                            || identity.chain_id != chain_id
+                        {
+                            bail!(
+                                "the signer service at {} signs as {} for {} on chain {}, and SAFE_OWNER_SERVICES names it for {address}, an owner of CLAIM_SIGNER {safe} on chain {chain_id}",
+                                service.host(),
+                                identity.owner,
+                                identity.safe,
+                                identity.chain_id
+                            );
+                        }
+                        able.push(format!("{address}, a signer service at {}", service.host()));
+                    }
+                    Err(err) => tracing::warn!(
+                        event = "startup.signer_service_down",
+                        owner = %address,
+                        "the signer service for {address} at {} {err:#}: the other owners sign until it answers",
+                        service.host()
+                    ),
+                }
+            }
         }
+    }
+    if able.len() < threshold {
+        bail!(
+            "{} of the owners this orchestrator asks can sign now, and CLAIM_SIGNER {safe} is a Safe of threshold {threshold}: {}",
+            able.len(),
+            if able.is_empty() {
+                "none".to_string()
+            } else {
+                able.join("; ")
+            }
+        );
     }
     tracing::info!(
         event = "startup.safe_signer",
         safe = %safe,
         threshold,
         owners = %listed,
-        "CLAIM_SIGNER is a Safe of threshold {threshold}: this orchestrator holds the keys of {} of its owners and signs as all of them, which is one party, not {threshold} (docs/signer-service.md)",
-        held.len()
+        "CLAIM_SIGNER is a Safe of threshold {threshold} with the owners {listed}. This orchestrator asks {}: {}",
+        signer.owners().len(),
+        able.join("; ")
     );
+    if keys >= threshold {
+        tracing::warn!(
+            event = "startup.one_party",
+            "this orchestrator holds the keys of {keys} owners of CLAIM_SIGNER {safe}, a Safe of threshold {threshold}, and signs as all of them, which is one party, not {threshold} (docs/signer-service.md)"
+        );
+    }
     Ok(())
 }
 
-/// Whether simulating takeOrders4 with the probe coupon shows the claim order
-/// accepts its signer. Its first check is the signer, so any other outcome comes
-/// after it. Only a claim, or MinimumIO for a vault that cannot pay the one wei,
-/// counts.
-fn accepts_signer(
-    signer: Address,
+/// What a simulated claim answered: nothing when the claim order took it, or
+/// would have but for the vault's balance (MinimumIO); otherwise its revert
+/// data. A transport failure, or an answer that is not takeOrders4's, is an error.
+fn outcome(
     taken: std::result::Result<(), alloy::contract::Error>,
     rpc_var: &str,
-) -> Result<()> {
+) -> Result<Option<Bytes>> {
     let what = "the claim order probe (takeOrders4)";
     let payload = match taken {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(None),
         Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(payload))) => payload,
         Err(alloy::contract::Error::TransportError(e)) => {
             return Err(rpc_failure(rpc_var, what, &e))
@@ -375,8 +463,18 @@ fn accepts_signer(
         return Err(rpc_failure(rpc_var, what, &RpcError::ErrorResp(payload)));
     };
     if MinimumIO::abi_decode(&revert, true).is_ok() {
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(revert))
+}
+
+/// Whether the simulated probe shows the claim order accepts its signer. Its
+/// first check is the signer, so any other outcome comes after it. Only a claim,
+/// or MinimumIO for a vault that cannot pay the one wei, counts.
+fn accepts_signer(signer: Address, refused: Option<Bytes>) -> Result<()> {
+    let Some(revert) = refused else {
+        return Ok(());
+    };
     if Revert::abi_decode(&revert, true).is_ok_and(|r| r.reason == "Wrong signer") {
         bail!("the claim order ORDER_HASH does not accept coupons from CLAIM_SIGNER {signer}: it answered \"Wrong signer\"");
     }
@@ -486,7 +584,8 @@ fn causes(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use crate::fake_rpc::{read_request, serve};
-    use crate::signer::{amount_word, context_digest, safe_message_hash, SafeOwners};
+    use crate::signer::safe::tests::{fake_service, owner_service, service_owner};
+    use crate::signer::{amount_word, context_digest, safe_message_hash, OwnerService, SafeOwners};
     use alloy::primitives::{address, PrimitiveSignature, U256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
@@ -571,6 +670,8 @@ mod tests {
         threshold: u64,
         owners: Vec<Address>,
         domain: Option<B256>,
+        /// Takes one owner's signature, whatever its threshold: a broken Safe.
+        takes_one: bool,
     }
 
     type Answer = std::result::Result<String, Value>;
@@ -607,6 +708,7 @@ mod tests {
                     threshold,
                     owners: owners.iter().map(|key| key.address()).collect(),
                     domain: None,
+                    takes_one: false,
                 }),
                 ..self
             }
@@ -659,6 +761,27 @@ mod tests {
                                 .domain
                                 .unwrap_or_else(|| safe_domain_separator(self.chain_id, to))
                                 .abi_encode(),
+                            ISafe::isValidSignatureCall::SELECTOR => {
+                                let asked =
+                                    ISafe::isValidSignatureCall::abi_decode(&input, true).unwrap();
+                                if !safe.accepts(
+                                    self.chain_id,
+                                    to,
+                                    &asked.dataHash,
+                                    &asked.signature,
+                                ) {
+                                    return reverted(
+                                        Revert {
+                                            reason: "GS026".to_string(),
+                                        }
+                                        .abi_encode(),
+                                    );
+                                }
+                                alloy::primitives::FixedBytes::<4>::from(
+                                    crate::signer::safe::EIP1271_MAGIC_VALUE,
+                                )
+                                .abi_encode()
+                            }
                             _ => return empty,
                         }
                     } else {
@@ -739,7 +862,12 @@ mod tests {
         /// each an owner's.
         fn accepts(&self, chain_id: u64, safe: Address, digest: &B256, signature: &[u8]) -> bool {
             let hash = safe_message_hash(chain_id, safe, digest);
-            if signature.len() != 65 * self.threshold as usize {
+            let fits = if self.takes_one {
+                signature.len() >= 65 && signature.len() % 65 == 0
+            } else {
+                signature.len() == 65 * self.threshold as usize
+            };
+            if !fits {
                 return false;
             }
             let mut last = Address::ZERO;
@@ -835,55 +963,94 @@ mod tests {
         OWNER_KEYS.iter().map(|key| key.parse().unwrap()).collect()
     }
 
-    /// The claim order with SAFE as its signer, a chain where SAFE is a Safe of
-    /// `threshold` with `owners()`, and the signer holding `held` of their keys.
-    fn safe_setup(network: Network, threshold: u64, held: &[usize]) -> (Chain, CouponSigner) {
+    /// The claim order with SAFE as its signer, and a chain where SAFE is a Safe
+    /// of `threshold` with `owners()`.
+    fn safe_setup(network: Network, threshold: u64) -> (Chain, ClaimOrder) {
         let (order, chain) = changed(|order| order.signer = SAFE);
         let chain = Chain {
             chain_id: network.chain_id(),
             ..chain
         }
         .with_safe(threshold, &owners());
-        let keys = held.iter().map(|i| owners()[*i].clone()).collect();
-        let signer = CouponSigner::for_order(
-            SafeOwners::new(SAFE, network.chain_id(), keys).unwrap(),
-            order,
-        );
-        (chain, signer)
+        (chain, order)
     }
 
-    async fn safe_refusal(network: Network, chain: Chain, signer: &CouponSigner) -> String {
+    fn held(keys: &[usize]) -> Vec<Owner> {
+        keys.iter()
+            .map(|i| Owner::Key(owners()[*i].clone()))
+            .collect()
+    }
+
+    /// The startup check on `chain`, with the Safe signer asking `asked` and
+    /// reading the chain on `signer_chain`.
+    async fn safe_check(
+        network: Network,
+        chain: Chain,
+        order: ClaimOrder,
+        asked: Vec<Owner>,
+        signer_chain: u64,
+    ) -> Result<()> {
+        let url =
+            serve(move |method, params| chain.answer(method, params).map(Value::String)).await;
+        let owners = SafeOwners::new(SAFE, signer_chain, asked, url.clone())?;
+        check(
+            network,
+            &url,
+            VAULT,
+            &CouponSigner::for_order(owners, order),
+        )
+        .await
+    }
+
+    async fn safe_refusal(network: Network, chain: Chain, asked: Vec<Owner>) -> String {
+        let order = changed(|order| order.signer = SAFE).0;
         format!(
             "{:#}",
-            check_with(network, chain, signer)
+            safe_check(network, chain, order, asked, network.chain_id())
                 .await
                 .expect_err("the check passed")
         )
     }
 
     /// The Safe's isValidSignature checks the owners' signatures over the
-    /// SafeMessage hash, as the probe has it do through takeOrders4.
+    /// SafeMessage hash, as the probe has it do through takeOrders4, with M
+    /// signatures, and refuses M-1.
     #[tokio::test]
     async fn passes_a_safe_claim_signer_whose_threshold_of_owner_keys_it_holds() {
         for network in [Network::BaseSepolia, Network::Mainnet] {
-            let (chain, signer) = safe_setup(network, 2, &[2, 0]);
-            check_with(network, chain, &signer).await.unwrap();
+            let (chain, order) = safe_setup(network, 2);
+            safe_check(network, chain, order, held(&[2, 0]), network.chain_id())
+                .await
+                .unwrap();
         }
     }
 
     #[tokio::test]
-    async fn refuses_safe_owner_keys_whose_count_is_not_the_safes_threshold() {
-        let (chain, signer) = safe_setup(Network::Mainnet, 3, &[0, 1]);
+    async fn refuses_fewer_owners_that_can_sign_than_the_safes_threshold() {
+        let (chain, _) = safe_setup(Network::Mainnet, 3);
+        let able = [0, 1]
+            .map(|i| format!("{}, a key held here", owners()[i].address()))
+            .join("; ");
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
-            format!("SAFE_OWNER_KEYS holds 2 keys, and CLAIM_SIGNER {SAFE} is a Safe of threshold 3: give the keys of that many of its owners")
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1])).await,
+            format!("2 of the owners this orchestrator asks can sign now, and CLAIM_SIGNER {SAFE} is a Safe of threshold 3: {able}")
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_more_safe_owner_keys_than_the_safes_threshold() {
+        let (chain, _) = safe_setup(Network::Mainnet, 2);
+
+        assert_eq!(
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1, 2])).await,
+            format!("SAFE_OWNER_KEYS holds 3 keys, and CLAIM_SIGNER {SAFE} is a Safe of threshold 2: give the keys of that many of its owners")
         );
     }
 
     #[tokio::test]
     async fn refuses_a_safe_owner_key_that_is_not_an_owner() {
-        let (chain, signer) = safe_setup(Network::Mainnet, 2, &[0, 1]);
+        let (chain, _) = safe_setup(Network::Mainnet, 2);
         let stranger = PrivateKeySigner::random();
         let chain = chain.with_safe(
             2,
@@ -898,7 +1065,7 @@ mod tests {
         .join(", ");
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1])).await,
             format!(
                 "SAFE_OWNER_KEYS holds the key of {}, which is not an owner of CLAIM_SIGNER {SAFE}: its owners are {listed}",
                 owners()[1].address()
@@ -908,53 +1075,166 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_a_safe_with_another_eip712_domain() {
-        let (mut chain, signer) = safe_setup(Network::Mainnet, 2, &[0, 1]);
+        let (mut chain, _) = safe_setup(Network::Mainnet, 2);
         chain.safe.as_mut().unwrap().domain = Some(safe_domain_separator(84_532, SAFE));
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1])).await,
             format!("CLAIM_SIGNER {SAFE} does not sign under the EIP-712 domain of a Safe 1.3.0 or later on chain 1, so its owners' signatures would not be over the hash it checks")
         );
     }
 
     #[tokio::test]
     async fn refuses_a_contract_claim_signer_that_is_not_a_safe_for_safe_owner_keys() {
-        let (mut chain, signer) = safe_setup(Network::Mainnet, 2, &[0, 1]);
+        let (mut chain, _) = safe_setup(Network::Mainnet, 2);
         chain.safe = None;
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1])).await,
             format!("CLAIM_SIGNER {SAFE} is a contract but not a Safe: it did not answer getThreshold()")
         );
     }
 
     #[tokio::test]
     async fn refuses_safe_owner_keys_for_a_claim_signer_that_is_a_key() {
-        let (mut chain, signer) = safe_setup(Network::Mainnet, 2, &[0, 1]);
+        let (mut chain, _) = safe_setup(Network::Mainnet, 2);
         chain.safe = None;
         chain.signer_code = "0x";
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
-            format!("CLAIM_SIGNER {SAFE} has no contract, so it is a key, not a Safe, and SAFE_OWNER_KEYS signs for a Safe. For a key, set SIGNER_PRIVATE_KEY instead")
+            safe_refusal(Network::Mainnet, chain, held(&[0, 1])).await,
+            format!("CLAIM_SIGNER {SAFE} has no contract, so it is a key, not a Safe, and SAFE_OWNER_KEYS and SAFE_OWNER_SERVICES sign for a Safe. For a key, set SIGNER_PRIVATE_KEY instead")
         );
     }
 
-    /// A Safe refuses a signature its owners did not give over the hash it
-    /// checks: the probe reports the InvalidSignature Raindex V6 reverts with.
-    /// Here the keys sign under another chain's domain, which no setting can
-    /// cause, as the Safe's chain and the signer's are both NETWORK's.
+    /// The owners' signatures are checked by the Safe before the probe goes to
+    /// the orderbook. Here the keys sign under another chain's domain, which no
+    /// setting can cause, as the Safe's chain and the signer's are both
+    /// NETWORK's.
     #[tokio::test]
-    async fn a_safe_refusing_the_probes_signature_is_reported() {
-        let (chain, _) = safe_setup(Network::Mainnet, 2, &[0, 1]);
-        let (order, _) = changed(|order| order.signer = SAFE);
-        let keys = vec![owners()[0].clone(), owners()[1].clone()];
-        let signer = CouponSigner::for_order(SafeOwners::new(SAFE, 84_532, keys).unwrap(), order);
+    async fn a_safe_refusing_its_owners_signatures_is_reported() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+
+        let err = safe_check(Network::Mainnet, chain, order, held(&[0, 1]), 84_532)
+            .await
+            .unwrap_err();
 
         assert_eq!(
-            safe_refusal(Network::Mainnet, chain, &signer).await,
-            format!("the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {SAFE} with error 0x{}", hex::encode(InvalidSignature::SELECTOR))
+            format!("{err:#}"),
+            format!("CLAIM_SIGNER {SAFE} refused the signatures of 2 of its owners: its isValidSignature did not accept them")
         );
+    }
+
+    /// A Safe that takes fewer signatures than its threshold says is refused:
+    /// the probe signed by M-1 owners must fail.
+    #[tokio::test]
+    async fn refuses_a_safe_that_takes_fewer_than_its_threshold() {
+        let (mut chain, order) = safe_setup(Network::Mainnet, 2);
+        chain.safe.as_mut().unwrap().takes_one = true;
+
+        let err = safe_check(Network::Mainnet, chain, order, held(&[0, 1]), 1)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            format!("the claim order ORDER_HASH took a coupon carrying 1 owner signatures for CLAIM_SIGNER {SAFE}, fewer than its threshold")
+        );
+    }
+
+    /// Owners at signer services: each answers GET /signer for its owner, the
+    /// Safe and the chain, and signs the probe, which pays no withdrawal. One
+    /// that is down is left out while the others are at least the threshold.
+    #[tokio::test]
+    async fn passes_a_safe_whose_owners_sign_at_their_signer_services_with_one_down() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let down = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+        let (a, b) = (
+            owner_service(owners()[0].clone()).await,
+            owner_service(owners()[1].clone()).await,
+        );
+        let asked = vec![
+            service_owner(&owners()[0], &a),
+            service_owner(&owners()[1], &b),
+            Owner::Service(
+                OwnerService::new(Network::Mainnet, owners()[2].address(), &down).unwrap(),
+            ),
+        ];
+
+        safe_check(Network::Mainnet, chain, order, asked, 1)
+            .await
+            .unwrap();
+
+        let paths: Vec<String> = a
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(paths, ["/holo/signer", "/holo/sign"]);
+        assert_eq!(a.requests.lock().unwrap()[1].1["withdrawal"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_signer_service_answering_for_another_owner_safe_or_chain() {
+        let (chain, _) = safe_setup(Network::Mainnet, 2);
+        let other_owner = owner_service(owners()[1].clone()).await;
+        let asked = vec![
+            service_owner(&owners()[0], &other_owner),
+            Owner::Key(owners()[2].clone()),
+        ];
+        let host = asked[0].name();
+        let host = host
+            .split("signer service at ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(')')
+            .to_string();
+
+        assert_eq!(
+            safe_refusal(Network::Mainnet, chain.clone(), asked).await,
+            format!(
+                "the signer service at {host} signs as {} for {SAFE} on chain 1, and SAFE_OWNER_SERVICES names it for {}, an owner of CLAIM_SIGNER {SAFE} on chain 1",
+                owners()[1].address(),
+                owners()[0].address()
+            )
+        );
+
+        let other_chain = fake_service(move |_, _| {
+            (
+                "200 OK",
+                json!({"owner": owners()[0].address(), "safe": SAFE, "chainId": 84532}).to_string(),
+            )
+        })
+        .await;
+        let asked = vec![
+            service_owner(&owners()[0], &other_chain),
+            Owner::Key(owners()[2].clone()),
+        ];
+        assert!(safe_refusal(Network::Mainnet, chain, asked)
+            .await
+            .contains("on chain 84532, and SAFE_OWNER_SERVICES names it"));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_signer_service_for_an_address_that_is_not_an_owner() {
+        let (chain, _) = safe_setup(Network::Mainnet, 2);
+        let stranger = PrivateKeySigner::random();
+        let service = owner_service(stranger.clone()).await;
+        let asked = vec![
+            service_owner(&stranger, &service),
+            Owner::Key(owners()[2].clone()),
+        ];
+
+        assert!(safe_refusal(Network::Mainnet, chain, asked)
+            .await
+            .starts_with(&format!(
+                "SAFE_OWNER_SERVICES names {}, which is not an owner of CLAIM_SIGNER {SAFE}",
+                stranger.address()
+            )));
     }
 
     /// `order` changed by `change`, with its hash rebuilt, and a chain that holds it.
@@ -1206,7 +1486,7 @@ mod tests {
             assert_eq!(
                 refusal(network, chain, &order()).await,
                 format!(
-                    "CLAIM_SIGNER {} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS to the keys of its threshold of owners instead",
+                    "CLAIM_SIGNER {} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES to its owners instead",
                     key().address()
                 )
             );
@@ -1224,7 +1504,7 @@ mod tests {
         assert_eq!(
             refusal(Network::BaseSepolia, chain, &order).await,
             format!(
-                "CLAIM_SIGNER {OTHER} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS to the keys of its threshold of owners instead"
+                "CLAIM_SIGNER {OTHER} is a contract, such as a Safe, and SIGNER_PRIVATE_KEY signs as a key, so it cannot sign for it. For a Safe, set SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES to its owners instead"
             )
         );
     }
@@ -1339,7 +1619,7 @@ mod tests {
         let refused = |taken| {
             format!(
                 "{:#}",
-                accepts_signer(OTHER, taken, "ETH_RPC_URL").unwrap_err()
+                accepts_signer(OTHER, outcome(taken, "ETH_RPC_URL").unwrap()).unwrap_err()
             )
         };
 
