@@ -160,7 +160,7 @@
 		<h3 class="mb-2 text-lg font-semibold">About This Faucet</h3>
 		<div class="text-sm text-gray-600">
 			<p class="mb-2">
-				This faucet provides mock HOT tokens on Sepolia testnet for testing the HOT Bridge.
+				This faucet provides mock HOT tokens on the Base Sepolia testnet for testing the HOT Bridge.
 			</p>
 			<ul class="list-inside list-disc space-y-1">
 				<li>Get 1000 mock HOT per request</li>

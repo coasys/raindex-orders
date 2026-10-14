@@ -3,6 +3,7 @@ import {
 	decodeErrorResult,
 	decodeFunctionResult,
 	encodeFunctionData,
+	hexToBigInt,
 	isHex,
 	numberToHex,
 	size,
@@ -13,7 +14,7 @@ import {
 } from 'viem'
 import { orderbookAbi } from '../generated'
 import { bridge } from './config'
-import { parseCoupon, type CouponConfig, type SignedContextV1Struct } from './coupon'
+import { floatToWei, parseCoupon, type CouponConfig, type SignedContextV1Struct } from './coupon'
 import {
 	ethereumStore,
 	getEthereum,
@@ -26,7 +27,7 @@ import {
 	writeContract,
 	type Eip1193Provider
 } from './ethereum'
-import { claimOrderStruct } from './network'
+import { CLAIM_IO_RATIO, claimOrderStruct } from './network'
 import { transactionStore } from './stores/transactionStore'
 import { causeChain } from './utils'
 
@@ -79,7 +80,7 @@ function refusalMessage(reason: string, coupon: CouponConfig) {
 		case 'Wrong output vault id':
 			return `This coupon does not match this bridge, so it cannot be claimed here. ${REISSUE}`
 		case 'Wrong output amount':
-		case 'MinimumInput':
+		case 'MinimumIO':
 			return 'The bridge cannot pay this claim right now, and your coupon was not used. Try again later, and contact Unyt support if it keeps failing.'
 		default:
 			return 'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
@@ -131,27 +132,40 @@ async function refusalOf(eth: Eip1193Provider, account: Address, data: Hex, amou
 		if (revert === undefined) throw err
 		return { revert, cause: err }
 	}
+	// takeOrders4 answers floats: the taker's input is the HOT the order paid.
 	const [paid] = decodeFunctionResult({
 		abi: orderbookAbi,
-		functionName: 'takeOrders',
+		functionName: 'takeOrders4',
 		data: result as Hex
 	})
-	if (paid !== amount) throw new Error(`The claim would pay ${paid}, not ${amount}`)
+	const paidWei = floatToWei(hexToBigInt(paid))
+	if (paidWei !== amount) throw new Error(`The claim would pay ${paidWei}, not ${amount}`)
 	return null
 }
 
+/**
+ * The takeOrders4 call of a claim: the taker's input is the order's output, exactly
+ * the coupon's amount, at the claim order's ratio.
+ */
 function takeOrdersConfig(signedContext: SignedContextV1Struct) {
-	const amount = signedContext.context[1]
+	const amount = numberToHex(signedContext.context[1], { size: 32 })
 	return {
-		minimumInput: amount,
-		maximumInput: amount,
-		maximumIORatio: 0n,
+		minimumIO: amount,
+		maximumIO: amount,
+		maximumIORatio: CLAIM_IO_RATIO,
+		IOIsInput: true,
 		orders: [
 			{
 				order: claimOrderStruct(bridge),
 				inputIOIndex: 0n,
 				outputIOIndex: 0n,
-				signedContext: [signedContext]
+				signedContext: [
+					{
+						signer: signedContext.signer,
+						context: signedContext.context.map(word => numberToHex(word, { size: 32 })),
+						signature: signedContext.signature
+					}
+				]
 			}
 		],
 		data: '0x' as Hex
@@ -203,7 +217,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	trace.couponNonce = numberToHex(coupon.nonce)
 	trace.couponExpiry = coupon.expiryTimestamp
 	const args = [takeOrdersConfig(signedContext)] as const
-	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders', args })
+	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders4', args })
 	const check = () => refusalOf(eth, account, data, coupon.withdrawAmount)
 
 	trace.step = 'checking the coupon'
@@ -220,7 +234,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	const sentHash = await writeContract({
 		address: bridge.orderbookAddress,
 		abi: orderbookAbi,
-		functionName: 'takeOrders',
+		functionName: 'takeOrders4',
 		args,
 		from: account
 	}).catch(err => {

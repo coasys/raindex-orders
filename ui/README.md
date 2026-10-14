@@ -37,6 +37,10 @@ You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://kit.svelte.dev/docs/adapters) for your target environment.
 
+## Networks and the orderbook ABI
+
+`PUBLIC_NETWORK` is `base-sepolia` (the TestNet, chain 84532) or `mainnet`; the build variables and their TestNet defaults are in `src/lib/network.ts`, and [DEPLOY.md](../DEPLOY.md#website) names them. `src/generated.ts` holds the Raindex V6 ABI from `forge inspect IRaindexV6 abi --json`, plus the errors a claim can revert with; `scripts/coupon-fixtures.mjs` writes the coupon-status test fixtures.
+
 ## Pausing the bridge
 
 While a Worker's `BRIDGE_PAUSED` secret is exactly `true`, Lock and the TestNet faucet show a stop page, the TestNet `/api/faucet` answers `503`, and a Lock page left open refuses to send. Claim works as usual. Any other value, or none, leaves the site open.

@@ -3097,6 +3097,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::config::{Network, RetentionConfig};
+    use alloy::primitives::U256;
     use alloy::signers::local::PrivateKeySigner;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
     use holochain_client::ExternIO;
@@ -3175,7 +3176,7 @@ mod tests {
             reporter: ReporterState::new(),
             ethereum: Some(EthereumSide {
                 chain: Ethereum {
-                    network: Network::Sepolia,
+                    network: Network::BaseSepolia,
                     rpc_url: "http://localhost:0".to_string(),
                     lock_vault_address: VAULT,
                     confirmations: 5,
@@ -3218,7 +3219,7 @@ mod tests {
         let path = test_db_path("bind-vault");
         let side = |vault: Address| EthereumSide {
             chain: Ethereum {
-                network: Network::Sepolia,
+                network: Network::BaseSepolia,
                 rpc_url: "http://localhost:0".to_string(),
                 lock_vault_address: vault,
                 confirmations: 5,
@@ -8545,8 +8546,13 @@ mod tests {
         let coupon = selection.coupons[&withdrawal.id.to_string()]
             .as_str()
             .unwrap();
-        let amount = coupon.split(',').nth(3);
-        assert_eq!(amount, Some("5000000000000000000"), "{coupon}");
+        // The amount word: 5 HOT in wei, with exponent -18 in its top 32 bits.
+        let amount = coupon.split(',').nth(3).unwrap().parse::<U256>().unwrap();
+        assert_eq!(
+            amount,
+            (U256::from(0xffffffeeu64) << 224) | U256::from(5_000_000_000_000_000_000u128),
+            "{coupon}"
+        );
     }
 
     #[tokio::test]

@@ -21,20 +21,20 @@
 
 		{#if bridge.faucet}
 			<a
-				href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia"
+				href="https://docs.base.org/base-chain/tools/network-faucets"
 				target="_blank"
 				rel="noopener noreferrer"
 				class="block"
 			>
 				<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
 					<h3 class="text-base font-semibold text-gray-900 dark:text-white">
-						Get Test ETH (Sepolia)
+						Get Test ETH (Base Sepolia)
 					</h3>
 					<p class="text-sm text-gray-600 dark:text-gray-400">
-						Use the Sepolia faucet to obtain test ETH for gas on the Sepolia network.
+						Use a Base Sepolia faucet to obtain test ETH for gas on the Base Sepolia network.
 					</p>
 					<p class="mt-2 text-sm font-medium text-blue-600 dark:text-blue-400">
-						Go to Sepolia Faucet →
+						Go to the Base Sepolia faucets →
 					</p>
 				</Card>
 			</a>

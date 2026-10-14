@@ -37,10 +37,10 @@ beforeEach(() => {
 afterEach(() => rmSync(bin, { recursive: true }))
 
 describe('cf-deploy.sh', () => {
-	it('deploys hot-bridge-ui with its Sepolia RPC and faucet key', () => {
+	it('deploys hot-bridge-ui with its Base Sepolia RPC and faucet key', () => {
 		const { status, calls } = deploy({
-			PUBLIC_NETWORK: 'sepolia',
-			SEPOLIA_RPC_URL: 'https://sepolia.rpc.test',
+			PUBLIC_NETWORK: 'base-sepolia',
+			BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test',
 			FAUCET_PRIVATE_KEY: '0xfaucet'
 		})
 
@@ -48,14 +48,14 @@ describe('cf-deploy.sh', () => {
 		expect(calls[0]).toBe('wrangler deploy --keep-vars ')
 		expect(calls[1]).toMatch(/^wrangler secret bulk \S+ \{/)
 		expect(JSON.parse(calls[1].slice(calls[1].indexOf('{')))).toEqual({
-			SEPOLIA_RPC_URL: 'https://sepolia.rpc.test',
+			BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test',
 			FAUCET_PRIVATE_KEY: '0xfaucet'
 		})
 	})
 
 	it('deploys hot-bridge-ui when PUBLIC_NETWORK is unset', () => {
 		const { status, calls } = deploy({
-			SEPOLIA_RPC_URL: 'https://sepolia.rpc.test',
+			BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test',
 			FAUCET_PRIVATE_KEY: '0xfaucet'
 		})
 
@@ -80,13 +80,16 @@ describe('cf-deploy.sh', () => {
 
 	it.each([
 		[
-			{ PUBLIC_NETWORK: 'sepolia', SEPOLIA_RPC_URL: 'https://sepolia.rpc.test' },
+			{ PUBLIC_NETWORK: 'base-sepolia', BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test' },
 			'FAUCET_PRIVATE_KEY'
 		],
-		[{ PUBLIC_NETWORK: 'sepolia', FAUCET_PRIVATE_KEY: '0xfaucet' }, 'SEPOLIA_RPC_URL'],
-		[{ PUBLIC_NETWORK: 'mainnet', SEPOLIA_RPC_URL: 'https://sepolia.rpc.test' }, 'ETH_RPC_URL'],
+		[{ PUBLIC_NETWORK: 'base-sepolia', FAUCET_PRIVATE_KEY: '0xfaucet' }, 'BASE_SEPOLIA_RPC_URL'],
+		[
+			{ PUBLIC_NETWORK: 'mainnet', BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test' },
+			'ETH_RPC_URL'
+		],
 		[{ PUBLIC_NETWORK: 'goerli', ETH_RPC_URL: 'https://eth.rpc.test' }, 'PUBLIC_NETWORK'],
-		[{ ETH_RPC_URL: 'https://eth.rpc.test' }, 'SEPOLIA_RPC_URL']
+		[{ ETH_RPC_URL: 'https://eth.rpc.test' }, 'BASE_SEPOLIA_RPC_URL']
 	])('fails, deploying nothing, without %o', (env, missing) => {
 		const { status, stderr, calls } = deploy(env)
 

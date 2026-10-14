@@ -1,5 +1,5 @@
 use crate::config::{log_testnet_defaults, with_network_defaults, Network};
-use alloy::primitives::{address, keccak256, Address, B256, U256};
+use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::{Context, Result};
@@ -23,11 +23,15 @@ const CLAIM_ORDER_VARIABLES: [&str; 10] = [
     "CLAIM_SIGNER",
     "CLAIM_INTERPRETER",
     "CLAIM_STORE",
-    "CLAIM_EXPRESSION",
+    "CLAIM_BYTECODE",
     "CLAIM_INPUT_TOKEN",
 ];
 
 const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// HOT's decimals on Ethereum, which the coupon's amount float carries as its
+/// exponent.
+const HOT_DECIMALS: u32 = 18;
 
 pub(crate) fn env_variables() -> impl Iterator<Item = &'static str> {
     CLAIM_ORDER_VARIABLES
@@ -47,27 +51,28 @@ pub struct ClaimOrder {
     pub order_owner: Address,
     pub orderbook: Address,
     pub token: Address,
-    pub vault_id: U256,
+    pub vault_id: B256,
     /// The order's `valid-signer`.
     pub signer: Address,
     pub interpreter: Address,
     pub store: Address,
-    pub expression: Address,
+    /// The order's expression, parsed: Raindex V6 orders carry their bytecode.
+    pub bytecode: Bytes,
     pub input_token: Address,
 }
 
 /// A coupon's signer, its nine context words and the signature over them.
 pub struct SignedCoupon {
     pub signer: Address,
-    pub context: Vec<U256>,
+    pub context: Vec<B256>,
     pub signature: Vec<u8>,
 }
 
 pub type Signing<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
-/// The claim order's `valid-signer`. The orderbook checks its signature of
-/// `digest` with OpenZeppelin's `SignatureChecker`: a key's 65-byte signature, or
-/// what a contract's EIP-1271 `isValidSignature` accepts.
+/// The claim order's `valid-signer`. Raindex checks its signature of `digest`
+/// with OpenZeppelin's `SignatureChecker`: a key's 65-byte signature, or what a
+/// contract's EIP-1271 `isValidSignature` accepts.
 pub trait CouponKey: Send + Sync {
     fn address(&self) -> Address;
     fn sign<'a>(&'a self, digest: &'a B256) -> Signing<'a>;
@@ -109,11 +114,11 @@ impl CouponSigner {
         let order_owner = parsed(&setting, "ORDER_OWNER", "an address", &mut faults);
         let orderbook = parsed(&setting, "ORDERBOOK_ADDRESS", "an address", &mut faults);
         let token = parsed(&setting, "TOKEN_ADDRESS", "an address", &mut faults);
-        let vault_id = parsed(&setting, "VAULT_ID", "a uint256", &mut faults);
+        let vault_id = parsed(&setting, "VAULT_ID", "a 32-byte vault ID", &mut faults);
         let signer = parsed(&setting, "CLAIM_SIGNER", "an address", &mut faults);
         let interpreter = parsed(&setting, "CLAIM_INTERPRETER", "an address", &mut faults);
         let store = parsed(&setting, "CLAIM_STORE", "an address", &mut faults);
-        let expression = parsed(&setting, "CLAIM_EXPRESSION", "an address", &mut faults);
+        let bytecode = parsed(&setting, "CLAIM_BYTECODE", "hex bytecode", &mut faults);
         let input_token = parsed(&setting, "CLAIM_INPUT_TOKEN", "an address", &mut faults);
         let expiry_seconds = match setting("EXPIRY_SECONDS") {
             None => Some(DEFAULT_EXPIRY_SECONDS),
@@ -157,7 +162,7 @@ impl CouponSigner {
             signer,
             interpreter,
             store,
-            expression,
+            bytecode,
             input_token,
         ) {
             (
@@ -169,7 +174,7 @@ impl CouponSigner {
                 Some(signer),
                 Some(interpreter),
                 Some(store),
-                Some(expression),
+                Some(bytecode),
                 Some(input_token),
             ) => Some(ClaimOrder {
                 order_hash,
@@ -180,7 +185,7 @@ impl CouponSigner {
                 signer,
                 interpreter,
                 store,
-                expression,
+                bytecode,
                 input_token,
             }),
             _ => None,
@@ -218,20 +223,15 @@ impl CouponSigner {
                 withdrawal_nonce(withdrawal),
             )
             .await?;
-        let context: Vec<String> = coupon.context.iter().map(U256::to_string).collect();
-        Ok(format!(
-            "{:?},0x{},{}",
-            coupon.signer,
-            hex::encode(coupon.signature),
-            context.join(",")
-        ))
+        Ok(serialize(&coupon))
     }
 
-    /// A coupon for one wei to the signer itself, which never expires, with a nonce
-    /// no withdrawal has. Simulated, it shows whether the claim order accepts this key.
+    /// A coupon for one wei to the signer itself, which expires at the latest
+    /// second a float of exponent 0 can hold, with a nonce no withdrawal has.
+    /// Simulated, it shows whether the claim order accepts this key.
     pub async fn probe_coupon(&self) -> Result<SignedCoupon> {
-        let nonce = U256::from_be_bytes(keccak256(b"bridge-orchestrator startup probe").0);
-        self.sign(self.key.address(), U256::from(1), U256::MAX, nonce)
+        let nonce = keccak256(b"bridge-orchestrator startup probe");
+        self.sign(self.key.address(), U256::from(1), MAX_EXPIRY, nonce)
             .await
     }
 
@@ -240,14 +240,14 @@ impl CouponSigner {
         recipient: Address,
         amount: U256,
         expiry: U256,
-        nonce: U256,
+        nonce: B256,
     ) -> Result<SignedCoupon> {
         let order = &self.order;
-        let context: Vec<U256> = vec![
+        let context: Vec<B256> = vec![
             pad_address(recipient),
-            amount,
-            expiry,
-            U256::from_be_bytes(order.order_hash.0),
+            amount_word(amount)?,
+            B256::from(expiry),
+            order.order_hash,
             pad_address(order.order_owner),
             pad_address(order.orderbook),
             pad_address(order.token),
@@ -263,23 +263,62 @@ impl CouponSigner {
     }
 }
 
+/// The largest coefficient a decimal float holds: int224::MAX.
+const MAX_FLOAT_COEFFICIENT: U256 =
+    U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 33]);
+
+/// The largest integer a float of exponent 0 holds.
+const MAX_EXPIRY: U256 = MAX_FLOAT_COEFFICIENT;
+
+/// The coupon as the website reads it: the signer, the signature, then each
+/// context word as a decimal number, all separated by commas.
+fn serialize(coupon: &SignedCoupon) -> String {
+    let context: Vec<String> = coupon
+        .context
+        .iter()
+        .map(|word| U256::from_be_bytes(word.0).to_string())
+        .collect();
+    format!(
+        "{:?},0x{},{}",
+        coupon.signer,
+        hex::encode(&coupon.signature),
+        context.join(",")
+    )
+}
+
+/// The amount word of a coupon: the decimal float Raindex V6 pays out, with the
+/// wei as its coefficient and -18 as its exponent, so 0xffffffee followed by the
+/// wei in the low 224 bits. Converting back loses nothing. A float's
+/// coefficient is an int224, which no HOT amount comes near.
+pub(crate) fn amount_word(wei: U256) -> Result<B256> {
+    anyhow::ensure!(
+        wei <= MAX_FLOAT_COEFFICIENT,
+        "the amount {wei} wei is too large for a decimal float"
+    );
+    let exponent = (-(HOT_DECIMALS as i32)) as u32;
+    let word = (U256::from(exponent) << 224) | wei;
+    Ok(B256::from(word))
+}
+
 #[cfg(test)]
 impl ClaimOrder {
-    /// The claim order on Sepolia, from TestNet's defaults.
-    pub fn sepolia() -> Self {
-        let value = with_network_defaults(Network::Sepolia, |_| None);
-        let address = |key: &str| value(key).unwrap().parse::<Address>().unwrap();
+    /// The claim order the coupon test vector names: test/TestCouponSignature.t.sol.
+    pub fn vector() -> Self {
         Self {
-            order_hash: value("ORDER_HASH").unwrap().parse().unwrap(),
-            order_owner: address("ORDER_OWNER"),
-            orderbook: address("ORDERBOOK_ADDRESS"),
-            token: address("TOKEN_ADDRESS"),
-            vault_id: value("VAULT_ID").unwrap().parse().unwrap(),
-            signer: address("CLAIM_SIGNER"),
-            interpreter: address("CLAIM_INTERPRETER"),
-            store: address("CLAIM_STORE"),
-            expression: address("CLAIM_EXPRESSION"),
-            input_token: address("CLAIM_INPUT_TOKEN"),
+            order_hash: "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9"
+                .parse()
+                .unwrap(),
+            order_owner: address!("E3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
+            orderbook: address!("37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"),
+            token: address!("6c6EE5e31d828De241282B9606C8e98Ea48526E2"),
+            vault_id: "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
+                .parse()
+                .unwrap(),
+            signer: TEST_SIGNER,
+            interpreter: address!("4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf"),
+            store: address!("1Aa775533E28B1D843e1A589034984E3a62005DC"),
+            bytecode: Bytes::from_static(&[0x00, 0xab]),
+            input_token: address!("1234567890123456789012345678901234567890"),
         }
     }
 }
@@ -287,7 +326,7 @@ impl ClaimOrder {
 #[cfg(test)]
 impl CouponSigner {
     pub fn with_key(key: impl CouponKey + 'static) -> Self {
-        Self::for_order(key, ClaimOrder::sepolia())
+        Self::for_order(key, ClaimOrder::vector())
     }
 
     pub fn for_order(key: impl CouponKey + 'static, order: ClaimOrder) -> Self {
@@ -299,8 +338,10 @@ impl CouponSigner {
     }
 }
 
-fn context_digest(context: &[U256]) -> B256 {
-    let packed: Vec<u8> = context.iter().flat_map(|v| v.to_be_bytes::<32>()).collect();
+/// What the signer signs: the EIP-191 hash of the packed words, as Raindex's
+/// LibContext.build checks it.
+pub(crate) fn context_digest(context: &[B256]) -> B256 {
+    let packed: Vec<u8> = context.iter().flat_map(|word| word.0).collect();
     keccak256(
         [
             b"\x19Ethereum Signed Message:\n32".as_slice(),
@@ -334,16 +375,12 @@ fn parsed<T: FromStr>(
 /// keccak256 of the withdrawal's 39-byte action hash. The claim order refuses a
 /// nonce it has already seen, so every coupon signed for one withdrawal shares a
 /// nonce and at most one of them can be claimed.
-fn withdrawal_nonce(withdrawal: &ActionHash) -> U256 {
-    U256::from_be_bytes(keccak256(withdrawal.get_raw_39()).0)
+fn withdrawal_nonce(withdrawal: &ActionHash) -> B256 {
+    keccak256(withdrawal.get_raw_39())
 }
 
-fn pad_address(addr: Address) -> U256 {
-    U256::from_be_slice(&{
-        let mut padded = [0u8; 32];
-        padded[12..].copy_from_slice(addr.as_slice());
-        padded
-    })
+fn pad_address(addr: Address) -> B256 {
+    addr.into_word()
 }
 
 #[derive(Debug)]
@@ -437,6 +474,29 @@ mod tests {
         );
     }
 
+    /// The amount word of the test vector: 1.5 HOT is the wei with exponent -18.
+    #[test]
+    fn the_amount_word_is_the_wei_with_exponent_minus_18() {
+        let word = amount_word(U256::from(1_500_000_000_000_000_000u128)).unwrap();
+
+        assert_eq!(
+            word,
+            "0xffffffee000000000000000000000000000000000000000014d1120d7b160000"
+                .parse::<B256>()
+                .unwrap()
+        );
+        assert_eq!(
+            amount_word(U256::from(1)).unwrap(),
+            "0xffffffee00000000000000000000000000000000000000000000000000000001"
+                .parse::<B256>()
+                .unwrap()
+        );
+        let too_large = (U256::from(1) << 223) + U256::from(1);
+        assert!(amount_word(too_large).is_err());
+        assert!(amount_word(U256::from(1) << 223).is_err());
+        assert!(amount_word((U256::from(1) << 223) - U256::from(1)).is_ok());
+    }
+
     #[tokio::test]
     async fn withdrawals_signed_in_the_same_second_get_different_nonces() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
@@ -465,8 +525,9 @@ mod tests {
         );
     }
 
-    /// Anvil's third account. test/TestCouponSignature.t.sol signs the same
-    /// context with forge's `vm.sign` and expects this coupon's signature.
+    /// The coupon test vector: anvil's third account signs the vector's words,
+    /// and test/TestCouponSignature.t.sol signs the same with forge's `vm.sign`
+    /// and expects this signature. ui/src/lib/coupon.test.ts reads this coupon.
     #[tokio::test]
     async fn a_key_signs_the_coupon_the_claim_order_checks() {
         let key: PrivateKeySigner =
@@ -478,9 +539,20 @@ mod tests {
         let coupon = coupon(&signer, &ActionHash::from_raw_32(vec![7; 32]), NOW).await;
 
         assert_eq!(coupon, GOLDEN_COUPON);
+        let fields: Vec<&str> = coupon.split(',').collect();
+        let words: Vec<B256> = fields[2..]
+            .iter()
+            .map(|field| B256::from(field.parse::<U256>().unwrap()))
+            .collect();
+        assert_eq!(
+            context_digest(&words),
+            "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
+                .parse::<B256>()
+                .unwrap()
+        );
     }
 
-    const GOLDEN_COUPON: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc,0x5700e22974b0b133fd972f920b36e055e35ab5e83c08db389845451c5532232846d64b38b077e85d8c9e311fd7d22b15af7a78f58b5cb11089b9b07b429bade11c,97433442488726861213578988847752201310395502865,1500000000000000000,1750604800,42941365433660945573526868378572896801276519612010928011051331832534249141753,1300945060633283894583661816534861012306758682838,1442425860134574572653119565674449928420894127102,1340384803335777240622375245841800624658726815561,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631";
+    const GOLDEN_COUPON: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc,0x452449c0ce920f0e30878832f19e55a7ad3c173dfb7074cef53cc1cc1db54cd43df1a26a92e096b59ba413f28cd2c0c1f4aa6276b56ea14eb612c07fcd76eb191b,97433442488726861213578988847752201310395502865,115792088752037155414859468704681636286916632540171964433728779348048145154048,1750604800,42941365433660945573526868378572896801276519612010928011051331832534249141753,1300945060633283894583661816534861012306758682838,319615586448914156470689800627502155326116515104,619044111217614189527117770386815914092009957090,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631";
 
     struct ContractSigner;
 
@@ -501,7 +573,10 @@ mod tests {
 
         let coupon = coupon(&signer, &withdrawal, NOW).await;
         let fields: Vec<&str> = coupon.split(',').collect();
-        let context: Vec<U256> = fields[2..].iter().map(|f| f.parse().unwrap()).collect();
+        let context: Vec<B256> = fields[2..]
+            .iter()
+            .map(|f| B256::from(f.parse::<U256>().unwrap()))
+            .collect();
         let digest = context_digest(&context);
 
         assert_eq!(fields[0], format!("{:?}", ContractSigner.address()));
@@ -514,7 +589,9 @@ mod tests {
         );
     }
 
-    const SEPOLIA_SIGNER_SETTINGS: [(&str, &str); 11] = [
+    /// The vector's claim order as a deploy record names it, with the test
+    /// signer's key.
+    const VECTOR_SIGNER_SETTINGS: [(&str, &str); 11] = [
         (
             "ORDER_HASH",
             "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
@@ -522,11 +599,11 @@ mod tests {
         ("ORDER_OWNER", "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
         (
             "ORDERBOOK_ADDRESS",
-            "0xfca89cD12Ba1346b1ac570ed988AB43b812733fe",
+            "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20",
         ),
         (
             "TOKEN_ADDRESS",
-            "0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749",
+            "0x6c6EE5e31d828De241282B9606C8e98Ea48526E2",
         ),
         (
             "VAULT_ID",
@@ -535,24 +612,19 @@ mod tests {
         ("CLAIM_SIGNER", "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"),
         (
             "CLAIM_INTERPRETER",
-            "0x8853d126bc23a45b9f807739b6ea0b38ef569005",
+            "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
         ),
-        ("CLAIM_STORE", "0x23f77e7bc935503e437166498d7d72f2ea290e1f"),
-        (
-            "CLAIM_EXPRESSION",
-            "0x0a1369aee76570cc7404492d55a5d1468d5a9b4b",
-        ),
+        ("CLAIM_STORE", "0x1Aa775533E28B1D843e1A589034984E3a62005DC"),
+        ("CLAIM_BYTECODE", "0x00ab"),
         (
             "CLAIM_INPUT_TOKEN",
-            "0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028",
+            "0x1234567890123456789012345678901234567890",
         ),
         ("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY),
     ];
 
-    fn sepolia_settings_with(
-        changes: &[(&'static str, Option<&str>)],
-    ) -> impl Fn(&str) -> Option<String> {
-        let mut set: Vec<(&'static str, String)> = SEPOLIA_SIGNER_SETTINGS
+    fn settings_with(changes: &[(&'static str, Option<&str>)]) -> impl Fn(&str) -> Option<String> {
+        let mut set: Vec<(&'static str, String)> = VECTOR_SIGNER_SETTINGS
             .iter()
             .map(|(key, value)| (*key, value.to_string()))
             .collect();
@@ -577,67 +649,71 @@ mod tests {
     }
 
     #[test]
-    fn the_sepolia_settings_parse_into_the_claim_order() {
-        let signer =
-            CouponSigner::from_settings(Network::Sepolia, sepolia_settings_with(&[])).unwrap();
+    fn the_settings_parse_into_the_claim_order() {
+        let signer = CouponSigner::from_settings(Network::BaseSepolia, settings_with(&[])).unwrap();
 
-        assert_eq!(signer.order(), &ClaimOrder::sepolia());
+        assert_eq!(signer.order(), &ClaimOrder::vector());
         assert_eq!(signer.key.address(), TEST_SIGNER);
         assert_eq!(signer.expiry_seconds, DEFAULT_EXPIRY_SECONDS);
     }
 
     const MAINNET_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 
-    /// The Sepolia settings with a key mainnet takes, then `changes`.
+    /// The vector's settings with a key mainnet takes, then `changes`.
     fn mainnet_settings_with(
         changes: &[(&'static str, Option<&str>)],
     ) -> impl Fn(&str) -> Option<String> {
         let mut all = vec![("SIGNER_PRIVATE_KEY", Some(MAINNET_KEY))];
         all.extend_from_slice(changes);
-        sepolia_settings_with(&all)
+        settings_with(&all)
     }
 
     #[test]
     fn mainnet_names_each_unset_signer_variable() {
-        for (key, _) in SEPOLIA_SIGNER_SETTINGS {
+        for (key, _) in VECTOR_SIGNER_SETTINGS {
             let message = refusal(Network::Mainnet, mainnet_settings_with(&[(key, None)]));
             assert_eq!(message, format!("{key} is required"));
         }
     }
 
+    /// TestNet's values are the ones the same on every chain: the orderbook, the
+    /// interpreter, the store, the vault ID and the test signer. Its mock HOT,
+    /// vault and claim order are chain-specific and have no defaults, so a
+    /// base-sepolia run names those as mainnet does.
     #[test]
-    fn sepolia_takes_testnet_values_for_all_but_the_key() {
+    fn base_sepolia_takes_testnet_values_for_what_is_the_same_on_every_chain() {
         let key = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY)]);
-        let signer = CouponSigner::from_settings(Network::Sepolia, key).unwrap();
 
-        assert_eq!(signer.order(), &ClaimOrder::sepolia());
         assert_eq!(
-            refusal(Network::Sepolia, test_settings(&[])),
-            "SIGNER_PRIVATE_KEY is required"
+            refusal(Network::BaseSepolia, key),
+            "ORDER_HASH is required; ORDER_OWNER is required; TOKEN_ADDRESS is required; CLAIM_BYTECODE is required; CLAIM_INPUT_TOKEN is required"
         );
-        let empty = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY), ("ORDER_HASH", "")]);
         assert_eq!(
-            CouponSigner::from_settings(Network::Sepolia, empty)
-                .unwrap()
-                .order(),
-            &ClaimOrder::sepolia()
+            refusal(Network::BaseSepolia, test_settings(&[])),
+            "ORDER_HASH is required; ORDER_OWNER is required; TOKEN_ADDRESS is required; CLAIM_BYTECODE is required; CLAIM_INPUT_TOKEN is required; SIGNER_PRIVATE_KEY is required"
         );
+        let given = settings_with(&[
+            ("ORDERBOOK_ADDRESS", None),
+            ("VAULT_ID", None),
+            ("CLAIM_SIGNER", None),
+            ("CLAIM_INTERPRETER", None),
+            ("CLAIM_STORE", None),
+        ]);
+        let signer = CouponSigner::from_settings(Network::BaseSepolia, given).unwrap();
+        assert_eq!(signer.order(), &ClaimOrder::vector());
     }
 
     #[test]
     fn each_malformed_signer_variable_is_named() {
-        for (key, _) in SEPOLIA_SIGNER_SETTINGS {
-            let message = refusal(
-                Network::Sepolia,
-                sepolia_settings_with(&[(key, Some("0xZZ"))]),
-            );
+        for (key, _) in VECTOR_SIGNER_SETTINGS {
+            let message = refusal(Network::BaseSepolia, settings_with(&[(key, Some("0xZZ"))]));
             assert!(message.starts_with(key), "{message}");
             assert!(!message.contains("is required"), "{message}");
         }
         for value in ["a week", "0", "31536001"] {
             let message = refusal(
-                Network::Sepolia,
-                sepolia_settings_with(&[("EXPIRY_SECONDS", Some(value))]),
+                Network::BaseSepolia,
+                settings_with(&[("EXPIRY_SECONDS", Some(value))]),
             );
             assert_eq!(
                 message,
@@ -667,25 +743,25 @@ mod tests {
     fn a_malformed_private_key_is_not_repeated() {
         let almost_a_key = &TEST_SIGNER_KEY[..TEST_SIGNER_KEY.len() - 2];
         let message = refusal(
-            Network::Sepolia,
-            sepolia_settings_with(&[("SIGNER_PRIVATE_KEY", Some(almost_a_key))]),
+            Network::BaseSepolia,
+            settings_with(&[("SIGNER_PRIVATE_KEY", Some(almost_a_key))]),
         );
 
         assert_eq!(message, "SIGNER_PRIVATE_KEY is not a secp256k1 private key");
     }
 
     #[test]
-    fn mainnet_refuses_the_test_signer_and_sepolia_takes_it() {
-        let message = refusal(Network::Mainnet, sepolia_settings_with(&[]));
+    fn mainnet_refuses_the_test_signer_and_base_sepolia_takes_it() {
+        let message = refusal(Network::Mainnet, settings_with(&[]));
         assert!(
             message.contains("test signer 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"),
             "{message}"
         );
-        assert!(CouponSigner::from_settings(Network::Sepolia, sepolia_settings_with(&[])).is_ok());
+        assert!(CouponSigner::from_settings(Network::BaseSepolia, settings_with(&[])).is_ok());
 
         let mainnet = CouponSigner::from_settings(
             Network::Mainnet,
-            sepolia_settings_with(&[
+            settings_with(&[
                 ("SIGNER_PRIVATE_KEY", Some(MAINNET_KEY)),
                 (
                     "CLAIM_SIGNER",
@@ -697,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_coupon_pays_the_key_one_wei_and_never_expires() {
+    fn the_probe_coupon_pays_the_key_one_wei_and_expires_last() {
         let key: PrivateKeySigner = TEST_SIGNER_KEY.parse().unwrap();
         let signer = CouponSigner::with_key(key);
 
@@ -708,8 +784,14 @@ mod tests {
 
         assert_eq!(probe.signer, TEST_SIGNER);
         assert_eq!(probe.context[0], pad_address(TEST_SIGNER));
-        assert_eq!(probe.context[1], U256::from(1));
-        assert_eq!(probe.context[2], U256::MAX);
+        assert_eq!(probe.context[1], amount_word(U256::from(1)).unwrap());
+        // int224::MAX with exponent 0: the latest expiry a float holds as an integer.
+        assert_eq!(
+            probe.context[2],
+            "0x000000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                .parse::<B256>()
+                .unwrap()
+        );
         let recovered = alloy::primitives::PrimitiveSignature::try_from(probe.signature.as_slice())
             .unwrap()
             .recover_address_from_prehash(&context_digest(&probe.context))
@@ -720,8 +802,8 @@ mod tests {
     #[test]
     fn expiry_seconds_is_read_when_set() {
         let signer = CouponSigner::from_settings(
-            Network::Sepolia,
-            sepolia_settings_with(&[("EXPIRY_SECONDS", Some("3600"))]),
+            Network::BaseSepolia,
+            settings_with(&[("EXPIRY_SECONDS", Some("3600"))]),
         )
         .unwrap();
 

@@ -2,15 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { generatePrivateKey } from 'viem/accounts'
 
 const { RPC_HOST, RPC_KEY, RPC_URL } = vi.hoisted(() => {
-	const RPC_HOST = 'sepolia.rpc-provider.test'
+	const RPC_HOST = 'base-sepolia.rpc-provider.test'
 	const RPC_KEY = 'secret-api-key-1234'
 	return { RPC_HOST, RPC_KEY, RPC_URL: `https://${RPC_HOST}/v3/${RPC_KEY}` }
 })
 
 vi.mock('$env/dynamic/private', () => ({
-	env: { FAUCET_PRIVATE_KEY: generatePrivateKey(), SEPOLIA_RPC_URL: RPC_URL }
+	env: { FAUCET_PRIVATE_KEY: generatePrivateKey(), BASE_SEPOLIA_RPC_URL: RPC_URL }
 }))
-vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).SEPOLIA_BUILD)
+vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).BASE_SEPOLIA_BUILD)
 
 import { GET, POST } from './+server'
 

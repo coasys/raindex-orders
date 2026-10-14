@@ -21,7 +21,7 @@ function wallet(chainId: number, refuseSwitch?: number) {
 	return asked
 }
 
-async function connectedOn(network: 'sepolia' | 'mainnet', walletChain: number) {
+async function connectedOn(network: 'base-sepolia' | 'mainnet', walletChain: number) {
 	const asked = wallet(walletChain)
 	const ethereum = await asBuild(BUILDS[network], () => import('./ethereum'))
 	ethereum.ethereumStore.set(connected(walletChain))
@@ -40,7 +40,7 @@ afterEach(() => {
 	vi.restoreAllMocks()
 })
 
-describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
+describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build', network => {
 	it('sends nothing while the wallet is on another chain', async () => {
 		const { ethereum, asked } = await connectedOn(network, OTHER_CHAIN[network])
 
@@ -123,20 +123,20 @@ describe('a failed read of the wallet chain', () => {
 })
 
 describe('a wallet without the chain', () => {
-	it('is asked to add Sepolia', async () => {
+	it('is asked to add Base Sepolia', async () => {
 		const asked = wallet(1, 4902)
-		const ethereum = await asBuild(BUILDS.sepolia, () => import('./ethereum'))
+		const ethereum = await asBuild(BUILDS['base-sepolia'], () => import('./ethereum'))
 
 		expect(await ethereum.switchNetwork()).toBe(true)
 		expect(asked[1]).toEqual({
 			method: 'wallet_addEthereumChain',
 			params: [
 				{
-					chainId: '0xaa36a7',
-					chainName: 'Sepolia Testnet',
+					chainId: '0x14a34',
+					chainName: 'Base Sepolia',
 					nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
-					rpcUrls: ['https://rpc.sepolia.org'],
-					blockExplorerUrls: ['https://sepolia.etherscan.io']
+					rpcUrls: ['https://sepolia.base.org'],
+					blockExplorerUrls: ['https://sepolia.basescan.org']
 				}
 			]
 		})
@@ -144,7 +144,7 @@ describe('a wallet without the chain', () => {
 
 	it('is not asked to add Ethereum', async () => {
 		vi.spyOn(console, 'error').mockImplementation(() => {})
-		const asked = wallet(11155111, 4902)
+		const asked = wallet(84532, 4902)
 		const ethereum = await asBuild(BUILDS.mainnet, () => import('./ethereum'))
 
 		expect(await ethereum.switchNetwork()).toBe(false)

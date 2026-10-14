@@ -2,29 +2,31 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { TEST_SIGNER, bindings, compose } from './compose-rainlang.mjs'
+import { RAINDEX_SUBPARSER, TEST_SIGNER, bindings, compose } from './compose-rainlang.mjs'
 
+/** Rain's deterministic address, the same on both networks. */
 const SUBPARSER = {
-	sepolia: '0xe6A589716d5a72276C08E0e08bc941a28005e55A',
-	mainnet: '0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326'
+	'base-sepolia': RAINDEX_SUBPARSER,
+	mainnet: RAINDEX_SUBPARSER
 }
 const SIGNER = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
 const COMPOSER = fileURLToPath(new URL('compose-rainlang.mjs', import.meta.url))
 
-for (const network of ['sepolia', 'mainnet']) {
+for (const network of ['base-sepolia', 'mainnet']) {
 	test(`${network}: binds the subparser and signer it is given`, async () => {
 		const rainlang = await compose({ network, subparser: SUBPARSER[network], signer: SIGNER })
 
 		assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER[network]}`))
-		assert.match(rainlang, new RegExp(`equal-to\\(signer<0>\\(\\) ${SIGNER}\\)`))
+		assert.match(rainlang, new RegExp(`binary-equal-to\\(signer<0>\\(\\) ${SIGNER}\\)`))
+		assert.match(rainlang, /io-ratio: 1e-30;/)
 		assert.doesNotMatch(rainlang, new RegExp(TEST_SIGNER, 'i'))
 	})
 }
 
-test('sepolia takes the test signer', async () => {
+test('base-sepolia takes the test signer', async () => {
 	const rainlang = await compose({
-		network: 'sepolia',
-		subparser: SUBPARSER.sepolia,
+		network: 'base-sepolia',
+		subparser: SUBPARSER['base-sepolia'],
 		signer: TEST_SIGNER
 	})
 
@@ -34,7 +36,7 @@ test('sepolia takes the test signer', async () => {
 test('composes for TestNet when given nothing', async () => {
 	const rainlang = await compose({})
 
-	assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER.sepolia}`))
+	assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER['base-sepolia']}`))
 	assert.match(rainlang, new RegExp(TEST_SIGNER))
 	assert.equal(execFileSync('node', [COMPOSER], { encoding: 'utf8' }).trim(), rainlang.trim())
 })
@@ -60,12 +62,16 @@ test('names every missing or malformed input', () => {
 		() => bindings({ network: 'goerli', subparser: '0x1234', signer: undefined }),
 		{
 			message:
-				'--network must be sepolia or mainnet, not goerli; --subparser must be a nonzero address, not 0x1234; --signer must be a nonzero address, not unset'
+				'--network must be base-sepolia or mainnet, not goerli; --subparser must be a nonzero address, not 0x1234; --signer must be a nonzero address, not unset'
 		}
 	)
 	assert.throws(
 		() =>
-			bindings({ network: 'sepolia', subparser: SUBPARSER.sepolia, signer: `0x${'0'.repeat(40)}` }),
+			bindings({
+				network: 'base-sepolia',
+				subparser: SUBPARSER['base-sepolia'],
+				signer: `0x${'0'.repeat(40)}`
+			}),
 		/--signer must be a nonzero address/
 	)
 })

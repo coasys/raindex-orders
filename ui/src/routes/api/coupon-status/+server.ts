@@ -61,8 +61,8 @@ const HEADERS = {
 const orderbook = bridge.orderbookAddress
 const orderHash = BigInt(CLAIM_ORDER.orderHash)
 
-// OrderBook evaluates the claim order under the namespace
-// LibNamespace.qualifyNamespace(order owner, orderbook) = keccak256(owner, orderbook),
+// Raindex evaluates the claim order under the namespace
+// LibNamespace.qualifyNamespace(order owner, raindex) = keccak256(owner, raindex),
 // and src/holo-claim.rain marks a nonce used there at hash(order-hash() nonce).
 const namespace = BigInt(
 	keccak256(
@@ -70,10 +70,11 @@ const namespace = BigInt(
 	)
 )
 const nonceKey = (nonce: bigint) =>
-	BigInt(keccak256(encodePacked(['uint256', 'uint256'], [orderHash, nonce])))
+	keccak256(encodePacked(['uint256', 'uint256'], [orderHash, nonce]))
 
+// Rainlang's IInterpreterStoreV3: keys and values are bytes32 words.
 const readAbi = parseAbi([
-	'function get(uint256 namespace, uint256 key) view returns (uint256)',
+	'function get(uint256 namespace, bytes32 key) view returns (bytes32)',
 	'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes32)',
 	'function getChainId() view returns (uint256)',
 	'function getBlockNumber() view returns (uint256)',
@@ -363,6 +364,7 @@ async function readChain(
 		if (answer.status === 'failure') throw answer.error
 		return answer.result as bigint
 	}
+	const flag = (i: number) => hexToBigInt(read(i) as unknown as Hex)
 	const chainId = read(0)
 	if (chainId !== BigInt(bridge.chain.id)) {
 		throw new Error(`RPC answered for chain ${chainId}, expected ${bridge.chain.id}`)
@@ -384,7 +386,7 @@ async function readChain(
 	return {
 		block: read(1),
 		timestamp: read(2),
-		flags: new Map(nonces.map((nonce, i) => [nonce, read(3 + i)])),
+		flags: new Map(nonces.map((nonce, i) => [nonce, flag(3 + i)])),
 		contractSigned: new Set(
 			unverified.filter((_, i) => {
 				const answer = checks[i]

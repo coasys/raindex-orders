@@ -1,26 +1,37 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { encodePacked, keccak256, maxUint256, type Hex } from 'viem'
+import { encodeAbiParameters, encodePacked, keccak256, maxUint256, type Hex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
-import { SEPOLIA_REDEEMED } from './fixtures'
+import { TESTNET_COUPONS } from './fixtures'
 import { fakeCache, fakeRpc as fakeChainRpc } from './fakeRpc'
 
 const env = vi.hoisted(() => ({
-	SEPOLIA_RPC_URL: 'https://rpc.test/secret-key' as string | undefined
+	BASE_SEPOLIA_RPC_URL: 'https://rpc.test/secret-key' as string | undefined
 }))
 vi.mock('$env/dynamic/private', () => ({ env }))
-vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).SEPOLIA_BUILD)
+vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).BASE_SEPOLIA_BUILD)
 
 import { OPTIONS, POST } from './+server'
 
-const STORE = '0x23f77e7bc935503e437166498d7d72f2ea290e1f'
+// The TestNet build's claim order: the Rainlang store, the namespace Raindex evaluates
+// the order under (keccak256 of the order owner and Raindex, as LibNamespace qualifies
+// it), and the store key the order marks a nonce at (hash(order-hash() nonce)).
+const STORE = '0x1aa775533e28b1d843e1a589034984e3a62005dc'
+const ORDER_HASH = 0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0bn
+const CLAIM_NAMESPACE = BigInt(
+	keccak256(
+		encodeAbiParameters(
+			[{ type: 'address' }, { type: 'address' }],
+			['0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6', '0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20']
+		)
+	)
+)
+const storeKey = (nonce: bigint) =>
+	BigInt(keccak256(encodePacked(['uint256', 'uint256'], [ORDER_HASH, nonce])))
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 
-// Read on Sepolia: the claim order's store namespace, and the store keys the nonces of
-// the first two fixtures were marked at when they were redeemed.
-const CLAIM_NAMESPACE = 0x2eff224ba29f37818f323107f4b089a0f598bb8cc44e3bf2738bbe591b2df7d1n
-const [A, B, C] = SEPOLIA_REDEEMED.map(({ coupon }) => coupon)
-const KEY_A = 0x5b791f671a06745c3b5c4c4bc3446ff7dfe601ba6e695a0d0b1f4af55fe50a3an
-const KEY_B = 0x42fd2eddc5420575975b7b001ea50a43a796c99cb93410a97ab467bf37e6d433n
+const [A, B, C] = TESTNET_COUPONS
+const KEY_A = storeKey(1775867941n)
+const KEY_B = storeKey(1775867943n)
 const EXPIRY_A = 1_776_472_741
 const EXPIRY_B = 1_776_472_743
 const EXPIRY_C = 1_776_472_922
@@ -61,21 +72,24 @@ async function resigned(coupon: string, key: Hex, signer = fieldsOf(coupon)[0]) 
 
 type Chain = { chainId: bigint; timestamp: number; flags: Map<bigint, bigint> }
 
-/** A Sepolia JSON-RPC endpoint answering Multicall3 aggregate3 calls from `chain`. */
+/** A Base Sepolia JSON-RPC endpoint answering Multicall3 aggregate3 calls from `chain`. */
 const fakeRpc = (chain: Chain) =>
 	fakeChainRpc({ ...chain, block: BLOCK, store: STORE, namespace: CLAIM_NAMESPACE })
 
-/** Sepolia with A and B redeemed, at a safe block timestamped `timestamp`. */
-const sepolia = (timestamp = BEFORE_ALL): Chain => ({
-	chainId: 11155111n,
+/** Base Sepolia with A and B redeemed, at a safe block timestamped `timestamp`. */
+const baseSepolia = (timestamp = BEFORE_ALL): Chain => ({
+	chainId: 84532n,
 	timestamp,
 	flags: new Map([
 		[KEY_A, 1n],
 		[KEY_B, 1n]
 	])
 })
-/** Sepolia with nothing redeemed. */
-const unclaimed = (timestamp = BEFORE_ALL): Chain => ({ ...sepolia(timestamp), flags: new Map() })
+/** Base Sepolia with nothing redeemed. */
+const unclaimed = (timestamp = BEFORE_ALL): Chain => ({
+	...baseSepolia(timestamp),
+	flags: new Map()
+})
 
 let cache: ReturnType<typeof fakeCache>
 
@@ -135,7 +149,7 @@ function expectCorsHeaders(response: Response) {
 const invalid = { status: 'invalid', nonce: null, expiry: null }
 
 beforeEach(() => {
-	env.SEPOLIA_RPC_URL = 'https://rpc.test/secret-key'
+	env.BASE_SEPOLIA_RPC_URL = 'https://rpc.test/secret-key'
 	cache = fakeCache()
 	vi.useFakeTimers({ toFake: ['Date'] })
 	setClock(BEFORE_ALL)
@@ -151,7 +165,7 @@ afterEach(() => {
 describe('POST /api/coupon-status', () => {
 	it('answers every coupon, in request order, from one read of the safe block', async () => {
 		// A redeemed, B not; both past expiry at this block, C not.
-		const chain = sepolia(EXPIRY_B + 1)
+		const chain = baseSepolia(EXPIRY_B + 1)
 		chain.flags.delete(KEY_B)
 		const rpc = fakeRpc(chain)
 
@@ -160,7 +174,7 @@ describe('POST /api/coupon-status', () => {
 		expect(response.status).toBe(200)
 		expectCorsHeaders(response)
 		expect(body).toEqual({
-			chainId: 11155111,
+			chainId: 84532,
 			block: '10883600',
 			results: [
 				{ status: 'unredeemed', nonce: '1775868122', expiry: EXPIRY_C },
@@ -184,9 +198,9 @@ describe('POST /api/coupon-status', () => {
 		expect(body.results.map((r: { status: string }) => r.status)).toEqual(['expired', 'unredeemed'])
 	})
 
-	it('reads 20 Sepolia coupons, the most a request takes, in one eth_call', async () => {
+	it('reads 20 TestNet coupons, the most a request takes, in one eth_call', async () => {
 		const rpc = fakeRpc(unclaimed())
-		const coupons = SEPOLIA_REDEEMED.map(({ coupon }) => coupon)
+		const coupons = TESTNET_COUPONS
 		expect(coupons).toHaveLength(20)
 
 		const { response, body } = await post({ coupons })
@@ -199,7 +213,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('reads a nonce once for coupons that share it', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { body } = await post({ coupons: [A, padded(A, A.length + 1)] })
 
@@ -208,7 +222,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('reads a coupon as long as one can be, every context field 78 digits', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		const longest = padded(A, 886)
 		expect(
 			fieldsOf(longest)
@@ -223,12 +237,12 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('makes no RPC call, and answers block null, when no coupon is valid', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { response, body } = await post({ coupons: ['not a coupon', withContext(A, 3, '1')] })
 
 		expect(response.status).toBe(200)
-		expect(body).toEqual({ chainId: 11155111, block: null, results: [invalid, invalid] })
+		expect(body).toEqual({ chainId: 84532, block: null, results: [invalid, invalid] })
 		expect(rpc.fetch).not.toHaveBeenCalled()
 	})
 
@@ -257,17 +271,17 @@ describe('POST /api/coupon-status', () => {
 		['a signature of the wrong length', withFields(A, { 1: signature.slice(0, -2) })],
 		['a signer that is not an address', withFields(A, { 0: '0x1234' })]
 	])('answers invalid for %s, and makes no RPC call', async (_, forged) => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { response, body } = await post({ coupons: [forged] })
 
 		expect(response.status).toBe(200)
-		expect(body).toEqual({ chainId: 11155111, block: null, results: [invalid] })
+		expect(body).toEqual({ chainId: 84532, block: null, results: [invalid] })
 		expect(rpc.fetch).not.toHaveBeenCalled()
 	})
 
 	it('answers invalid for a coupon signed by another key, whichever signer it names', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		const key = generatePrivateKey()
 		const other = privateKeyToAccount(key).address
 
@@ -296,7 +310,7 @@ describe('POST /api/coupon-status', () => {
 		['another order owner', withContext(A, 4, '1')],
 		['another orderbook', withContext(A, 5, '1')]
 	])('answers invalid for %s, and makes no RPC call', async (_, malformed) => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { response, body } = await post({ coupons: [malformed] })
 
@@ -315,7 +329,7 @@ describe('POST /api/coupon-status', () => {
 		['21 coupons', { coupons: Array(21).fill(A) }],
 		['a coupon that is not a string', { coupons: [A, 1] }]
 	])('answers 400 for %s', async (_, body) => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { response, body: answer } = await post(body)
 
@@ -326,7 +340,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('answers 400 to a body over 64 KB by its Content-Length, unread', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		const request = new Request('http://localhost/api/coupon-status', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', 'Content-Length': '65537' },
@@ -343,7 +357,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('answers 400 to a body that states no length once it passes 64 KB', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 
 		const { response, body } = await send(streamed(bodyOf(64 * 1024 + 1)))
 
@@ -353,7 +367,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('reads a body of exactly 64 KB, with or without a stated length', async () => {
-		fakeRpc(sepolia())
+		fakeRpc(baseSepolia())
 
 		const stated = await post(bodyOf(64 * 1024))
 		const unstated = await send(streamed(bodyOf(64 * 1024)))
@@ -436,7 +450,7 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('answers 502, and caches nothing, when the RPC is on another chain', async () => {
-		fakeRpc({ ...sepolia(), chainId: 1n })
+		fakeRpc({ ...baseSepolia(), chainId: 1n })
 
 		const { response } = await post({ coupons: [A] })
 
@@ -445,8 +459,8 @@ describe('POST /api/coupon-status', () => {
 	})
 
 	it('answers 502 when a coupon needs a read and no RPC is configured', async () => {
-		const rpc = fakeRpc(sepolia())
-		env.SEPOLIA_RPC_URL = undefined
+		const rpc = fakeRpc(baseSepolia())
+		env.BASE_SEPOLIA_RPC_URL = undefined
 
 		const { response, body } = await post({ coupons: [A] })
 
@@ -458,14 +472,14 @@ describe('POST /api/coupon-status', () => {
 
 describe('POST /api/coupon-status cache', () => {
 	it('answers a redeemed coupon from the cache from then on, with no RPC call', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		await post({ coupons: [A] })
 
 		setClock(BEFORE_ALL + 30 * 24 * 60 * 60)
 		const { body } = await post({ coupons: [A] })
 
 		expect(body).toEqual({
-			chainId: 11155111,
+			chainId: 84532,
 			block: null,
 			results: [{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A }]
 		})
@@ -515,7 +529,7 @@ describe('POST /api/coupon-status cache', () => {
 	})
 
 	it('reads, in one call, only the coupons the cache cannot answer', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		await post({ coupons: [A] })
 		rpc.storeReads.length = 0
 
@@ -535,7 +549,7 @@ describe('POST /api/coupon-status cache', () => {
 	})
 
 	it('answers another spelling of a cached coupon from the cache, with no RPC call', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		await post({ coupons: [A] })
 		const [signer, signature] = fieldsOf(A)
 		const recased = withFields(A, {
@@ -548,7 +562,7 @@ describe('POST /api/coupon-status cache', () => {
 		const { body } = await post({ coupons: [recased, zeroPadded] })
 
 		expect(body).toEqual({
-			chainId: 11155111,
+			chainId: 84532,
 			block: null,
 			results: [
 				{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A },
@@ -559,7 +573,7 @@ describe('POST /api/coupon-status cache', () => {
 	})
 
 	it('answers invalid for a cached coupon carrying another signature, with no RPC call', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		await post({ coupons: [A] })
 		const signature = fieldsOf(A)[1]
 		const forged = withFields(A, { 1: `${signature.slice(0, 64)}00${signature.slice(66)}` })
@@ -571,7 +585,7 @@ describe('POST /api/coupon-status cache', () => {
 	})
 
 	it('answers with what it read when the cache cannot store it', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		cache.store.put.mockRejectedValue(new Error('cache unavailable'))
 
 		const { response, body } = await post({ coupons: [A, C] })
@@ -586,7 +600,7 @@ describe('POST /api/coupon-status cache', () => {
 	})
 
 	it('reads the chain when the cache cannot be read', async () => {
-		const rpc = fakeRpc(sepolia())
+		const rpc = fakeRpc(baseSepolia())
 		await post({ coupons: [A] })
 		cache.store.match.mockRejectedValue(new Error('cache unavailable'))
 

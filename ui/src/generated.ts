@@ -1,1194 +1,2098 @@
-// Contract ABIs for HOT Bridge
-// Generated from Raindex orderbook contracts
+// Contract ABIs for HOT Bridge.
+//
+// orderbookAbi is Raindex V6: `forge inspect IRaindexV6 abi --json` on
+// raindex-interface 0.1.7 (the release src/Constants.sol names), plus the
+// errors RaindexV6.sol and Rainlang's LibContext.sol declare outside the
+// interface, which a claim can revert with: InvalidSignature, MinimumIO,
+// TokenMismatch, NotOrderOwner and the rest. Every amount is a decimal float,
+// a bytes32 (ui/src/lib/coupon.ts). Regenerate it from the repo root with
+//   forge inspect IRaindexV6 abi --json
+// and keep those errors.
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Orderbook
+// Orderbook (RaindexV6)
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/**
- * [__View Contract on Sepolia Etherscan__](https://sepolia.etherscan.io/address/0xfca89cD12Ba1346b1ac570ed988AB43b812733fe)
- */
 export const orderbookAbi = [
-  {
-    type: 'error',
-    inputs: [{ name: 'result', internalType: 'bytes32', type: 'bytes32' }],
-    name: 'FlashLenderCallbackFailed',
-  },
-  {
-    type: 'error',
-    inputs: [{ name: 'i', internalType: 'uint256', type: 'uint256' }],
-    name: 'InvalidSignature',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'minimumInput', internalType: 'uint256', type: 'uint256' },
-      { name: 'input', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'MinimumInput',
-  },
-  { type: 'error', inputs: [], name: 'NoOrders' },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'sender', internalType: 'address', type: 'address' },
-      { name: 'owner', internalType: 'address', type: 'address' },
-    ],
-    name: 'NotOrderOwner',
-  },
-  {
-    type: 'error',
-    inputs: [{ name: 'unmeta', internalType: 'bytes', type: 'bytes' }],
-    name: 'NotRainMetaV1',
-  },
-  { type: 'error', inputs: [], name: 'OrderNoHandleIO' },
-  { type: 'error', inputs: [], name: 'OrderNoInputs' },
-  { type: 'error', inputs: [], name: 'OrderNoOutputs' },
-  { type: 'error', inputs: [], name: 'OrderNoSources' },
-  {
-    type: 'error',
-    inputs: [{ name: 'owner', internalType: 'address', type: 'address' }],
-    name: 'SameOwner',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'bytecode', internalType: 'bytes', type: 'bytes' },
-      { name: 'sourceIndex', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'SourceIndexOutOfBounds',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'aliceTokenDecimals', internalType: 'uint8', type: 'uint8' },
-      { name: 'bobTokenDecimals', internalType: 'uint8', type: 'uint8' },
-    ],
-    name: 'TokenDecimalsMismatch',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'aliceToken', internalType: 'address', type: 'address' },
-      { name: 'bobToken', internalType: 'address', type: 'address' },
-    ],
-    name: 'TokenMismatch',
-  },
-  {
-    type: 'error',
-    inputs: [{ name: 'inputs', internalType: 'uint256', type: 'uint256' }],
-    name: 'UnsupportedCalculateInputs',
-  },
-  {
-    type: 'error',
-    inputs: [{ name: 'outputs', internalType: 'uint256', type: 'uint256' }],
-    name: 'UnsupportedCalculateOutputs',
-  },
-  {
-    type: 'error',
-    inputs: [{ name: 'inputs', internalType: 'uint256', type: 'uint256' }],
-    name: 'UnsupportedHandleInputs',
-  },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'sender', internalType: 'address', type: 'address' },
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'ZeroDepositAmount',
-  },
-  { type: 'error', inputs: [], name: 'ZeroMaximumInput' },
-  {
-    type: 'error',
-    inputs: [
-      { name: 'sender', internalType: 'address', type: 'address' },
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'ZeroWithdrawTargetAmount',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'expressionDeployer',
-        internalType: 'contract IExpressionDeployerV3',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'order',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-        indexed: false,
-      },
-      {
-        name: 'orderHash',
-        internalType: 'bytes32',
-        type: 'bytes32',
-        indexed: false,
-      },
-    ],
-    name: 'AddOrder',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'clearStateChange',
-        internalType: 'struct ClearStateChange',
-        type: 'tuple',
-        components: [
-          { name: 'aliceOutput', internalType: 'uint256', type: 'uint256' },
-          { name: 'bobOutput', internalType: 'uint256', type: 'uint256' },
-          { name: 'aliceInput', internalType: 'uint256', type: 'uint256' },
-          { name: 'bobInput', internalType: 'uint256', type: 'uint256' },
-        ],
-        indexed: false,
-      },
-    ],
-    name: 'AfterClear',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'alice',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-        indexed: false,
-      },
-      {
-        name: 'bob',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-        indexed: false,
-      },
-      {
-        name: 'clearConfig',
-        internalType: 'struct ClearConfig',
-        type: 'tuple',
-        components: [
-          {
-            name: 'aliceInputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'aliceOutputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          { name: 'bobInputIOIndex', internalType: 'uint256', type: 'uint256' },
-          {
-            name: 'bobOutputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'aliceBountyVaultId',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'bobBountyVaultId',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-        ],
-        indexed: false,
-      },
-    ],
-    name: 'Clear',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'context',
-        internalType: 'uint256[][]',
-        type: 'uint256[][]',
-        indexed: false,
-      },
-    ],
-    name: 'Context',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'token',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'vaultId',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-      {
-        name: 'amount',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-    ],
-    name: 'Deposit',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'subject',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-      { name: 'meta', internalType: 'bytes', type: 'bytes', indexed: false },
-    ],
-    name: 'MetaV1',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'owner',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'orderHash',
-        internalType: 'bytes32',
-        type: 'bytes32',
-        indexed: false,
-      },
-    ],
-    name: 'OrderExceedsMaxRatio',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'owner',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'orderHash',
-        internalType: 'bytes32',
-        type: 'bytes32',
-        indexed: false,
-      },
-    ],
-    name: 'OrderNotFound',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'owner',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'orderHash',
-        internalType: 'bytes32',
-        type: 'bytes32',
-        indexed: false,
-      },
-    ],
-    name: 'OrderZeroAmount',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'order',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-        indexed: false,
-      },
-      {
-        name: 'orderHash',
-        internalType: 'bytes32',
-        type: 'bytes32',
-        indexed: false,
-      },
-    ],
-    name: 'RemoveOrder',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'config',
-        internalType: 'struct TakeOrderConfigV2',
-        type: 'tuple',
-        components: [
-          {
-            name: 'order',
-            internalType: 'struct OrderV2',
-            type: 'tuple',
-            components: [
-              { name: 'owner', internalType: 'address', type: 'address' },
-              { name: 'handleIO', internalType: 'bool', type: 'bool' },
-              {
-                name: 'evaluable',
-                internalType: 'struct EvaluableV2',
-                type: 'tuple',
-                components: [
-                  {
-                    name: 'interpreter',
-                    internalType: 'contract IInterpreterV2',
-                    type: 'address',
-                  },
-                  {
-                    name: 'store',
-                    internalType: 'contract IInterpreterStoreV2',
-                    type: 'address',
-                  },
-                  {
-                    name: 'expression',
-                    internalType: 'address',
-                    type: 'address',
-                  },
-                ],
-              },
-              {
-                name: 'validInputs',
-                internalType: 'struct IO[]',
-                type: 'tuple[]',
-                components: [
-                  { name: 'token', internalType: 'address', type: 'address' },
-                  { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-                  { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-                ],
-              },
-              {
-                name: 'validOutputs',
-                internalType: 'struct IO[]',
-                type: 'tuple[]',
-                components: [
-                  { name: 'token', internalType: 'address', type: 'address' },
-                  { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-                  { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-                ],
-              },
-            ],
-          },
-          { name: 'inputIOIndex', internalType: 'uint256', type: 'uint256' },
-          { name: 'outputIOIndex', internalType: 'uint256', type: 'uint256' },
-          {
-            name: 'signedContext',
-            internalType: 'struct SignedContextV1[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'signer', internalType: 'address', type: 'address' },
-              { name: 'context', internalType: 'uint256[]', type: 'uint256[]' },
-              { name: 'signature', internalType: 'bytes', type: 'bytes' },
-            ],
-          },
-        ],
-        indexed: false,
-      },
-      {
-        name: 'input',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-      {
-        name: 'output',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-    ],
-    name: 'TakeOrder',
-  },
-  {
-    type: 'event',
-    anonymous: false,
-    inputs: [
-      {
-        name: 'sender',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'token',
-        internalType: 'address',
-        type: 'address',
-        indexed: false,
-      },
-      {
-        name: 'vaultId',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-      {
-        name: 'targetAmount',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-      {
-        name: 'amount',
-        internalType: 'uint256',
-        type: 'uint256',
-        indexed: false,
-      },
-    ],
-    name: 'Withdraw',
-  },
-  {
-    type: 'function',
-    inputs: [
-      {
-        name: 'config',
-        internalType: 'struct OrderConfigV2',
-        type: 'tuple',
-        components: [
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'evaluableConfig',
-            internalType: 'struct EvaluableConfigV3',
-            type: 'tuple',
-            components: [
-              {
-                name: 'deployer',
-                internalType: 'contract IExpressionDeployerV3',
-                type: 'address',
-              },
-              { name: 'bytecode', internalType: 'bytes', type: 'bytes' },
-              {
-                name: 'constants',
-                internalType: 'uint256[]',
-                type: 'uint256[]',
-              },
-            ],
-          },
-          { name: 'meta', internalType: 'bytes', type: 'bytes' },
-        ],
-      },
-    ],
-    name: 'addOrder',
-    outputs: [{ name: 'stateChanged', internalType: 'bool', type: 'bool' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [
-      {
-        name: 'aliceOrder',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-      },
-      {
-        name: 'bobOrder',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-      },
-      {
-        name: 'clearConfig',
-        internalType: 'struct ClearConfig',
-        type: 'tuple',
-        components: [
-          {
-            name: 'aliceInputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'aliceOutputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          { name: 'bobInputIOIndex', internalType: 'uint256', type: 'uint256' },
-          {
-            name: 'bobOutputIOIndex',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'aliceBountyVaultId',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-          {
-            name: 'bobBountyVaultId',
-            internalType: 'uint256',
-            type: 'uint256',
-          },
-        ],
-      },
-      {
-        name: 'aliceSignedContext',
-        internalType: 'struct SignedContextV1[]',
-        type: 'tuple[]',
-        components: [
-          { name: 'signer', internalType: 'address', type: 'address' },
-          { name: 'context', internalType: 'uint256[]', type: 'uint256[]' },
-          { name: 'signature', internalType: 'bytes', type: 'bytes' },
-        ],
-      },
-      {
-        name: 'bobSignedContext',
-        internalType: 'struct SignedContextV1[]',
-        type: 'tuple[]',
-        components: [
-          { name: 'signer', internalType: 'address', type: 'address' },
-          { name: 'context', internalType: 'uint256[]', type: 'uint256[]' },
-          { name: 'signature', internalType: 'bytes', type: 'bytes' },
-        ],
-      },
-    ],
-    name: 'clear',
-    outputs: [],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-      { name: 'amount', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'deposit',
-    outputs: [],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [
-      { name: '', internalType: 'address', type: 'address' },
-      { name: '', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'flashFee',
-    outputs: [{ name: '', internalType: 'uint256', type: 'uint256' }],
-    stateMutability: 'pure',
-  },
-  {
-    type: 'function',
-    inputs: [
-      {
-        name: 'receiver',
-        internalType: 'contract IERC3156FlashBorrower',
-        type: 'address',
-      },
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'amount', internalType: 'uint256', type: 'uint256' },
-      { name: 'data', internalType: 'bytes', type: 'bytes' },
-    ],
-    name: 'flashLoan',
-    outputs: [{ name: '', internalType: 'bool', type: 'bool' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [{ name: 'token', internalType: 'address', type: 'address' }],
-    name: 'maxFlashLoan',
-    outputs: [{ name: '', internalType: 'uint256', type: 'uint256' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    inputs: [{ name: 'data', internalType: 'bytes[]', type: 'bytes[]' }],
-    name: 'multicall',
-    outputs: [{ name: 'results', internalType: 'bytes[]', type: 'bytes[]' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [{ name: 'orderHash', internalType: 'bytes32', type: 'bytes32' }],
-    name: 'orderExists',
-    outputs: [{ name: '', internalType: 'bool', type: 'bool' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    inputs: [
-      {
-        name: 'order',
-        internalType: 'struct OrderV2',
-        type: 'tuple',
-        components: [
-          { name: 'owner', internalType: 'address', type: 'address' },
-          { name: 'handleIO', internalType: 'bool', type: 'bool' },
-          {
-            name: 'evaluable',
-            internalType: 'struct EvaluableV2',
-            type: 'tuple',
-            components: [
-              {
-                name: 'interpreter',
-                internalType: 'contract IInterpreterV2',
-                type: 'address',
-              },
-              {
-                name: 'store',
-                internalType: 'contract IInterpreterStoreV2',
-                type: 'address',
-              },
-              { name: 'expression', internalType: 'address', type: 'address' },
-            ],
-          },
-          {
-            name: 'validInputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-          {
-            name: 'validOutputs',
-            internalType: 'struct IO[]',
-            type: 'tuple[]',
-            components: [
-              { name: 'token', internalType: 'address', type: 'address' },
-              { name: 'decimals', internalType: 'uint8', type: 'uint8' },
-              { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-            ],
-          },
-        ],
-      },
-    ],
-    name: 'removeOrder',
-    outputs: [{ name: 'stateChanged', internalType: 'bool', type: 'bool' }],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [{ name: 'interfaceId', internalType: 'bytes4', type: 'bytes4' }],
-    name: 'supportsInterface',
-    outputs: [{ name: '', internalType: 'bool', type: 'bool' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    inputs: [
-      {
-        name: 'config',
-        internalType: 'struct TakeOrdersConfigV2',
-        type: 'tuple',
-        components: [
-          { name: 'minimumInput', internalType: 'uint256', type: 'uint256' },
-          { name: 'maximumInput', internalType: 'uint256', type: 'uint256' },
-          { name: 'maximumIORatio', internalType: 'uint256', type: 'uint256' },
-          {
-            name: 'orders',
-            internalType: 'struct TakeOrderConfigV2[]',
-            type: 'tuple[]',
-            components: [
-              {
-                name: 'order',
-                internalType: 'struct OrderV2',
-                type: 'tuple',
-                components: [
-                  { name: 'owner', internalType: 'address', type: 'address' },
-                  { name: 'handleIO', internalType: 'bool', type: 'bool' },
-                  {
-                    name: 'evaluable',
-                    internalType: 'struct EvaluableV2',
-                    type: 'tuple',
-                    components: [
-                      {
-                        name: 'interpreter',
-                        internalType: 'contract IInterpreterV2',
-                        type: 'address',
-                      },
-                      {
-                        name: 'store',
-                        internalType: 'contract IInterpreterStoreV2',
-                        type: 'address',
-                      },
-                      {
-                        name: 'expression',
-                        internalType: 'address',
-                        type: 'address',
-                      },
-                    ],
-                  },
-                  {
-                    name: 'validInputs',
-                    internalType: 'struct IO[]',
-                    type: 'tuple[]',
-                    components: [
-                      {
-                        name: 'token',
-                        internalType: 'address',
-                        type: 'address',
-                      },
-                      {
-                        name: 'decimals',
-                        internalType: 'uint8',
-                        type: 'uint8',
-                      },
-                      {
-                        name: 'vaultId',
-                        internalType: 'uint256',
-                        type: 'uint256',
-                      },
-                    ],
-                  },
-                  {
-                    name: 'validOutputs',
-                    internalType: 'struct IO[]',
-                    type: 'tuple[]',
-                    components: [
-                      {
-                        name: 'token',
-                        internalType: 'address',
-                        type: 'address',
-                      },
-                      {
-                        name: 'decimals',
-                        internalType: 'uint8',
-                        type: 'uint8',
-                      },
-                      {
-                        name: 'vaultId',
-                        internalType: 'uint256',
-                        type: 'uint256',
-                      },
-                    ],
-                  },
-                ],
-              },
-              {
-                name: 'inputIOIndex',
-                internalType: 'uint256',
-                type: 'uint256',
-              },
-              {
-                name: 'outputIOIndex',
-                internalType: 'uint256',
-                type: 'uint256',
-              },
-              {
-                name: 'signedContext',
-                internalType: 'struct SignedContextV1[]',
-                type: 'tuple[]',
-                components: [
-                  { name: 'signer', internalType: 'address', type: 'address' },
-                  {
-                    name: 'context',
-                    internalType: 'uint256[]',
-                    type: 'uint256[]',
-                  },
-                  { name: 'signature', internalType: 'bytes', type: 'bytes' },
-                ],
-              },
-            ],
-          },
-          { name: 'data', internalType: 'bytes', type: 'bytes' },
-        ],
-      },
-    ],
-    name: 'takeOrders',
-    outputs: [
-      { name: 'totalTakerInput', internalType: 'uint256', type: 'uint256' },
-      { name: 'totalTakerOutput', internalType: 'uint256', type: 'uint256' },
-    ],
-    stateMutability: 'nonpayable',
-  },
-  {
-    type: 'function',
-    inputs: [
-      { name: 'owner', internalType: 'address', type: 'address' },
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'vaultBalance',
-    outputs: [{ name: '', internalType: 'uint256', type: 'uint256' }],
-    stateMutability: 'view',
-  },
-  {
-    type: 'function',
-    inputs: [
-      { name: 'token', internalType: 'address', type: 'address' },
-      { name: 'vaultId', internalType: 'uint256', type: 'uint256' },
-      { name: 'targetAmount', internalType: 'uint256', type: 'uint256' },
-    ],
-    name: 'withdraw',
-    outputs: [],
-    stateMutability: 'nonpayable',
-  },
+	{
+		type: 'error',
+		name: 'ClearZeroAmount',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'InvalidSignature',
+		inputs: [
+			{
+				name: 'i',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'MinimumIO',
+		inputs: [
+			{
+				name: 'minimumIO',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+			{
+				name: 'actualIO',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'NegativeBounty',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'NegativePull',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'NegativePush',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'NegativeVaultBalance',
+		inputs: [
+			{
+				name: 'vaultBalance',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'NegativeVaultBalanceChange',
+		inputs: [
+			{
+				name: 'amount',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'NoOrders',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'NotOrderOwner',
+		inputs: [
+			{
+				name: 'owner',
+				type: 'address',
+				internalType: 'address',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'OrderNoHandleIO',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'OrderNoInputs',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'OrderNoOutputs',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'OrderNoSources',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'ReentrancyGuardReentrantCall',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'SameOwner',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'TokenMismatch',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'TokenSelfTrade',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'UnsupportedCalculateOutputs',
+		inputs: [
+			{
+				name: 'outputs',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'ZeroDepositAmount',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'ZeroMaximumIO',
+		inputs: [],
+	},
+	{
+		type: 'error',
+		name: 'ZeroVaultId',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+		],
+	},
+	{
+		type: 'error',
+		name: 'ZeroWithdrawTargetAmount',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+		],
+	},
+	{
+		type: 'event',
+		name: 'AddOrderV3',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+			{
+				name: 'order',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'AfterClearV2',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'clearStateChange',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct ClearStateChangeV2',
+				components: [
+					{
+						name: 'aliceOutput',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'bobOutput',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'aliceInput',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'bobInput',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+				],
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'ClearV3',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'alice',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'bob',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'clearConfig',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct ClearConfigV2',
+				components: [
+					{
+						name: 'aliceInputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'aliceOutputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'bobInputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'bobOutputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'aliceBountyVaultId',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+					{
+						name: 'bobBountyVaultId',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'ContextV2',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'context',
+				type: 'bytes32[][]',
+				indexed: false,
+				internalType: 'bytes32[][]',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'DepositV2',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+			{
+				name: 'depositAmountUint256',
+				type: 'uint256',
+				indexed: false,
+				internalType: 'uint256',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'OrderExceedsMaxRatio',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'owner',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'OrderNotFound',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'owner',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'OrderZeroAmount',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'owner',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'RemoveOrderV3',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+			{
+				name: 'order',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'TakeOrderV3',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'config',
+				type: 'tuple',
+				indexed: false,
+				internalType: 'struct TakeOrderConfigV4',
+				components: [
+					{
+						name: 'order',
+						type: 'tuple',
+						internalType: 'struct OrderV4',
+						components: [
+							{
+								name: 'owner',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'evaluable',
+								type: 'tuple',
+								internalType: 'struct EvaluableV4',
+								components: [
+									{
+										name: 'interpreter',
+										type: 'address',
+										internalType: 'contract IInterpreterV4',
+									},
+									{
+										name: 'store',
+										type: 'address',
+										internalType: 'contract IInterpreterStoreV3',
+									},
+									{
+										name: 'bytecode',
+										type: 'bytes',
+										internalType: 'bytes',
+									},
+								],
+							},
+							{
+								name: 'validInputs',
+								type: 'tuple[]',
+								internalType: 'struct IOV2[]',
+								components: [
+									{
+										name: 'token',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'vaultId',
+										type: 'bytes32',
+										internalType: 'bytes32',
+									},
+								],
+							},
+							{
+								name: 'validOutputs',
+								type: 'tuple[]',
+								internalType: 'struct IOV2[]',
+								components: [
+									{
+										name: 'token',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'vaultId',
+										type: 'bytes32',
+										internalType: 'bytes32',
+									},
+								],
+							},
+							{
+								name: 'nonce',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'inputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'outputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+			{
+				name: 'input',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'Float',
+			},
+			{
+				name: 'output',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'Float',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'event',
+		name: 'WithdrawV2',
+		inputs: [
+			{
+				name: 'sender',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				indexed: false,
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'bytes32',
+			},
+			{
+				name: 'targetAmount',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'Float',
+			},
+			{
+				name: 'withdrawAmount',
+				type: 'bytes32',
+				indexed: false,
+				internalType: 'Float',
+			},
+			{
+				name: 'withdrawAmountUint256',
+				type: 'uint256',
+				indexed: false,
+				internalType: 'uint256',
+			},
+		],
+		anonymous: false,
+	},
+	{
+		type: 'function',
+		name: 'addOrder4',
+		inputs: [
+			{
+				name: 'config',
+				type: 'tuple',
+				internalType: 'struct OrderConfigV4',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+					{
+						name: 'secret',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+					{
+						name: 'meta',
+						type: 'bytes',
+						internalType: 'bytes',
+					},
+				],
+			},
+			{
+				name: 'tasks',
+				type: 'tuple[]',
+				internalType: 'struct TaskV2[]',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [
+			{
+				name: 'stateChanged',
+				type: 'bool',
+				internalType: 'bool',
+			},
+		],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'clear3',
+		inputs: [
+			{
+				name: 'alice',
+				type: 'tuple',
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'bob',
+				type: 'tuple',
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'clearConfig',
+				type: 'tuple',
+				internalType: 'struct ClearConfigV2',
+				components: [
+					{
+						name: 'aliceInputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'aliceOutputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'bobInputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'bobOutputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'aliceBountyVaultId',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+					{
+						name: 'bobBountyVaultId',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'aliceSignedContext',
+				type: 'tuple[]',
+				internalType: 'struct SignedContextV1[]',
+				components: [
+					{
+						name: 'signer',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'context',
+						type: 'bytes32[]',
+						internalType: 'bytes32[]',
+					},
+					{
+						name: 'signature',
+						type: 'bytes',
+						internalType: 'bytes',
+					},
+				],
+			},
+			{
+				name: 'bobSignedContext',
+				type: 'tuple[]',
+				internalType: 'struct SignedContextV1[]',
+				components: [
+					{
+						name: 'signer',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'context',
+						type: 'bytes32[]',
+						internalType: 'bytes32[]',
+					},
+					{
+						name: 'signature',
+						type: 'bytes',
+						internalType: 'bytes',
+					},
+				],
+			},
+		],
+		outputs: [],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'deposit4',
+		inputs: [
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+			{
+				name: 'depositAmount',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+			{
+				name: 'tasks',
+				type: 'tuple[]',
+				internalType: 'struct TaskV2[]',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'entask2',
+		inputs: [
+			{
+				name: 'tasks',
+				type: 'tuple[]',
+				internalType: 'struct TaskV2[]',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'flashFee',
+		inputs: [
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'amount',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+		],
+		outputs: [
+			{
+				name: '',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+		],
+		stateMutability: 'view',
+	},
+	{
+		type: 'function',
+		name: 'flashLoan',
+		inputs: [
+			{
+				name: 'receiver',
+				type: 'address',
+				internalType: 'contract IERC3156FlashBorrower',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'amount',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+			{
+				name: 'data',
+				type: 'bytes',
+				internalType: 'bytes',
+			},
+		],
+		outputs: [
+			{
+				name: '',
+				type: 'bool',
+				internalType: 'bool',
+			},
+		],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'maxFlashLoan',
+		inputs: [
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+		],
+		outputs: [
+			{
+				name: '',
+				type: 'uint256',
+				internalType: 'uint256',
+			},
+		],
+		stateMutability: 'view',
+	},
+	{
+		type: 'function',
+		name: 'orderExists',
+		inputs: [
+			{
+				name: 'orderHash',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+		],
+		outputs: [
+			{
+				name: 'exists',
+				type: 'bool',
+				internalType: 'bool',
+			},
+		],
+		stateMutability: 'view',
+	},
+	{
+		type: 'function',
+		name: 'quote2',
+		inputs: [
+			{
+				name: 'quoteConfig',
+				type: 'tuple',
+				internalType: 'struct QuoteV2',
+				components: [
+					{
+						name: 'order',
+						type: 'tuple',
+						internalType: 'struct OrderV4',
+						components: [
+							{
+								name: 'owner',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'evaluable',
+								type: 'tuple',
+								internalType: 'struct EvaluableV4',
+								components: [
+									{
+										name: 'interpreter',
+										type: 'address',
+										internalType: 'contract IInterpreterV4',
+									},
+									{
+										name: 'store',
+										type: 'address',
+										internalType: 'contract IInterpreterStoreV3',
+									},
+									{
+										name: 'bytecode',
+										type: 'bytes',
+										internalType: 'bytes',
+									},
+								],
+							},
+							{
+								name: 'validInputs',
+								type: 'tuple[]',
+								internalType: 'struct IOV2[]',
+								components: [
+									{
+										name: 'token',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'vaultId',
+										type: 'bytes32',
+										internalType: 'bytes32',
+									},
+								],
+							},
+							{
+								name: 'validOutputs',
+								type: 'tuple[]',
+								internalType: 'struct IOV2[]',
+								components: [
+									{
+										name: 'token',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'vaultId',
+										type: 'bytes32',
+										internalType: 'bytes32',
+									},
+								],
+							},
+							{
+								name: 'nonce',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'inputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'outputIOIndex',
+						type: 'uint256',
+						internalType: 'uint256',
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [
+			{
+				name: 'exists',
+				type: 'bool',
+				internalType: 'bool',
+			},
+			{
+				name: 'outputMax',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+			{
+				name: 'ioRatio',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+		stateMutability: 'view',
+	},
+	{
+		type: 'function',
+		name: 'removeOrder3',
+		inputs: [
+			{
+				name: 'order',
+				type: 'tuple',
+				internalType: 'struct OrderV4',
+				components: [
+					{
+						name: 'owner',
+						type: 'address',
+						internalType: 'address',
+					},
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'validInputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'validOutputs',
+						type: 'tuple[]',
+						internalType: 'struct IOV2[]',
+						components: [
+							{
+								name: 'token',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'vaultId',
+								type: 'bytes32',
+								internalType: 'bytes32',
+							},
+						],
+					},
+					{
+						name: 'nonce',
+						type: 'bytes32',
+						internalType: 'bytes32',
+					},
+				],
+			},
+			{
+				name: 'tasks',
+				type: 'tuple[]',
+				internalType: 'struct TaskV2[]',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [
+			{
+				name: 'stateChanged',
+				type: 'bool',
+				internalType: 'bool',
+			},
+		],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'takeOrders4',
+		inputs: [
+			{
+				name: 'config',
+				type: 'tuple',
+				internalType: 'struct TakeOrdersConfigV5',
+				components: [
+					{
+						name: 'minimumIO',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'maximumIO',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'maximumIORatio',
+						type: 'bytes32',
+						internalType: 'Float',
+					},
+					{
+						name: 'IOIsInput',
+						type: 'bool',
+						internalType: 'bool',
+					},
+					{
+						name: 'orders',
+						type: 'tuple[]',
+						internalType: 'struct TakeOrderConfigV4[]',
+						components: [
+							{
+								name: 'order',
+								type: 'tuple',
+								internalType: 'struct OrderV4',
+								components: [
+									{
+										name: 'owner',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'evaluable',
+										type: 'tuple',
+										internalType: 'struct EvaluableV4',
+										components: [
+											{
+												name: 'interpreter',
+												type: 'address',
+												internalType: 'contract IInterpreterV4',
+											},
+											{
+												name: 'store',
+												type: 'address',
+												internalType: 'contract IInterpreterStoreV3',
+											},
+											{
+												name: 'bytecode',
+												type: 'bytes',
+												internalType: 'bytes',
+											},
+										],
+									},
+									{
+										name: 'validInputs',
+										type: 'tuple[]',
+										internalType: 'struct IOV2[]',
+										components: [
+											{
+												name: 'token',
+												type: 'address',
+												internalType: 'address',
+											},
+											{
+												name: 'vaultId',
+												type: 'bytes32',
+												internalType: 'bytes32',
+											},
+										],
+									},
+									{
+										name: 'validOutputs',
+										type: 'tuple[]',
+										internalType: 'struct IOV2[]',
+										components: [
+											{
+												name: 'token',
+												type: 'address',
+												internalType: 'address',
+											},
+											{
+												name: 'vaultId',
+												type: 'bytes32',
+												internalType: 'bytes32',
+											},
+										],
+									},
+									{
+										name: 'nonce',
+										type: 'bytes32',
+										internalType: 'bytes32',
+									},
+								],
+							},
+							{
+								name: 'inputIOIndex',
+								type: 'uint256',
+								internalType: 'uint256',
+							},
+							{
+								name: 'outputIOIndex',
+								type: 'uint256',
+								internalType: 'uint256',
+							},
+							{
+								name: 'signedContext',
+								type: 'tuple[]',
+								internalType: 'struct SignedContextV1[]',
+								components: [
+									{
+										name: 'signer',
+										type: 'address',
+										internalType: 'address',
+									},
+									{
+										name: 'context',
+										type: 'bytes32[]',
+										internalType: 'bytes32[]',
+									},
+									{
+										name: 'signature',
+										type: 'bytes',
+										internalType: 'bytes',
+									},
+								],
+							},
+						],
+					},
+					{
+						name: 'data',
+						type: 'bytes',
+						internalType: 'bytes',
+					},
+				],
+			},
+		],
+		outputs: [
+			{
+				name: 'totalTakerInput',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+			{
+				name: 'totalTakerOutput',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+		stateMutability: 'nonpayable',
+	},
+	{
+		type: 'function',
+		name: 'vaultBalance2',
+		inputs: [
+			{
+				name: 'owner',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+		],
+		outputs: [
+			{
+				name: 'balance',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+		],
+		stateMutability: 'view',
+	},
+	{
+		type: 'function',
+		name: 'withdraw4',
+		inputs: [
+			{
+				name: 'token',
+				type: 'address',
+				internalType: 'address',
+			},
+			{
+				name: 'vaultId',
+				type: 'bytes32',
+				internalType: 'bytes32',
+			},
+			{
+				name: 'targetAmount',
+				type: 'bytes32',
+				internalType: 'Float',
+			},
+			{
+				name: 'tasks',
+				type: 'tuple[]',
+				internalType: 'struct TaskV2[]',
+				components: [
+					{
+						name: 'evaluable',
+						type: 'tuple',
+						internalType: 'struct EvaluableV4',
+						components: [
+							{
+								name: 'interpreter',
+								type: 'address',
+								internalType: 'contract IInterpreterV4',
+							},
+							{
+								name: 'store',
+								type: 'address',
+								internalType: 'contract IInterpreterStoreV3',
+							},
+							{
+								name: 'bytecode',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+					{
+						name: 'signedContext',
+						type: 'tuple[]',
+						internalType: 'struct SignedContextV1[]',
+						components: [
+							{
+								name: 'signer',
+								type: 'address',
+								internalType: 'address',
+							},
+							{
+								name: 'context',
+								type: 'bytes32[]',
+								internalType: 'bytes32[]',
+							},
+							{
+								name: 'signature',
+								type: 'bytes',
+								internalType: 'bytes',
+							},
+						],
+					},
+				],
+			},
+		],
+		outputs: [],
+		stateMutability: 'nonpayable',
+	},
 ] as const
-
-/**
- * [__View Contract on Sepolia Etherscan__](https://sepolia.etherscan.io/address/0xfca89cD12Ba1346b1ac570ed988AB43b812733fe)
- */
-export const orderbookAddress = {
-  11155111: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
-} as const
-
-/**
- * [__View Contract on Sepolia Etherscan__](https://sepolia.etherscan.io/address/0xfca89cD12Ba1346b1ac570ed988AB43b812733fe)
- */
-export const orderbookConfig = {
-  address: orderbookAddress,
-  abi: orderbookAbi,
-} as const
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // erc20
