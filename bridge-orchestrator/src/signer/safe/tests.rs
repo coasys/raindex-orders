@@ -779,3 +779,78 @@ fn mainnet_takes_https_or_this_machine_for_a_signer_service() {
         ))
     );
 }
+
+/// The worked example in docs/signer-service.md, word for word: the coupon test
+/// vector's request to the service of owner 0x7099…79C8 of SAFE on mainnet, and
+/// that owner's signature, which ui/scripts/safe-message.test.ts reproduces with
+/// viem.
+#[tokio::test]
+async fn the_worked_example_in_the_signer_service_doc() {
+    let words = [
+        "0x0000000000000000000000001111111111111111111111111111111111111111",
+        "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+        "0x0000000000000000000000000000000000000000000000000000000068581c00",
+        "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
+        "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
+        "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
+        "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
+        "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+        "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+    ];
+    let context: Vec<B256> = words.iter().map(|w| w.parse().unwrap()).collect();
+    assert_eq!(
+        context[8],
+        keccak256(withdrawal().get_raw_39()),
+        "the nonce is keccak256 of the withdrawal's 39 bytes"
+    );
+    let chain = FakeSafe::new(2, &[0, 1, 2]);
+    let url = chain.serve().await;
+    let service = owner_service(owner_key(0)).await;
+    let owners = safe_owners(
+        vec![
+            service_owner(&owner_key(0), &service),
+            Owner::Key(owner_key(1)),
+        ],
+        &url,
+    );
+    let asked = SignRequest {
+        digest: context_digest(&context),
+        context,
+        withdrawal: Some(withdrawal()),
+    };
+
+    owners.sign_request(&asked).await.unwrap();
+
+    assert_eq!(
+        service.requests.lock().unwrap()[0].1,
+        serde_json::from_str::<Value>(
+            r#"{
+              "safe": "0x3838fc4e0cba211c3d6d202539bb2dc2b72c7a22",
+              "chainId": 1,
+              "owner": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+              "withdrawal": "uhCkkBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBweIGAsC",
+              "context": [
+                "0x0000000000000000000000001111111111111111111111111111111111111111",
+                "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+                "0x0000000000000000000000000000000000000000000000000000000068581c00",
+                "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
+                "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
+                "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
+                "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
+                "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+                "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77"
+              ],
+              "couponDigest": "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f",
+              "safeMessageHash": "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+            }"#
+        )
+        .unwrap()
+    );
+    let hash: B256 = "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+        .parse()
+        .unwrap();
+    assert_eq!(
+        format!("0x{}", hex::encode(typed_data_signature(&hash, &owner_key(0)))),
+        "0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c"
+    );
+}

@@ -15,7 +15,7 @@ import { isAddressEqual, keccak256, pad, stringToHex, toHex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { couponDigest, safeMessageHash, signAsOwner } from './safe-message.mjs'
 
-const env = (name) => {
+const env = name => {
 	const value = process.env[name]
 	if (!value) throw new Error(`${name} is required`)
 	return value
@@ -27,7 +27,7 @@ const chainId = Number(env('CHAIN_ID'))
 const mode = process.env.MODE ?? 'sign'
 const signingKey = mode === 'wrong-key' ? generatePrivateKey() : ownerKey
 const maxExpirySeconds = BigInt(process.env.MAX_EXPIRY_SECONDS ?? 8 * 24 * 60 * 60)
-const word = (hex) => pad(hex.toLowerCase(), { size: 32 })
+const word = hex => pad(hex.toLowerCase(), { size: 32 })
 const record = [
 	word(env('ORDER_HASH')),
 	word(env('ORDER_OWNER')),
@@ -57,14 +57,24 @@ function check(body) {
 		refuse('wrong_safe_or_chain', `this service signs for ${safe} on chain ${chainId}`)
 	if (!isAddressEqual(body.owner, owner)) refuse('wrong_owner', `this service signs as ${owner}`)
 	const words = body.context
-	if (!Array.isArray(words) || words.length !== 9 || !words.every((w) => /^0x[0-9a-fA-F]{64}$/.test(w)))
+	if (
+		!Array.isArray(words) ||
+		words.length !== 9 ||
+		!words.every(w => /^0x[0-9a-fA-F]{64}$/.test(w))
+	)
 		throw new Refusal(400, 'bad_request', 'context is nine 32-byte hex words')
-	const lower = words.map((w) => w.toLowerCase())
+	const lower = words.map(w => w.toLowerCase())
 	for (let i = 0; i < 5; i++) {
-		if (lower[3 + i] !== record[i]) refuse('order_mismatch', `word ${3 + i} is not the deploy record's`)
+		if (lower[3 + i] !== record[i])
+			refuse('order_mismatch', `word ${3 + i} is not the deploy record's`)
 	}
 	if (body.withdrawal === null) {
-		if (lower[0] !== word(safe) || lower[1] !== ONE_WEI || lower[2] !== MAX_EXPIRY || lower[8] !== PROBE_NONCE)
+		if (
+			lower[0] !== word(safe) ||
+			lower[1] !== ONE_WEI ||
+			lower[2] !== MAX_EXPIRY ||
+			lower[8] !== PROBE_NONCE
+		)
 			refuse('probe_mismatch', 'a request with no withdrawal must be the startup probe')
 	} else {
 		if (typeof body.withdrawal !== 'string' || !body.withdrawal.startsWith('u'))
@@ -74,7 +84,8 @@ function check(body) {
 			refuse('nonce_mismatch', 'word 8 is not keccak256 of the withdrawal')
 		const expiry = BigInt(lower[2])
 		const now = BigInt(Math.floor(Date.now() / 1000))
-		if (expiry <= now || expiry > now + maxExpirySeconds) refuse('expiry_out_of_range', `expiry ${expiry}`)
+		if (expiry <= now || expiry > now + maxExpirySeconds)
+			refuse('expiry_out_of_range', `expiry ${expiry}`)
 		console.log(`MOCK: no Holochain check of ${body.withdrawal}`)
 	}
 	const digest = couponDigest(lower)
@@ -85,7 +96,8 @@ function check(body) {
 }
 
 async function answer(request, body) {
-	if (request.method === 'GET' && request.url.endsWith('/signer')) return [200, { owner, safe, chainId }]
+	if (request.method === 'GET' && request.url.endsWith('/signer'))
+		return [200, { owner, safe, chainId }]
 	if (request.method === 'POST' && request.url.endsWith('/sign')) {
 		const hash = check(JSON.parse(body))
 		return [200, { owner, signature: await signAsOwner(signingKey, hash) }]
@@ -95,17 +107,21 @@ async function answer(request, body) {
 
 createServer((request, response) => {
 	let body = ''
-	request.on('data', (chunk) => (body += chunk))
+	request.on('data', chunk => (body += chunk))
 	request.on('end', async () => {
 		let status, reply
 		try {
 			;[status, reply] = await answer(request, body)
 		} catch (err) {
 			;[status, reply] =
-				err instanceof Refusal ? [err.status, { code: err.code, reason: err.message }] : [400, { code: 'bad_request', reason: String(err) }]
+				err instanceof Refusal
+					? [err.status, { code: err.code, reason: err.message }]
+					: [400, { code: 'bad_request', reason: String(err) }]
 		}
 		console.log(`${request.method} ${request.url} -> ${status} ${reply.code ?? ''}`)
 		response.writeHead(status, { 'Content-Type': 'application/json' })
 		response.end(JSON.stringify(reply))
 	})
-}).listen(Number(env('PORT')), '127.0.0.1', () => console.log(`mock signer service for ${owner} on ${env('PORT')}`))
+}).listen(Number(env('PORT')), '127.0.0.1', () =>
+	console.log(`mock signer service for ${owner} on ${env('PORT')}`)
+)

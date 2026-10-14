@@ -8,7 +8,9 @@ import { privateKeyToAccount } from 'viem/accounts'
 /** The digest Raindex checks a coupon's signature over: the EIP-191 hash of keccak256 of the nine packed words. */
 export function couponDigest(words) {
 	const packed = keccak256(encodePacked(Array(9).fill('bytes32'), words))
-	return keccak256(encodePacked(['string', 'bytes32'], ['\x19Ethereum Signed Message:\n32', packed]))
+	return keccak256(
+		encodePacked(['string', 'bytes32'], ['\x19Ethereum Signed Message:\n32', packed])
+	)
 }
 
 /**
