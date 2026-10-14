@@ -188,6 +188,117 @@ abstract contract ForkRehearsal is Test, SignContext {
     }
 }
 
+/// The bridge as it launches: one Safe of three owners that needs two
+/// signatures, created by `deploy-mainnet.sh safe`, is the vault admin from the
+/// deploy's one transaction and the claim order's coupon signer.
+contract OneSafeRehearsal is ForkRehearsal {
+    error InvalidSignature(uint256 i);
+
+    function safe() private view returns (address) {
+        return vm.envAddress("BRIDGE_SAFE");
+    }
+
+    function safeSigned(bytes32[] memory c, uint256[] memory ownerKeys) private view returns (SignedContextV1 memory) {
+        return SignedContextV1(safe(), c, LibSafe.couponSignature(vm, safe(), ownerKeys, LibCoupon.digest(c)));
+    }
+
+    function twoOwners() private view returns (uint256[] memory) {
+        return vm.envUint("REHEARSAL_BRIDGE_OWNER_KEYS", ",");
+    }
+
+    function oneOwner() private view returns (uint256[] memory one) {
+        one = new uint256[](1);
+        one[0] = vm.envUint("REHEARSAL_BRIDGE_ONE_OWNER_KEY");
+    }
+
+    function expectInvalidSignature(SignedContextV1 memory coupon) private {
+        lock(100e18);
+        TakeOrdersConfigV5 memory config = claimConfig(coupon);
+        vm.prank(claimer);
+        vm.expectRevert(abi.encodeWithSelector(InvalidSignature.selector, 0));
+        RAINDEX.takeOrders4(config);
+    }
+
+    function testTheSafeIsTheAdminFromTheDeploysBlockAndTheCouponSigner() external onFork {
+        assertEq(vault.admin(), safe());
+        assertTwoOfThree(safe());
+        assertHandedOverOnce(vm.envUint("REHEARSAL_DEPLOY_BLOCK"), vm.envAddress("HOLO_BRIDGE_DEPLOYER"), safe());
+        assertTrue(RAINDEX.orderExists(orderHash));
+    }
+
+    function testACouponCarryingTwoOwnerSignaturesClaims() external onFork {
+        lock(100e18);
+        uint256 before = vault.vaultBalance();
+
+        claim(safeSigned(context(40e18, inAWeek(), 21), twoOwners()));
+
+        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(vault.vaultBalance(), before - 40e18);
+    }
+
+    function testACouponCarryingOneOwnerSignatureFails() external onFork {
+        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 22), oneOwner()));
+    }
+
+    function testACouponCarryingAnOwnersAndAStrangersSignatureFails() external onFork {
+        (, uint256 stranger) = makeAddrAndKey("not an owner");
+        uint256[] memory keys = new uint256[](2);
+        (keys[0], keys[1]) = (oneOwner()[0], stranger);
+        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 23), keys));
+    }
+
+    function testACouponCarryingOneOwnersSignatureTwiceFails() external onFork {
+        uint256[] memory keys = new uint256[](2);
+        (keys[0], keys[1]) = (oneOwner()[0], oneOwner()[0]);
+        expectInvalidSignature(safeSigned(context(40e18, inAWeek(), 24), keys));
+    }
+
+    function testASecondClaimWithTheSameNonceFails() external onFork {
+        lock(100e18);
+        claim(safeSigned(context(40e18, inAWeek(), 25), twoOwners()));
+
+        TakeOrdersConfigV5 memory again = claimConfig(safeSigned(context(40e18, inAWeek() + 1, 25), twoOwners()));
+        vm.prank(claimer);
+        vm.expectRevert(bytes("Nonce already used"));
+        RAINDEX.takeOrders4(again);
+    }
+
+    function testAnExpiredCouponFails() external onFork {
+        lock(100e18);
+        SignedContextV1 memory coupon = safeSigned(context(40e18, block.timestamp + 60, 26), twoOwners());
+        vm.warp(block.timestamp + 60);
+
+        vm.expectRevert(bytes("Order expired"));
+        claim(coupon);
+    }
+
+    /// The owners' signatures of a coupon are over its SafeMessage hash, not
+    /// over any Safe transaction's hash: they execute no admin call.
+    function testACouponsOwnerSignaturesDoNotExecuteAnAdminCall() external onFork {
+        bytes memory call = abi.encodeCall(HoloLockVault.adminWithdraw, (1e18, claimer));
+        bytes memory signatures = safeSigned(context(40e18, inAWeek(), 27), twoOwners()).signature;
+        lock(10e18);
+
+        vm.expectRevert(bytes("GS026"));
+        ISafe(safe()).execTransaction(address(vault), 0, call, 0, 0, 0, 0, address(0), payable(address(0)), signatures);
+        assertEq(MAINNET_HOT.balanceOf(claimer), 0);
+    }
+
+    function testTheSafeAdministersWithTwoOwnerSignaturesAndNotWithOne() external onFork {
+        assertSafeAdministers(ISafe(safe()), twoOwners());
+    }
+
+    function testNeitherTheDeployerNorTheDeployerContractNorAnOwnerAloneAdministers() external onFork {
+        lock(10e18);
+        assertOnlyAdmin(vm.envAddress("REHEARSAL_DEPLOYER"));
+        assertOnlyAdmin(vm.envAddress("HOLO_BRIDGE_DEPLOYER"));
+        address[] memory owners = ISafe(safe()).getOwners();
+        for (uint256 i = 0; i < owners.length; i++) {
+            assertOnlyAdmin(owners[i]);
+        }
+    }
+}
+
 /// The bridge as deploy-mainnet.sh launches it: a Safe of three owners that
 /// needs two signatures is the vault admin from the deploy's one transaction,
 /// and a key is the coupon signer.
