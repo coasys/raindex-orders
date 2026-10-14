@@ -14,6 +14,7 @@ import {
 import {IInterpreterV4} from "rainlang-interface-0.2.9/src/interface/IInterpreterV4.sol";
 import {IInterpreterStoreV3} from "rainlang-interface-0.2.9/src/interface/IInterpreterStoreV3.sol";
 import {LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {
     RAINDEX,
@@ -38,6 +39,8 @@ abstract contract ForkRehearsal is Test, SignContext {
     bytes32 internal constant ADMIN_CHANGED = keccak256("AdminChanged(address,address)");
 
     HoloLockVault internal vault;
+    /// HOT on mainnet; on another fork, the token REHEARSAL_TOKEN names.
+    IERC20 internal hot;
     IInterpreterV4 internal interpreter;
     IInterpreterStoreV3 internal store;
     bytes internal bytecode;
@@ -54,6 +57,7 @@ abstract contract ForkRehearsal is Test, SignContext {
     function setUp() public {
         if (!vm.envOr("REHEARSAL", false)) return;
         vm.createSelectFork(vm.envString("REHEARSAL_RPC_URL"));
+        hot = IERC20(vm.envOr("REHEARSAL_TOKEN", address(MAINNET_HOT)));
         vault = HoloLockVault(vm.envAddress("MAINNET_LOCK_VAULT_ADDRESS"));
         orderHash = vm.envBytes32("ORDER_HASH");
         interpreter = IInterpreterV4(vm.envAddress("PUBLIC_CLAIM_INTERPRETER"));
@@ -68,7 +72,7 @@ abstract contract ForkRehearsal is Test, SignContext {
             address(vault),
             EvaluableV4(interpreter, store, bytecode),
             claimIO(inputToken),
-            claimIO(address(MAINNET_HOT)),
+            claimIO(address(hot)),
             CLAIM_ORDER_NONCE
         );
     }
@@ -79,9 +83,9 @@ abstract contract ForkRehearsal is Test, SignContext {
     }
 
     function fundLocker(uint256 amount) internal {
-        deal(address(MAINNET_HOT), locker, amount);
+        deal(address(hot), locker, amount);
         vm.prank(locker);
-        MAINNET_HOT.approve(address(vault), amount);
+        hot.approve(address(vault), amount);
     }
 
     function lock(uint256 amount) internal {
@@ -109,7 +113,7 @@ abstract contract ForkRehearsal is Test, SignContext {
             orderHash,
             address(vault),
             address(RAINDEX),
-            address(MAINNET_HOT),
+            address(hot),
             HOLO_VAULT_ID,
             keccak256(abi.encodePacked(hex"842924", bytes32(withdrawal), bytes4(0)))
         );
@@ -232,7 +236,7 @@ contract OneSafeRehearsal is ForkRehearsal {
 
         claim(safeSigned(context(40e18, inAWeek(), 21), twoOwners()));
 
-        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(hot.balanceOf(claimer), 40e18);
         assertEq(vault.vaultBalance(), before - 40e18);
     }
 
@@ -281,7 +285,7 @@ contract OneSafeRehearsal is ForkRehearsal {
 
         vm.expectRevert(bytes("GS026"));
         ISafe(safe()).execTransaction(address(vault), 0, call, 0, 0, 0, 0, address(0), payable(address(0)), signatures);
-        assertEq(MAINNET_HOT.balanceOf(claimer), 0);
+        assertEq(hot.balanceOf(claimer), 0);
     }
 
     function testTheSafeAdministersWithTwoOwnerSignaturesAndNotWithOne() external onFork {
@@ -308,7 +312,7 @@ contract LaunchRehearsal is ForkRehearsal {
     }
 
     function testTheVaultHoldsWhatTheDeployRecordSays() external onFork {
-        assertEq(address(vault.token()), address(MAINNET_HOT));
+        assertEq(address(vault.token()), address(hot));
         assertEq(address(vault.orderbook()), address(RAINDEX));
         assertEq(vault.vaultId(), HOLO_VAULT_ID);
         assertEq(vault.minLockAmount(), MIN_LOCK_AMOUNT);
@@ -334,7 +338,7 @@ contract LaunchRehearsal is ForkRehearsal {
 
         claim(signed(context(40e18, inAWeek(), 1)));
 
-        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(hot.balanceOf(claimer), 40e18);
         assertEq(vault.vaultBalance(), before - 40e18);
     }
 
@@ -430,7 +434,7 @@ contract SafeSignerRehearsal is ForkRehearsal {
 
         claim(safeSigned(context(40e18, inAWeek(), 5), "REHEARSAL_SIGNER_OWNER_KEYS"));
 
-        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(hot.balanceOf(claimer), 40e18);
         assertEq(vault.vaultBalance(), before - 40e18);
     }
 
@@ -486,7 +490,7 @@ contract SafeSignerRehearsal is ForkRehearsal {
         TakeOrdersConfigV5 memory config = claimConfig(accepted);
         vm.prank(recipient);
         RAINDEX.takeOrders4(config);
-        assertEq(MAINNET_HOT.balanceOf(recipient), 40e18);
+        assertEq(hot.balanceOf(recipient), 40e18);
     }
 
     /// `signer,signature,c0..c8`, the words as decimal numbers.
@@ -519,6 +523,6 @@ contract SingleKeyAdminRehearsal is ForkRehearsal {
 
         claim(SignedContextV1(safe, c, LibSafe.couponSignature(vm, safe, keys, LibCoupon.digest(c))));
 
-        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
+        assertEq(hot.balanceOf(claimer), 40e18);
     }
 }
