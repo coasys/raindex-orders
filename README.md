@@ -69,6 +69,8 @@ npm run dev
 # Open http://localhost:5173
 ```
 
+To try Lock and Claim with MetaMask before deploying, `test/local-ui.sh <your address>` deploys the TestNet on a local anvil fork of Base Sepolia and points the dev server at it, and `npm run make-coupon` in `ui/` makes a coupon to claim: [DEPLOY.md](./DEPLOY.md#test-the-website-locally).
+
 ### 3. Run the bridge orchestrator
 
 ```bash
@@ -90,7 +92,17 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 | Rainlang 0.1.9 expression deployer, interpreter, store | `0xb90c299a8321fbdd8D0F367e560f5341F840dA3F`, `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf`, `0x1Aa775533E28B1D843e1A589034984E3a62005DC` |
 | Test Signer (TestNet only) | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
 
-The TestNet bridge (mock HOT, HoloLockVault, ClaimInputToken, claim order) is not deployed on Base Sepolia yet; `deploy-base-sepolia.sh` writes its addresses to `.env`. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
+### TestNet on Base Sepolia
+
+| Contract | Address on Base Sepolia |
+|----------|---------|
+| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
+| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
+| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
+| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
+| Claim order signer | the test signer |
+
+`deploy-base-sepolia.sh` wrote these to `.env`, and `broadcast/*/84532/run-latest.json` records each transaction. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
 
 ## Documentation
 
@@ -125,7 +137,8 @@ forge soldeer install
 forge build
 
 # Run tests: the unit tests, and the claim order on forks of Ethereum mainnet
-# (RPC_URL_ETH) and Base Sepolia (RPC_URL_BASE_SEPOLIA), public RPCs by default
+# (RPC_URL_ETH) and Base Sepolia (RPC_URL_BASE_SEPOLIA), public RPCs by default,
+# at the latest block unless FORK_BLOCK_ETH / FORK_BLOCK_BASE_SEPOLIA pins one
 forge test
 
 # Build the bridge orchestrator

@@ -156,8 +156,12 @@ expect_refusal "$fork" "pass the signer as a forge wallet option" \
 	env "${inputs[@]}" ./deploy-mainnet.sh
 expect_refusal "$fork" "--private-key takes a raw key" \
 	env "${inputs[@]}" ./deploy-mainnet.sh --private-key "$deployer_key"
+# The refusal must not rest on keys[2]'s live mainnet code, which its delegation's
+# owner can change or clear: give it a delegation designator on the fork.
+delegated=$(address_of "${keys[2]}")
+cast rpc anvil_setCode "$delegated" "0xef0100${deployer#0x}" --rpc-url "$fork" >/dev/null
 expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
-	env "${inputs[@]}" VALID_SIGNER="$(address_of "${keys[2]}")" "${deploy[@]}"
+	env "${inputs[@]}" VALID_SIGNER="$delegated" "${deploy[@]}"
 echo "-- the vault admin must be a Safe of threshold 2 or more, the one meant"
 expect_refusal "$fork" "ADMIN_ADDRESS $admin is a key, not a Safe" \
 	env "${inputs[@]}" ADMIN_ADDRESS="$admin" "${deploy[@]}"

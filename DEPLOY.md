@@ -31,6 +31,7 @@ Raindex V6 counts every amount as a decimal float. The vault converts each lock 
 
 ```bash
 # Copy example env file. It holds addresses, never a private key.
+# .env.base-sepolia.example instead has the deployed TestNet's addresses.
 cp .env.example .env
 
 # Keep the deployer key in an encrypted keystore, entered at a prompt
@@ -73,7 +74,15 @@ The `deploy-base-sepolia.sh` script handles all deployment steps:
 
 ### 4. Run the orchestrator and the website against it
 
-The orchestrator and the website take what is the same on every chain from TestNet's defaults (RaindexV6, the Rainlang interpreter and store, the vault ID, the test signer) and need the rest from this deploy: the orchestrator `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `TOKEN_ADDRESS`, `ORDER_HASH`, `ORDER_OWNER`, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN`, and the website `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_TOKEN_ADDRESS`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN`. `rotate-claim-signer.sh record <block>` prints them all as a deploy record once the order is added (`NETWORK=base-sepolia`, `VALID_SIGNER` the test signer); so does `cast` on the order's `AddOrderV3` event. Then:
+The orchestrator and the website take what is the same on every chain from TestNet's defaults (RaindexV6, the Rainlang interpreter and store, the vault ID, the test signer) and need the rest from this deploy: the orchestrator `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `TOKEN_ADDRESS`, `ORDER_HASH`, `ORDER_OWNER`, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN`, and the website `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_TOKEN_ADDRESS`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN`. `rotate-claim-signer.sh record <block>` prints them all as a deploy record once the order is added, reading from `<block>` on (a block before the `order-via-vault` step); so does `cast` on the order's `AddOrderV3` event. `record` is written for a signer rotation and refuses while `ORDER_HASH`, the order a rotation replaces, is still on the orderbook. A first deploy has no previous order, so pass a zero hash, which overrides the one in `.env`:
+
+```bash
+NETWORK=base-sepolia VALID_SIGNER=0x8E72b7568738da52ca3DCd9b24E178127A4E7d37 \
+  ORDER_HASH=0x0000000000000000000000000000000000000000000000000000000000000000 \
+  ./rotate-claim-signer.sh record <block>
+```
+
+Then:
 
 ```bash
 # bridge-orchestrator: NETWORK=base-sepolia, BASE_SEPOLIA_RPC_URL, SIGNER_PRIVATE_KEY
@@ -86,7 +95,15 @@ npm run build
 
 ### Deployed Contract Addresses (Base Sepolia)
 
-The TestNet bridge is not deployed on Base Sepolia yet. Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). The test signer is `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`.
+| Contract | Address on Base Sepolia |
+|----------|---------|
+| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
+| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
+| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
+| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
+| Claim order signer | the test signer |
+
+Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). The test signer is `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`. `broadcast/*/84532/run-latest.json` records each transaction.
 
 The previous TestNet, on Ethereum Sepolia against OrderBookV3 (vault `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6`, orderbook `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe`), does not carry over: its vault, order and coupons are V3's.
 
@@ -127,11 +144,32 @@ The rehearsal runs the orchestrator binary, so build it first: `cargo build` in 
 
 ### Website
 
-One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_SIGNER`), and logs which; it must be given the rest, as TestNet is not deployed on Base Sepolia yet. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
+One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_SIGNER`), and for TestNet's deploy on Base Sepolia (`PUBLIC_TOKEN_ADDRESS`, `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_CLAIM_INPUT_TOKEN`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE`), and logs which. A build for a new TestNet deploy names all five: one given alone pairs with the old order's hash, which the order hash check refuses. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
 
 The website waits for a sent transaction by polling every 2 seconds, Base's block time, for up to 5 minutes, as before: that is about 150 Base blocks, and 25 on mainnet.
 
 ## Testing the Complete Flow
+
+### Test the website locally
+
+`test/local-ui.sh` deploys the TestNet on an anvil fork of Base Sepolia on your machine, so you can lock mock HOT and claim it back in the website with MetaMask before deploying to Base Sepolia. Nothing goes to a live chain. It needs Foundry, and `npm ci` run at the top of the repo and in `ui/`.
+
+```bash
+test/local-ui.sh 0xYourMetaMaskAddress
+```
+
+It starts anvil on `127.0.0.1:8545`, forking `FORK_URL` (`https://sepolia.base.org` by default), so the chain ID stays 84532 and Raindex V6 and Rainlang are there. Then it runs `deploy-base-sepolia.sh all` (mock HOT, HoloLockVault, ClaimInputToken, and the claim order accepting the test signer's coupons) signed by anvil's published account 0, with its addresses in `.local-ui/deploy.env`, not your `.env`. It reads the deploy record back with `rotate-claim-signer.sh record`, gives your address 100 ETH and 10000 mock HOT, and writes `ui/.env.development.local`: the record's `PUBLIC_*` lines, `BASE_SEPOLIA_RPC_URL=http://127.0.0.1:8545`, and account 0 as the faucet's key. Only `npm run dev` reads that file; `npm run build` never does. Then it prints the next steps:
+
+1. `cd ui && npm run dev`, and open http://localhost:5173.
+2. In MetaMask, add a network with RPC URL `http://127.0.0.1:8545` and chain ID 84532 (or add that RPC URL to an existing Base Sepolia network and select it), and import the mock HOT token it prints.
+3. Lock on `/lock`. Then make a coupon, from `ui/`, and open the claim link it prints:
+
+   ```bash
+   npm run make-coupon -- --recipient 0xYourMetaMaskAddress --amount 5
+   ```
+
+   `make-coupon` signs as the test signer, whose key is public in `src/Constants.sol`, for the claim order in `ui/.env.development.local`. `--expiry <unix seconds>` and `--nonce <n>` override its defaults: a week from the chain's time, and a random nonce. It refuses mainnet (chain 1, or `PUBLIC_NETWORK=mainnet`), and any chain but Base Sepolia. A claim pays out of what has been locked, so lock at least the coupon's amount first.
+4. `test/local-ui.sh stop` stops anvil. Each start deploys afresh, so run the script again after a stop, and clear MetaMask's activity for the account (Settings > Advanced > Clear activity tab data), whose nonces are then stale.
 
 ### Lock Flow (HOT -> Bridged HOT)
 

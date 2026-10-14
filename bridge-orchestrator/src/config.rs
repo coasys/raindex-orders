@@ -66,8 +66,8 @@ impl Network {
 /// TestNet's values: a base-sepolia run takes each one it is not given. Mainnet has none,
 /// so a mainnet run names every value it lacks. Raindex V6 and the Rainlang
 /// contracts are at the same address on every chain, Base Sepolia included.
-/// TestNet's mock HOT, vault and claim order are not deployed on Base Sepolia
-/// yet, so a base-sepolia run names those too.
+/// TestNet's mock HOT, vault and claim order are chain-specific, and the
+/// orchestrator has no defaults for them, so a base-sepolia run names those too.
 const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
     ("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),
     (
@@ -816,8 +816,8 @@ mod tests {
         assert_eq!(mainnet.confirmations, 5);
     }
 
-    /// TestNet's RPC is a default; its vault is not deployed on Raindex V6
-    /// yet, so a base-sepolia run names it.
+    /// TestNet's RPC is a default; its vault is chain-specific and has no
+    /// default, so a base-sepolia run names it.
     #[test]
     fn an_unset_network_is_sepolia_with_testnet_values() {
         for unset in [vec![], vec![("NETWORK", "")]] {

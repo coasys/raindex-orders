@@ -56,11 +56,15 @@ export function unpackFloat(word: bigint): { coefficient: bigint; exponent: bigi
 export function floatToWei(word: bigint): bigint {
 	const { coefficient, exponent } = unpackFloat(word)
 	if (coefficient < 0n) throw new Error('The amount is negative')
+	// Zero at any exponent, which 10 cannot be raised to past the BigInt limit.
+	if (coefficient === 0n) return 0n
 	const scale = exponent + HOT_DECIMALS
 	if (scale >= 0n) {
-		if (scale > 77n && coefficient !== 0n) throw new Error('The amount is too large')
+		if (scale > 77n) throw new Error('The amount is too large')
 		return coefficient * 10n ** scale
 	}
+	// A coefficient is below 10^68, so no power of 10 past 10^77 divides it.
+	if (-scale > 77n) throw new Error('The amount is not a whole number of wei')
 	const divisor = 10n ** -scale
 	if (coefficient % divisor !== 0n) throw new Error('The amount is not a whole number of wei')
 	return coefficient / divisor

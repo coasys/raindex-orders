@@ -18,7 +18,7 @@ This document describes the architecture of the two-way bridge between HOT token
 | Bridge Orchestrator (Rust) | Complete | `bridge-orchestrator/` |
 | Web UI | Complete | `ui/` |
 | Deployment Scripts | Complete | `deploy-base-sepolia.sh`, `deploy-mainnet.sh`, `script/` |
-| TestNet on Base Sepolia | Pending deploy | `deploy-base-sepolia.sh` |
+| TestNet on Base Sepolia | Deployed ([addresses](./README.md#testnet-on-base-sepolia)) | `deploy-base-sepolia.sh` |
 | Foundry Tests | Complete | `test/` |
 | Holochain Integration | Pending | - |
 
@@ -333,7 +333,7 @@ The release Rain deployed on Ethereum mainnet and Base Sepolia, at the same addr
 | Test Signer | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
 | Vault ID | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
 
-The TestNet moved from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532). Its mock HOT, HoloLockVault, ClaimInputToken and claim order are not deployed there yet: `deploy-base-sepolia.sh` deploys them and keeps their addresses in `.env` ([DEPLOY.md](./DEPLOY.md#deploy-the-testnet-on-base-sepolia)). The old Sepolia bridge, on OrderBookV3, does not carry over.
+The TestNet moved from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532). Its mock HOT, HoloLockVault, ClaimInputToken and claim order are deployed there by `deploy-base-sepolia.sh` ([DEPLOY.md](./DEPLOY.md#deploy-the-testnet-on-base-sepolia)), at the [addresses in the README](./README.md#testnet-on-base-sepolia). The old Sepolia bridge, on OrderBookV3, does not carry over.
 
 ---
 

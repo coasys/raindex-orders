@@ -62,7 +62,11 @@ contract TestClaimBaseSepolia is Test, SignContext {
     bytes32 internal orderHash;
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("RPC_URL_BASE_SEPOLIA", string("https://base-sepolia-rpc.publicnode.com")));
+        // FORK_BLOCK_BASE_SEPOLIA pins the fork to a block; unset, it is the latest.
+        string memory rpc = vm.envOr("RPC_URL_BASE_SEPOLIA", string("https://base-sepolia-rpc.publicnode.com"));
+        uint256 forkBlock = vm.envOr("FORK_BLOCK_BASE_SEPOLIA", uint256(0));
+        if (forkBlock == 0) vm.createSelectFork(rpc);
+        else vm.createSelectFork(rpc, forkBlock);
         assertEq(block.chainid, 84532, "the fork is not Base Sepolia");
         // Deployed on the fork: a contract made before the fork is selected is not there.
         scripts = new ClaimOrderHarness();
@@ -93,21 +97,22 @@ contract TestClaimBaseSepolia is Test, SignContext {
         vm.stopPrank();
     }
 
-    function coupon(uint256 amount, uint256 expiry, uint256 nonce) internal view returns (SignedContextV1 memory) {
-        return signContext(
-            signerKey,
-            LibCoupon.words(
-                claimer,
-                amount,
-                expiry,
-                orderHash,
-                address(vault),
-                address(RAINDEX),
-                address(token),
-                HOLO_VAULT_ID,
-                bytes32(nonce)
-            )
+    function words(uint256 amount, uint256 expiry, uint256 nonce) internal view returns (bytes32[] memory) {
+        return LibCoupon.words(
+            claimer,
+            amount,
+            expiry,
+            orderHash,
+            address(vault),
+            address(RAINDEX),
+            address(token),
+            HOLO_VAULT_ID,
+            bytes32(nonce)
         );
+    }
+
+    function coupon(uint256 amount, uint256 expiry, uint256 nonce) internal view returns (SignedContextV1 memory) {
+        return signContext(signerKey, words(amount, expiry, nonce));
     }
 
     /// The claim as the website sends it: takeOrders4 for exactly `amount` of HOT.
@@ -163,7 +168,7 @@ contract TestClaimBaseSepolia is Test, SignContext {
     function testACouponFromAnotherSignerFails() public {
         lock(100e18);
         (, uint256 otherKey) = makeAddrAndKey("not the coupon signer");
-        SignedContextV1 memory other = signContext(otherKey, coupon(40e18, block.timestamp + 7 days, 2).context);
+        SignedContextV1 memory other = signContext(otherKey, words(40e18, block.timestamp + 7 days, 2));
 
         claimFails(other, 40e18, "Wrong signer");
     }

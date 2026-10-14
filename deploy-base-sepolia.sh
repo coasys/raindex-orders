@@ -33,17 +33,25 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Load environment
-if [ -f .env ]; then
-    source .env
+# Load environment: ENV_FILE, .env by default, holds the addresses and gets
+# each one this script deploys. They are exported, as forge reads only .env itself.
+ENV_FILE="${ENV_FILE:-.env}"
+load_env() {
+    set -a
+    # shellcheck source=/dev/null
+    source "$ENV_FILE"
+    set +a
+}
+if [ -f "$ENV_FILE" ]; then
+    load_env
 else
-    echo -e "${RED}Error: .env file not found${NC}"
-    echo "Please copy .env.example to .env"
+    echo -e "${RED}Error: $ENV_FILE file not found${NC}"
+    echo "Please copy .env.example to $ENV_FILE"
     exit 1
 fi
 
 if [ -n "$PRIVATE_KEY" ]; then
-    echo -e "${RED}Error: remove PRIVATE_KEY from .env. Pass --account <keystore> or --ledger instead.${NC}"
+    echo -e "${RED}Error: remove PRIVATE_KEY from $ENV_FILE. Pass --account <keystore> or --ledger instead.${NC}"
     exit 1
 fi
 
@@ -85,11 +93,11 @@ fi
 echo ""
 
 set_env() {
-    if grep -q "^$1=" .env; then
-        sed -i "s|^$1=.*|$1=$2|" .env
+    if grep -q "^$1=" "$ENV_FILE"; then
+        sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
     else
-        [ -z "$(tail -c1 .env)" ] || echo >> .env
-        echo "$1=$2" >> .env
+        [ -z "$(tail -c1 "$ENV_FILE")" ] || echo >> "$ENV_FILE"
+        echo "$1=$2" >> "$ENV_FILE"
     fi
 }
 
@@ -104,7 +112,7 @@ deploy_token() {
     if [ -n "$TOKEN_ADDR" ]; then
         echo -e "${GREEN}MockHOT deployed at: $TOKEN_ADDR${NC}"
         set_env TOKEN_ADDRESS "$TOKEN_ADDR"
-        echo -e "${GREEN}Updated .env with TOKEN_ADDRESS${NC}"
+        echo -e "${GREEN}Updated $ENV_FILE with TOKEN_ADDRESS${NC}"
     else
         die "Could not extract token address from output"
     fi
@@ -114,7 +122,7 @@ deploy_vault() {
     echo -e "${YELLOW}=== Step 2: Deploying HoloLockVault ===${NC}"
 
     if [ -z "$TOKEN_ADDRESS" ]; then
-        echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
+        echo -e "${RED}Error: TOKEN_ADDRESS not set in $ENV_FILE${NC}"
         echo "Run step 1 first, or set TOKEN_ADDRESS to an existing token on Base Sepolia"
         exit 1
     fi
@@ -132,7 +140,7 @@ deploy_vault() {
         echo -e "${GREEN}ClaimInputToken deployed at: $INPUT_TOKEN_ADDR${NC}"
         set_env BASE_SEPOLIA_LOCK_VAULT_ADDRESS "$VAULT_ADDR"
         set_env CLAIM_INPUT_TOKEN "$INPUT_TOKEN_ADDR"
-        echo -e "${GREEN}Updated .env with BASE_SEPOLIA_LOCK_VAULT_ADDRESS and CLAIM_INPUT_TOKEN${NC}"
+        echo -e "${GREEN}Updated $ENV_FILE with BASE_SEPOLIA_LOCK_VAULT_ADDRESS and CLAIM_INPUT_TOKEN${NC}"
     else
         die "Could not extract the vault and claim input token addresses from output"
     fi
@@ -142,7 +150,7 @@ mint_tokens() {
     echo -e "${YELLOW}=== Step 3: Minting Test Tokens ===${NC}"
 
     if [ -z "$TOKEN_ADDRESS" ]; then
-        echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
+        echo -e "${RED}Error: TOKEN_ADDRESS not set in $ENV_FILE${NC}"
         exit 1
     fi
 
@@ -168,7 +176,7 @@ deploy_order_via_vault() {
     echo -e "${GREEN}This makes the vault the order owner, so claims use the same vault as locks.${NC}"
 
     if [ -z "$BASE_SEPOLIA_LOCK_VAULT_ADDRESS" ] || [ -z "$CLAIM_INPUT_TOKEN" ]; then
-        echo -e "${RED}Error: BASE_SEPOLIA_LOCK_VAULT_ADDRESS or CLAIM_INPUT_TOKEN not set in .env${NC}"
+        echo -e "${RED}Error: BASE_SEPOLIA_LOCK_VAULT_ADDRESS or CLAIM_INPUT_TOKEN not set in $ENV_FILE${NC}"
         echo "Deploy the vault first with: ./deploy-base-sepolia.sh vault"
         exit 1
     fi
@@ -193,9 +201,9 @@ deploy_order_via_vault() {
         echo -e "${GREEN}Order deployed via vault! Hash: $ORDER_HASH_VAL${NC}"
         set_env ORDER_HASH "$ORDER_HASH_VAL"
         set_env ORDER_OWNER "$BASE_SEPOLIA_LOCK_VAULT_ADDRESS"
-        echo -e "${GREEN}Updated .env with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
+        echo -e "${GREEN}Updated $ENV_FILE with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
     else
-        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Etherscan, and set ORDER_OWNER to $BASE_SEPOLIA_LOCK_VAULT_ADDRESS."
+        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Basescan (https://sepolia.basescan.org), and set ORDER_OWNER to $BASE_SEPOLIA_LOCK_VAULT_ADDRESS."
     fi
 }
 
@@ -239,13 +247,13 @@ case "$STEP" in
     all)
         deploy_token
         echo ""
-        source .env
+        load_env
         deploy_vault
         echo ""
-        source .env
+        load_env
         mint_tokens
         echo ""
-        source .env
+        load_env
         deploy_order_via_vault
         ;;
     status)

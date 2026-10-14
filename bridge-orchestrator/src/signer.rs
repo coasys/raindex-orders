@@ -428,8 +428,12 @@ impl CouponSigner {
     }
 }
 
-/// The largest integer a float of exponent 0 holds: its coefficient is an int224.
-const MAX_EXPIRY: U256 = U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 33]);
+/// The largest coefficient a decimal float holds: int224::MAX.
+const MAX_FLOAT_COEFFICIENT: U256 =
+    U256::from_limbs([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 33]);
+
+/// The largest integer a float of exponent 0 holds.
+const MAX_EXPIRY: U256 = MAX_FLOAT_COEFFICIENT;
 
 /// The coupon as the website reads it: the signer, the signature, then each
 /// context word as a decimal number, all separated by commas.
@@ -453,7 +457,7 @@ fn serialize(coupon: &SignedCoupon) -> String {
 /// coefficient is an int224, which no HOT amount comes near.
 pub(crate) fn amount_word(wei: U256) -> Result<B256> {
     anyhow::ensure!(
-        wei <= MAX_EXPIRY,
+        wei <= MAX_FLOAT_COEFFICIENT,
         "the amount {wei} wei is too large for a decimal float"
     );
     let exponent = (-(HOT_DECIMALS as i32)) as u32;
@@ -846,7 +850,7 @@ mod tests {
 
     /// TestNet's values are the ones the same on every chain: the orderbook, the
     /// interpreter, the store, the vault ID and the test signer. Its mock HOT,
-    /// vault and claim order are not deployed on Base Sepolia yet, so a
+    /// vault and claim order are chain-specific and have no defaults, so a
     /// base-sepolia run names those as mainnet does.
     #[test]
     fn base_sepolia_takes_testnet_values_for_what_is_the_same_on_every_chain() {
