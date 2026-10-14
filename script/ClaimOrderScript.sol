@@ -12,6 +12,7 @@ import {
 } from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {ClaimInputToken} from "src/ClaimInputToken.sol";
+import {ICompatibilityFallbackHandler, LibSafeSetup} from "./Safe.sol";
 import {
     RAINDEX,
     RAINDEX_CODEHASH,
@@ -151,6 +152,37 @@ abstract contract ClaimOrderScript is Script {
             require(
                 isSafe && threshold >= 2 && threshold <= 20,
                 "VALID_SIGNER is a contract but not a Safe whose threshold is 2 to 20"
+            );
+            require(
+                hashesSafeMessages(signer),
+                "VALID_SIGNER is a Safe whose fallback handler does not hash coupons as Safe's CompatibilityFallbackHandler does, so it would refuse every coupon: set that handler on it (docs/enable-multisig.md)"
+            );
+        }
+    }
+
+    /// Whether the Safe `safe` answers EIP-1271 for coupons: its fallback
+    /// handler, asked through the Safe, hashes a digest into the SafeMessage hash
+    /// its owners sign, on this chain. A Safe with no handler, or another, fails.
+    function hashesSafeMessages(address safe) internal view returns (bool) {
+        bytes32 digest = keccak256("a coupon digest");
+        (bool answered, bytes memory answer) =
+            safe.staticcall(abi.encodeCall(ICompatibilityFallbackHandler.getMessageHash, (abi.encode(digest))));
+        return answered && answer.length == 32
+            && abi.decode(answer, (bytes32)) == LibSafeSetup.messageHash(block.chainid, safe, digest);
+    }
+
+    /// Logs whether one Safe holds both roles: the vault admin and the coupon
+    /// signer. That is the launch shape (docs/enable-multisig.md): the owners who
+    /// can sign a coupon could take the vault's HOT either way, and a coupon's
+    /// owner signatures cannot pass as an admin transaction's.
+    function logRoles(address admin, address signer) internal pure {
+        if (admin == signer) {
+            console2.log(
+                string.concat(
+                    "VALID_SIGNER is ADMIN_ADDRESS ",
+                    vm.toString(admin),
+                    ": one Safe is the vault admin and the coupon signer"
+                )
             );
         }
     }
