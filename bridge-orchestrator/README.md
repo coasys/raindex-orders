@@ -32,20 +32,26 @@ refuses to start, naming each variable at fault, when:
 - the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
   `CLAIM_*` values describe does not hash to `ORDER_HASH`
 - `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
-- `SIGNER_PRIVATE_KEY` and `SAFE_OWNER_KEYS` are both set, or neither
+- `SIGNER_PRIVATE_KEY` is set with `SAFE_OWNER_KEYS` or `SAFE_OWNER_SERVICES`,
+  or none of them is set
 - `CLAIM_SIGNER` is a contract, such as a Safe, and `SIGNER_PRIVATE_KEY` is
   set: a key cannot sign for it
-- `CLAIM_SIGNER` is a key and `SAFE_OWNER_KEYS` is set
+- `CLAIM_SIGNER` is a key and `SAFE_OWNER_KEYS` or `SAFE_OWNER_SERVICES` is set
 - `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
-- `CLAIM_SIGNER` is a Safe and `SAFE_OWNER_KEYS` does not hold as many keys as
-  its threshold, holds a key that is not one of its owners, or holds one
-  twice; or `CLAIM_SIGNER` does not answer as a Safe, or does not sign under
-  the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s chain
+- `CLAIM_SIGNER` is a Safe and `SAFE_OWNER_KEYS` holds more keys than its
+  threshold, a key that is not one of its owners, or one twice;
+  `SAFE_OWNER_SERVICES` names an address that is not one of its owners, or a
+  service that answers `GET /signer` for another owner, Safe or chain; fewer
+  owners than its threshold can sign now (a service that does not answer is
+  logged and left out); or `CLAIM_SIGNER` does not answer as a Safe, or does
+  not sign under the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s
+  chain
 - the claim order does not accept a coupon signed with that key, or by those
   owners for the Safe. `run` simulates `takeOrders4` with a one-wei coupon to
   the signer, and starts only if the order pays it, or answers `MinimumIO`
-  because its vault is empty. For a Safe, that simulation runs the Safe's own
-  `isValidSignature` over the owners' signatures.
+  because its vault is empty. For a Safe, the probe is signed by M owners, the
+  signer services among them, the Safe's own `isValidSignature` must accept
+  them, and the simulated claim with M-1 of them must fail.
 - on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
   signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
@@ -346,8 +352,9 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
-| `SIGNER_PRIVATE_KEY` | One of the two | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
-| `SAFE_OWNER_KEYS` | One of the two | -- The keys of as many owners of `CLAIM_SIGNER` as its threshold, separated by commas, when it is a Safe. The orchestrator signs each coupon as all of them: it is one party, however many keys it holds ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SIGNER_PRIVATE_KEY` | For a key | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
+| `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 20 seconds each, takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)) |
 | `ORDER_HASH` | Yes | -- |
 | `ORDER_OWNER` | Yes | -- (the vault) |
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |
