@@ -593,7 +593,8 @@ grep -qF "UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes: ADMIN_ADDRESS $admin is one key, wh
 read_record "$work/unsafe.log"
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/unsafe.log") == "$signer_safe" ]] ||
 	fail "the deploy record does not name the signer Safe"
-expect_startup "$work/unsafe.log" "for the signer Safe as the coupon signer from the deploy" SAFE_OWNER_KEYS="$two_owner_keys"
+expect_startup "$work/unsafe.log" "for the signer Safe as the coupon signer from the deploy" \
+	SAFE_OWNER_KEYS="$two_owner_keys" UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes
 ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
 	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
 	ADMIN_ADDRESS=$admin SIGNER_SAFE=$signer_safe HOLO_BRIDGE_DEPLOYER=$bridge_deployer \
