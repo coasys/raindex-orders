@@ -803,6 +803,11 @@ async fn the_worked_example_in_the_signer_service_doc() {
         keccak256(withdrawal().get_raw_39()),
         "the nonce is keccak256 of the withdrawal's 39 bytes"
     );
+    assert_eq!(
+        context[1],
+        amount_of("1.5").unwrap(),
+        "the amount word is the spend's \"1.5\" HOT in wei, exponent -18"
+    );
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let url = chain.serve().await;
     let service = owner_service(owner_key(0)).await;
@@ -885,4 +890,57 @@ async fn a_signer_service_answer_over_the_size_cap_is_refused() {
         message,
         format!("answered more than {MAX_ANSWER_BYTES} bytes")
     );
+}
+
+/// Word 1 as the orchestrator makes it from a spend's HOT amount, a decimal
+/// string: `None` where it refuses the amount.
+fn amount_of(amount: &str) -> Option<B256> {
+    let payout = Payout::new("0x1111111111111111111111111111111111111111", amount).ok()?;
+    Some(crate::signer::amount_word(payout.wei).unwrap())
+}
+
+/// The amount conversion table in docs/signer-service.md ("The amount"): each
+/// decimal string's word, and the strings that are refused.
+#[test]
+fn the_amount_vectors_in_the_signer_service_doc() {
+    for (amount, word) in [
+        (
+            "1.5",
+            "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+        ),
+        (
+            "5",
+            "0xffffffee00000000000000000000000000000000000000004563918244f40000",
+        ),
+        (
+            "0.000001",
+            "0xffffffee0000000000000000000000000000000000000000000000e8d4a51000",
+        ),
+        (
+            "0.000000000000000001",
+            "0xffffffee00000000000000000000000000000000000000000000000000000001",
+        ),
+    ] {
+        assert_eq!(amount_of(amount), Some(word.parse().unwrap()), "{amount:?}");
+    }
+    for refused in [
+        "0",
+        "0.0",
+        "-1",
+        "1.0000000000000000001",
+        "1e18",
+        ".5",
+        "5.",
+        "",
+    ] {
+        assert_eq!(amount_of(refused), None, "{refused:?}");
+    }
+    // A spend's amount is a ZFuel, which serialises as such a string, with at
+    // most 6 fractional digits and no trailing zeros.
+    for amount in ["1.5", "5", "0.000001"] {
+        assert_eq!(
+            amount.parse::<zfuel::fuel::ZFuel>().unwrap().to_string(),
+            amount
+        );
+    }
 }

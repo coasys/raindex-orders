@@ -59,15 +59,15 @@ Answers:
 409 { "code": "amount_mismatch", "reason": "the amount 40 HOT is not the spend's 30 HOT" }
 ```
 
-`signature` is 65 bytes: r, s, then v as 27 or 28, over `safeMessageHash` with no prefix. That is what a wallet's `eth_signTypedData_v4` of the typed data below returns, and what `sign(hash)` returns in most key libraries. The orchestrator also takes v as 0 or 1, and Safe's `eth_sign` form: v as 31 or 32, over the EIP-191 hash of `safeMessageHash`.
+`signature` is 65 bytes: r, s, then v as 27 or 28, over `safeMessageHash` with no prefix. That is what a wallet's `eth_signTypedData_v4` of the typed data below returns, and what `sign(hash)` returns in most key libraries. The orchestrator also takes v as 0 or 1, and Safe's `eth_sign` form: v as 31 or 32, over the EIP-191 hash of `safeMessageHash`. Any s is fine, high or low: Safe's `ecrecover` does not require a low s.
 
 A refusal is HTTP 409 with a `code` from this list and a `reason` for people. The orchestrator logs the code and the first 200 characters of the reason.
 
 | code | when |
 |---|---|
 | `unknown_withdrawal` | the service's node does not hold a spend with that action hash |
-| `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below) |
-| `amount_mismatch` | word 1 is not the spend's amount |
+| `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
+| `amount_mismatch` | word 1 is not the word the service makes of the spend's amount |
 | `recipient_mismatch` | word 0 is not the spend's withdraw-to address |
 | `expiry_out_of_range` | word 2 is in the past, or further ahead than the agreed maximum |
 | `nonce_mismatch` | word 8 is not keccak256 of the withdrawal's 39 bytes |
@@ -179,14 +179,35 @@ export async function signAsOwner(key, hash) {
 Each check uses the service's own sources: its own Holochain node, or one it trusts, and a copy of the deploy record it was given when it was set up, never the request.
 
 1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
-2. **The amount.** Word 1 is exactly the spend's amount in the HOT unit (`HOT_UNIT_INDEX`), in wei, encoded as above. Not more, not another unit.
+2. **The amount.** Word 1 is exactly the spend's amount in the HOT unit, converted as in [the amount](#the-amount) below. Not more, not another unit.
 3. **The recipient.** Word 0 is the `withdraw_to_address` in the spend's attached payload.
 4. **The expiry.** Word 2 is in the future and no more than the agreed maximum ahead. The orchestrator's `EXPIRY_SECONDS` is 7 days by default.
-5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and the claim order lets only one of them claim, so signing the same withdrawal again is safe. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
+5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and one claim order lets only one of them claim, so signing the same withdrawal again is safe. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
 6. **The order.** Words 3 to 7 equal the service's copy of the deploy record, and `safe`, `chainId` and `owner` are what the service signs for.
 7. **The hashes.** The service computes `couponDigest` and `safeMessageHash` from the words it checked, and refuses with `hash_mismatch` if the request's differ. It signs its own `safeMessageHash`, and nothing else.
 
 If any check fails, the service refuses with its code and alerts a person. A refusal means the orchestrator and the service see the network differently: a bug, or an attack.
+
+### The amount
+
+The spend's `amount` maps each unit index, as a string, to a decimal string: a ZFuel, as `rave_engine` serialises it. The HOT amount is the entry under the bridge's `HOT_UNIT_INDEX`. The service converts it as the orchestrator does (`hot_in_wei` in `bridge-orchestrator/src/signer.rs`):
+
+- **Format.** Digits, optionally a `.` and more digits: `5`, `1.5`, `0.000001`. Digits are required on both sides of a `.`, and there is no sign, exponent, space or hex.
+- **Exact.** wei = the decimal × 10^18, with no rounding. At most 18 fractional digits; a ZFuel holds at most 6, so every real amount converts exactly.
+- **Not zero.**
+- **The word** is `ffffffee` (exponent -18) and then the wei as a 224-bit integer, as in the word table above. The service builds this word itself and compares all 32 bytes with word 1. It does not compare numeric values, as a float has more than one encoding of a value.
+
+A spend with no HOT entry, or one that breaks these rules, is refused with `not_a_withdrawal`, since no coupon can pay it. A word 1 other than the service's own word is refused with `amount_mismatch`. `bridge-orchestrator/src/signer/safe/tests.rs` pins these vectors:
+
+| amount | word 1 |
+|---|---|
+| `"1.5"` | `0xffffffee000000000000000000000000000000000000000014d1120d7b160000` |
+| `"5"` | `0xffffffee00000000000000000000000000000000000000004563918244f40000` |
+| `"0.000001"` | `0xffffffee0000000000000000000000000000000000000000000000e8d4a51000` |
+| `"0.000000000000000001"` | `0xffffffee00000000000000000000000000000000000000000000000000000001` |
+| `"0"`, `"0.0"`, `"-1"`, `"1e18"`, `".5"`, `"5."`, `"1.0000000000000000001"` | refused |
+
+The last vector has more digits than a ZFuel holds. It tests the conversion, not a spend that can exist.
 
 ### The startup probe
 
