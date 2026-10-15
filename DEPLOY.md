@@ -93,6 +93,23 @@ cargo run -- run
 npm run build
 ```
 
+### Or: a fresh TestNet with one Safe as the vault admin and the coupon signer
+
+This is the mainnet shape on Base Sepolia. `all-safe` deploys mock HOT, mints some to the wallet, creates the bridge's Safe (or finds it), and deploys the vault, its `ClaimInputToken` and the claim order in one `HoloBridgeDeployer` transaction, with the Safe as the vault admin from the first block and as the claim order's coupon signer:
+
+```bash
+SAFE_OWNERS=0x...,0x...,0x... SAFE_THRESHOLD=2 ./deploy-base-sepolia.sh all-safe --account deployer
+```
+
+The steps run one by one too: `token`, `mint`, `safe`, `bridge`.
+
+- **`safe`** creates the Safe through Safe's own SafeProxyFactory 1.4.1, with the SafeL2 1.4.1 singleton (the one Safe's app uses on Base) and the CompatibilityFallbackHandler, which answers the claim order's EIP-1271 question. It refuses a threshold below 2 or of half the owners or fewer (every two sets of signers must share an owner, [docs/signer-service.md](./docs/signer-service.md#one-order-per-withdrawal)), an owner that is a contract, and an owner named twice, and checks the factory, singletons and handler are Safe's code, byte for byte. The address follows from the owners, the threshold and `SAFE_SALT_NONCE` (a fixed default unless set), so it is printed before anything is sent, and a second run with the same inputs finds the Safe and sends nothing. It writes `ADMIN_ADDRESS`, `ADMIN_SAFE_THRESHOLD`, `ADMIN_SAFE_OWNERS` and `VALID_SIGNER` to `.env`.
+- **`bridge`** runs `script/DeployBridge.s.sol:DeployBaseSepoliaBridge`, the mainnet deploy's one transaction with `TOKEN_ADDRESS` as HOT, then reads the deploy record back from the chain and writes `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `CLAIM_INPUT_TOKEN`, `ORDER_HASH`, `ORDER_OWNER`, `CLAIM_SIGNER` and `CLAIM_BYTECODE` to `.env`. It refuses what the mainnet deploy refuses (below), except the test signer.
+
+The orchestrator then runs with `SAFE_OWNER_SERVICES`, the owners' signer services, or `SAFE_OWNER_KEYS`, owner keys it holds, in place of `SIGNER_PRIVATE_KEY` ([docs/signer-service.md](./docs/signer-service.md)). The website takes the record's values as for any new TestNet deploy, `PUBLIC_CLAIM_SIGNER` being the Safe.
+
+`test/base-sepolia-safe-rehearsal.sh` runs `all-safe` on an anvil fork of Base Sepolia (`FORK_URL`, `https://sepolia.base.org` unless set), finds the Safe again without sending, starts the orchestrator against the fork with the owners at mock signer services and with owner keys, and proves on the fork that two owner signatures claim, one or a stranger's do not, and the Safe's admin calls need two owners.
+
 ### Deployed Contract Addresses (Base Sepolia)
 
 | Contract | Address on Base Sepolia |
@@ -109,20 +126,31 @@ The previous TestNet, on Ethereum Sepolia against OrderBookV3 (vault `0xE3E064e3
 
 ## Mainnet deploy
 
-`deploy-mainnet.sh` deploys the bridge on Ethereum mainnet against the RaindexV6 Rain deployed there. It deploys no orderbook.
+`deploy-mainnet.sh` deploys the bridge on Ethereum mainnet against the RaindexV6 Rain deployed there, in one transaction, with a Safe as the vault admin from that transaction on. It deploys no orderbook. At launch one Safe is both the vault admin and the coupon signer ([docs/enable-multisig.md](./docs/enable-multisig.md#one-safe-for-both-roles)).
+
+First the Safe. `deploy-mainnet.sh safe` creates it through Safe's own SafeProxyFactory 1.4.1, with the Safe 1.4.1 singleton and the CompatibilityFallbackHandler, or finds it if it exists with those owners and threshold. Its address follows from the owners, the threshold and `SAFE_SALT_NONCE` (a fixed default unless set), so it is printed before anything is sent, and a second run sends nothing. It refuses a threshold below 2, a contract or a repeated owner, and Safe contracts whose code is not Safe's release, and prints the inputs the deploy takes:
+
+```bash
+ETH_RPC_URL=<an Ethereum RPC> SAFE_OWNERS=0x...,0x...,0x... SAFE_THRESHOLD=2 \
+./deploy-mainnet.sh safe --ledger       # or --account <keystore>
+```
+
+An existing Safe made in the Safe app works too, if it is Safe's SafeProxy 1.4.1 on the Safe 1.4.1 or SafeL2 1.4.1 singleton, with the CompatibilityFallbackHandler 1.4.1 and no module or guard (the deploy checks; [docs/enable-multisig.md](./docs/enable-multisig.md#create-the-safe)). Then the bridge:
 
 ```bash
 npm ci   # compose-rainlang.mjs, which composes the claim expression
 ETH_RPC_URL=<an Ethereum RPC> \
-ADMIN_ADDRESS=<the vault's final admin> \
-VALID_SIGNER=<the coupon signer's address> \
+ADMIN_ADDRESS=<the Safe> \
+ADMIN_SAFE_THRESHOLD=<its threshold> ADMIN_SAFE_OWNERS=<its owners, separated by commas> \
+VALID_SIGNER=<the Safe; or a key, or another Safe> \
 ./deploy-mainnet.sh --ledger            # or --account <keystore>
 ```
 
-- **Refusals.** Before it sends anything, it refuses a chain other than 1, a missing input, a raw key option such as `--private-key`, an `ADMIN_ADDRESS` equal to the deployer, a `VALID_SIGNER` equal to the test signer, a `VALID_SIGNER` with an EIP-7702 delegation (Raindex V6 asks a delegated key's delegate for a coupon's signature, never the key), and a Rain contract that is not the release on the chain.
-- **What it sends.** A `ClaimInputToken`, then `HoloLockVault(HOT, RaindexV6, HOLO_VAULT_ID, deployer, MIN_LOCK_AMOUNT)`, then the claim order through the vault, then `setAdmin(ADMIN_ADDRESS)`. It sends them one at a time, each after the one before has landed.
-- **The record.** It reads back the vault's token, orderbook, vault ID and admin, and the claim order, from the chain. Then it prints the deploy record under the variable names the orchestrator and the website take, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN` among them.
-- **Failure.** A run cannot be resumed. A run that stops part way prints the transactions it sent. A new run deploys a new vault.
+- **Refusals.** Before it sends anything, it refuses a chain other than 1, a missing input, a raw key option such as `--private-key`, an `ADMIN_ADDRESS` equal to the deployer, a `VALID_SIGNER` equal to the test signer, a `VALID_SIGNER` with an EIP-7702 delegation (Raindex V6 asks a delegated key's delegate for a coupon's signature, never the key), a contract `VALID_SIGNER` that is not a Safe of threshold 2 to 20, a Safe `VALID_SIGNER` whose threshold is half its owners or fewer, a Safe `VALID_SIGNER` whose fallback handler does not hash coupons as the CompatibilityFallbackHandler does (it would refuse every coupon), a Safe `VALID_SIGNER` or `ADMIN_ADDRESS` that is not Safe's SafeProxy 1.4.1 on the Safe 1.4.1 or SafeL2 1.4.1 singleton with the CompatibilityFallbackHandler 1.4.1, or that has a module or a guard (a module acts as the Safe with no owner's signature), and a Rain contract that is not the release on the chain. It refuses an `ADMIN_ADDRESS` that is a key, a contract that is not a Safe, or a Safe of threshold 1, so that no one key controls the vault; `UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes` lets a key or a threshold-1 Safe through, and is logged. For a Safe admin it reads the Safe's threshold and owners, prints them, and refuses ones other than `ADMIN_SAFE_THRESHOLD` and `ADMIN_SAFE_OWNERS`: the operator states which Safe is meant, and a wrong address is caught before the vault goes to it.
+- **What it sends.** One transaction: a `HoloBridgeDeployer`, whose constructor deploys the `ClaimInputToken`, then `HoloLockVault(HOT, RaindexV6, HOLO_VAULT_ID, <itself>, MIN_LOCK_AMOUNT)`, adds the claim order through the vault, and calls `setAdmin(ADMIN_ADDRESS)`. The deployer contract is the vault's admin only inside that transaction and holds no right after it; the key that sends it is never the admin. The transaction reverts as a whole if any step fails, leaving nothing behind.
+- **The record.** It reads the vault from the `HoloBridgeDeployer`, reads back the vault's token, orderbook, vault ID and admin, checks that the vault's admin changed exactly once, from the deployer contract to `ADMIN_ADDRESS`, in the deploy's block, and reads the claim order. Then it prints the deploy record under the variable names the orchestrator and the website take, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN` among them. To print it again: `forge script script/DeployMainnet.s.sol:DeployMainnet --rpc-url $ETH_RPC_URL --sig 'record(address,uint256)' <HoloBridgeDeployer> <block>`.
+- **The coupon signer.** The Safe: the orchestrator runs with `SAFE_OWNER_SERVICES`, each owner's signer service, which checks each withdrawal on its own Holochain node before it signs ([docs/signer-service.md](./docs/signer-service.md)). It can also hold owner keys itself, `SAFE_OWNER_KEYS`; holding M of them is one party signing as the Safe, and when the Safe is also the vault admin each such key also approves admin transactions. On mainnet the orchestrator refuses either unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`. A key: it runs with `SIGNER_PRIVATE_KEY`. When `VALID_SIGNER` is `ADMIN_ADDRESS`, the deploy logs that one Safe holds both roles.
+- **Failure.** A run that sends its transaction and sees it revert, or not land, prints it. A new run deploys a new vault.
 
 ### Rehearse it first
 
@@ -132,7 +160,11 @@ VALID_SIGNER=<the coupon signer's address> \
 nix develop -c test/fork-rehearsal.sh   # FORK_URL sets the mainnet RPC that anvil forks
 ```
 
-It proves that the deploy sends nothing while it refuses a chain other than 1 (a plain anvil on chain 31337), a missing input, a raw key, the deployer as admin, the test signer and a signer with an EIP-7702 delegation (anvil's published accounts carry one on mainnet, so the rehearsal's coupon signers are fresh keys). Then it deploys on the fork, and proves that the orchestrator passes its startup checks with the deploy record and the coupon signer's key, and refuses another key. It proves that a lock lands in the vault, that a coupon signed as the orchestrator signs claims it back, and that nonce reuse, a wrong signer and an expired coupon fail. It proves that the admin is `ADMIN_ADDRESS` and the deployer is locked out. Last, it moves the vault admin and the coupon signer to 2 of 3 Safes, as [docs/enable-multisig.md](./docs/enable-multisig.md) describes, and proves that a coupon with two owner signatures claims and one with a single signature fails. The rotation refuses the test signer and a Safe of threshold 1, and its record refuses a signer the new order does not accept, a second order of the vault's left on the orderbook, and an order run by another interpreter. The orchestrator refuses to start for the Safe as coupon signer.
+First the launch shape. It creates the bridge's Safe, 2 of 3 fresh owner keys, with `deploy-mainnet.sh safe`, which refuses a threshold of 1 and, run again, finds the Safe and sends nothing. It creates three more Safes of anvil accounts and one with no fallback handler, then proves that the deploy sends nothing while it refuses a chain other than 1 (a plain anvil on chain 31337), a missing input, a raw key, the test signer, a signer with an EIP-7702 delegation (anvil's published accounts carry one on mainnet, so the rehearsal's coupon signers are fresh keys), a Safe of threshold 1 or a Safe with no fallback handler as the signer, a key or the deployer as the admin, a Safe of threshold 1, a contract that is not a Safe, and a stated threshold or owner list that is not the Safe's. Then it deploys with the bridge's Safe as `ADMIN_ADDRESS` and `VALID_SIGNER`, in one transaction, and starts mock signer services for the three owners (`ui/scripts/mock-signer-service.mjs`, which speaks [docs/signer-service.md](./docs/signer-service.md) and checks nothing on Holochain). The orchestrator refuses two owner keys and one key with one service unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` (those keys would be vault admin keys on the orchestrator's host), and passes its startup checks with two owner keys and the override, with the three services, with one service down, with one refusing, and with one key, one service and the override, each time with the probe signed by two owners taken and by one refused; it refuses one service left of two, a service signing with another key, a service answering for another owner, a key, and another Safe's owner keys. On the fork, a coupon with two owner signatures claims; one signature, an owner's and a stranger's, or one owner's twice fail; a nonce claims once; an expired coupon fails; a coupon's owner signatures execute no admin call; the Safe administers with two owners and not one; and the deployer, the deployer contract and each owner alone are refused every admin call.
+
+Then the separate shape, on a second deploy: the admin Safe as the vault admin and a key as the coupon signer. The orchestrator passes its startup checks with the deploy record and the coupon signer's key, refuses another key, and refuses `SAFE_OWNER_KEYS` for a key signer. It proves that a lock lands in the vault, that a coupon signed as the orchestrator signs claims it back, that nonce reuse, a wrong signer and an expired coupon fail, that the vault's admin was handed over once, from the deployer contract to the Safe, in the deploy's block, that the deployer, the deployer contract and each owner alone are refused every admin call, and that the Safe acts with two owner signatures and not with one.
+
+Then it moves the coupon signer to a 2 of 3 Safe through the admin Safe, as [docs/enable-multisig.md](./docs/enable-multisig.md) describes. The rotation refuses the test signer and a Safe of threshold 1, and its record refuses a signer the new order does not accept, a second order of the vault's left on the orderbook, and an order run by another interpreter. The orchestrator then refuses the keys of two of the Safe's three owners, which are one party, and passes its startup checks with them and `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`, through the Safe's own `isValidSignature`, and refuses a key for the Safe, one key, three, a key that is not an owner's, the admin Safe's owners, a key twice, and both key variables set. On the fork, a coupon with two owner signatures claims, and one with a single signature, with an owner's and a stranger's, with an owner's twice, or with the admin Safe's owners' fails. The website's coupon status reads a coupon the Safe's owners signed as unredeemed and two the Safe refuses as invalid, through the real Safe on the fork, then reads the first as redeemed once it is claimed (`ui/src/routes/api/coupon-status/server.fork.test.ts`). Last, a deploy with `UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes` hands the vault to a key, with the signer Safe as the coupon signer from the start.
 
 `FORK_URL` is `https://ethereum-rpc.publicnode.com` unless set.
 
@@ -326,4 +358,4 @@ What it means depends on when the coupon was signed. Coupons signed before the p
 - Keep private keys out of `.env` files and command lines: sign with `--account` or `--ledger`
 - The test signer key in this repo is for testing only, and every mainnet input refuses it
 - Who holds the coupon signer and the vault admin, and how each moves to a multisig: [docs/enable-multisig.md](./docs/enable-multisig.md)
-- The admin key controls emergency withdrawals. It can move to a Safe multisig, whose key holders follow [docs/key-holder.md](./docs/key-holder.md)
+- The vault admin controls emergency withdrawals. On mainnet it is a Safe multisig from the deploy's first transaction, whose key holders follow [docs/key-holder.md](./docs/key-holder.md)

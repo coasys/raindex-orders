@@ -14,9 +14,9 @@ import { OPTIONS, POST } from './+server'
 
 // The TestNet build's claim order: the Rainlang store, the namespace Raindex evaluates
 // the order under (keccak256 of the order owner and Raindex, as LibNamespace qualifies
-// it), and the store key the order marks a nonce at (hash(order-hash() nonce)).
+// it), and the store key the order marks a nonce at: the nonce itself, under the owner's
+// namespace, so a nonce stays used across claim order rotations.
 const STORE = '0x1aa775533e28b1d843e1a589034984e3a62005dc'
-const ORDER_HASH = 0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0bn
 const CLAIM_NAMESPACE = BigInt(
 	keccak256(
 		encodeAbiParameters(
@@ -25,8 +25,7 @@ const CLAIM_NAMESPACE = BigInt(
 		)
 	)
 )
-const storeKey = (nonce: bigint) =>
-	BigInt(keccak256(encodePacked(['uint256', 'uint256'], [ORDER_HASH, nonce])))
+const storeKey = (nonce: bigint) => nonce
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 
 const [A, B, C] = TESTNET_COUPONS

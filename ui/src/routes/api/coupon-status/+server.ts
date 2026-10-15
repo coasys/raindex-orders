@@ -14,6 +14,7 @@ import {
 	isHex,
 	keccak256,
 	maxUint256,
+	numberToHex,
 	parseAbi,
 	recoverMessageAddress,
 	stringToHex,
@@ -63,14 +64,14 @@ const orderHash = BigInt(CLAIM_ORDER.orderHash)
 
 // Raindex evaluates the claim order under the namespace
 // LibNamespace.qualifyNamespace(order owner, raindex) = keccak256(owner, raindex),
-// and src/holo-claim.rain marks a nonce used there at hash(order-hash() nonce).
+// and src/holo-claim.rain marks a nonce used there at the nonce itself: the key
+// names no order hash, so a nonce stays used across claim order rotations.
 const namespace = BigInt(
 	keccak256(
 		encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [CLAIM_ORDER.owner, orderbook])
 	)
 )
-const nonceKey = (nonce: bigint) =>
-	keccak256(encodePacked(['uint256', 'uint256'], [orderHash, nonce]))
+const nonceKey = (nonce: bigint) => numberToHex(nonce, { size: 32 })
 
 // Rainlang's IInterpreterStoreV3: keys and values are bytes32 words.
 const readAbi = parseAbi([
