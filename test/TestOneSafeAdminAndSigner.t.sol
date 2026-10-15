@@ -326,6 +326,29 @@ contract TestOneSafeAdminAndSigner is Test {
         harness.acceptAdmin(one, AdminInputs(true, 1, owners));
     }
 
+    /// A Safe of 2 of 4 has two sets of 2 owners that share none: after a claim
+    /// order rotation, owners that never signed a withdrawal could sign it
+    /// again for the new order (docs/signer-service.md#one-order-per-withdrawal).
+    /// The deploy and the rotation refuse it as the coupon signer, and take 3 of 4.
+    function testASafeWhoseThresholdIsHalfItsOwnersIsRefusedAsTheCouponSigner() public {
+        address[] memory four = new address[](4);
+        (four[0], four[1], four[2], four[3]) = (owners[0], owners[1], owners[2], makeAddr("owner 3"));
+        address half = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, LibSafeSetup.setupCall(four, 2), 5);
+        address more = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, LibSafeSetup.setupCall(four, 3), 6);
+
+        vm.expectRevert(
+            bytes(
+                string.concat(
+                    "VALID_SIGNER ",
+                    vm.toString(half),
+                    " is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal)"
+                )
+            )
+        );
+        harness.acceptSigner(half);
+        harness.acceptSigner(more);
+    }
+
     /// `safe` with `fault` is refused as the vault admin and as the coupon signer.
     function expectRefusedForBothRoles(address refused, string memory fault) internal {
         string memory why =
@@ -483,6 +506,22 @@ contract TestCreateSafe is Test {
             )
         );
         harness.found(owners, 2, 44, SAFE_SINGLETON);
+    }
+
+    /// The threshold is more than half the owners, so that every two sets of
+    /// signers share an owner (docs/signer-service.md#one-order-per-withdrawal).
+    function testTheThresholdIsMoreThanHalfTheOwners() public {
+        address[] memory four = new address[](4);
+        (four[0], four[1], four[2], four[3]) = (owners[0], owners[1], owners[2], makeAddr("owner 3"));
+        harness.acceptOwners(four, 3);
+        harness.acceptOwners(four, 4);
+
+        vm.expectRevert(
+            bytes(
+                "SAFE_THRESHOLD 2 is half the 4 SAFE_OWNERS or fewer, so two sets of 2 owners could share none and sign one withdrawal for two claim orders: it must be more than half (docs/signer-service.md#one-order-per-withdrawal)"
+            )
+        );
+        harness.acceptOwners(four, 2);
     }
 
     function testTheOwnersAreTwoToTwentyKeysNoneTwiceAndTheThresholdTwoOrMore() public {

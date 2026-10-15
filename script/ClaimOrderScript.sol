@@ -151,7 +151,12 @@ abstract contract ClaimOrderScript is Script {
     /// coupons Raindex V6 refuses (it asks any account with code through EIP-1271,
     /// never by the key's signature), and a contract signer whose signatures the
     /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
-    /// as a key's. A Safe must be one only its owners act as (`safeFault`).
+    /// as a key's. A Safe's threshold must be more than half its owners, so that
+    /// every two sets of signers share an owner: each signer service refuses a
+    /// withdrawal it signed for another claim order, and only then is one of
+    /// them in every set that could sign it for this one
+    /// (docs/signer-service.md#one-order-per-withdrawal). A Safe must be one
+    /// only its owners act as (`safeFault`).
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
         require(signer != address(0), "VALID_SIGNER must be a nonzero address");
         require(
@@ -163,10 +168,24 @@ abstract contract ClaimOrderScript is Script {
             "VALID_SIGNER has an EIP-7702 delegation, which Raindex V6 asks for a coupon's signature in place of the key: use a key with no delegation, or a Safe"
         );
         if (isContract(signer)) {
-            (bool isSafe, uint256 threshold,) = safeOf(signer);
+            (bool isSafe, uint256 threshold, address[] memory owners) = safeOf(signer);
             require(
                 isSafe && threshold >= 2 && threshold <= 20,
                 "VALID_SIGNER is a contract but not a Safe whose threshold is 2 to 20"
+            );
+            require(
+                threshold * 2 > owners.length,
+                string.concat(
+                    "VALID_SIGNER ",
+                    vm.toString(signer),
+                    " is a Safe of threshold ",
+                    vm.toString(threshold),
+                    " with ",
+                    vm.toString(owners.length),
+                    " owners, so two sets of ",
+                    vm.toString(threshold),
+                    " of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal)"
+                )
             );
             require(
                 hashesSafeMessages(signer),

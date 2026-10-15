@@ -105,7 +105,11 @@ contract CreateSafe is ClaimOrderScript {
 
     /// 2 to 20 owners, none twice, none zero, none a contract: each owner signs
     /// as a key, at a signer service or in the orchestrator. The threshold is 2
-    /// or more, so that no one key acts as the Safe, and at most the owners.
+    /// or more, so that no one key acts as the Safe, and at most the owners. It
+    /// is more than half the owners, so that every two sets of signers share an
+    /// owner: each signer service refuses a withdrawal it signed for another
+    /// claim order, and only then is one of them in every set that could sign
+    /// it for a new order (docs/signer-service.md#one-order-per-withdrawal).
     function requireOwners(address[] memory owners, uint256 threshold) internal view {
         require(
             owners.length >= 2 && owners.length <= MAX_OWNERS,
@@ -129,6 +133,18 @@ contract CreateSafe is ClaimOrderScript {
                 "SAFE_THRESHOLD is how many owners must sign, 2 to the ",
                 vm.toString(owners.length),
                 " SAFE_OWNERS lists, so that no one key acts as the Safe"
+            )
+        );
+        require(
+            threshold * 2 > owners.length,
+            string.concat(
+                "SAFE_THRESHOLD ",
+                vm.toString(threshold),
+                " is half the ",
+                vm.toString(owners.length),
+                " SAFE_OWNERS or fewer, so two sets of ",
+                vm.toString(threshold),
+                " owners could share none and sign one withdrawal for two claim orders: it must be more than half (docs/signer-service.md#one-order-per-withdrawal)"
             )
         );
     }
