@@ -1,5 +1,6 @@
 use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
-use crate::lock_flow::{format_amount, LockFlow};
+use crate::lock_flow::format_amount;
+use crate::screening::Screener;
 use crate::signer::{CouponSigner, Payout};
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::stop::{ensure_running, is_stopped, Stopped};
@@ -26,6 +27,9 @@ use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
 
 pub mod in_transit;
+mod screening;
+
+use screening::{WithdrawalGate, LOCKS_SCREENED, WITHDRAWALS_SCREENED};
 
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const WITHDRAWER_ROLE: &str = "withdrawer";
@@ -43,6 +47,8 @@ pub struct BridgeOrchestrator {
 pub struct EthereumSide {
     pub chain: Ethereum,
     pub signer: CouponSigner,
+    /// `None` with `SCREENING=off`.
+    pub screener: Option<Box<dyn Screener>>,
 }
 
 /// Severity bucket for a source-chain-pressure event. Mapped to a
@@ -107,10 +113,12 @@ struct BridgingSelection {
     coupon_bytes: usize,
     withdrawals_found: usize,
     unpayable: Vec<(Transaction, anyhow::Error)>,
+    held: usize,
 }
 
 async fn select_bridging_links(
     signer: Option<&CouponSigner>,
+    gate: &WithdrawalGate<'_>,
     bridging_agent: &AgentPubKeyB64,
     bridging_links: &[Transaction],
     coupons_budget: usize,
@@ -123,6 +131,7 @@ async fn select_bridging_links(
         coupon_bytes: 0,
         withdrawals_found: 0,
         unpayable: Vec::new(),
+        held: 0,
     };
     let mut withdrawal_capped = false;
 
@@ -154,6 +163,13 @@ async fn select_bridging_links(
             }
         };
         if withdrawal_capped {
+            continue;
+        }
+        if !gate
+            .pays(&tx.id.to_string(), terms.recipient(), &amount)
+            .await?
+        {
+            selection.held += 1;
             continue;
         }
         let coupon = signer.coupon(terms, tx.id.as_ref()).await?;
@@ -232,6 +248,8 @@ impl BridgeOrchestrator {
         let db = StateStore::open(&cfg.db_path)?;
         if let Some(side) = &ethereum {
             db.bind_vault(&format!("{:#x}", side.chain.lock_vault_address))?;
+            let screening = screening_at_start(&db, side.screener.as_deref())?;
+            info!(event = "startup.screening", "{screening}");
         }
         let recovered = db.recover_stale_items()?;
         if !recovered.is_empty() {
@@ -309,8 +327,12 @@ impl BridgeOrchestrator {
     /// S2 and S4 refresh their told sets only when a cycle reaches them, so
     /// without this a link that left during a shorter cycle would stay told.
     fn forget_unparked(&self, parked: &HashSet<String>) {
-        for told in self.told.lock().expect("told mutex poisoned").values_mut() {
-            told.retain(|id| parked.contains(id));
+        for (check, told) in self.told.lock().expect("told mutex poisoned").iter_mut() {
+            // A lock's item ID is never a parked link ID, so pruning would tell each waiting lock
+            // again every cycle.
+            if check != LOCKS_SCREENED {
+                told.retain(|id| parked.contains(id));
+            }
         }
     }
 
@@ -522,10 +544,7 @@ impl BridgeOrchestrator {
                     return Ok(());
                 }
             };
-        let lock_flow = self
-            .ethereum
-            .as_ref()
-            .map(|side| LockFlow::new(side.chain.clone(), self.db.clone(), shutdown.clone()));
+        let lock_flow = self.lock_flow(&shutdown);
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
@@ -552,14 +571,7 @@ impl BridgeOrchestrator {
             }
 
             if let Some(lock_flow) = &lock_flow {
-                if let Err(e) = lock_flow.run_cycle().await {
-                    if !is_stopped(&e) {
-                        error!(
-                            event = "bridge.lock_read_failed",
-                            "[lock-flow] cycle failed: {e:#}"
-                        );
-                    }
-                }
+                self.read_and_screen_locks(lock_flow, &shutdown).await;
             }
 
             if *shutdown.borrow() {
@@ -1110,6 +1122,7 @@ impl BridgeOrchestrator {
         let bridging_links = conductor.parked_links(&bridging_ea_id).await?;
         self.log_foreign_proofs("proof_foreign/bridging", &bridging_links);
 
+        let gate = WithdrawalGate::new(&self.db, self.screener());
         let BridgingSelection {
             deposits: deposit_rave_links,
             withdrawals: selected_withdrawal_links,
@@ -1117,8 +1130,10 @@ impl BridgeOrchestrator {
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
             unpayable,
+            held: held_withdrawals,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
+            &gate,
             &self.cfg.bridging_agent_pubkey,
             &bridging_links,
             coupons_budget,
@@ -1126,6 +1141,7 @@ impl BridgeOrchestrator {
         )
         .await?;
         self.log_unpayable(&unpayable);
+        self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
 
         let deposit_ids: HashSet<String> = deposit_rave_links
             .iter()
@@ -1182,7 +1198,8 @@ impl BridgeOrchestrator {
 
         let retained_deposit_count = retained_deposit_ids.len();
         let withdrawal_count = retained_withdrawal_ids.len();
-        let deferred_withdrawals = total_withdrawals_found - unpayable.len() - withdrawal_count;
+        let deferred_withdrawals =
+            total_withdrawals_found - unpayable.len() - held_withdrawals - withdrawal_count;
         let deferred_deposits_by_rave_cap = pre_cap_deposit_count - retained_deposit_count;
         let deferred_withdrawals_by_rave_cap = pre_cap_withdrawal_count - withdrawal_count;
 
@@ -1200,13 +1217,14 @@ impl BridgeOrchestrator {
         }
 
         info!(
-            "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={} unpayable={}",
+            "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={} unpayable={} held={}",
             total_withdrawals_found,
             withdrawal_count,
             total_withdrawals_found,
             coupon_cumulative_bytes,
             deferred_withdrawals,
-            unpayable.len()
+            unpayable.len(),
+            held_withdrawals
         );
 
         let mut succeeded_locks = 0usize;
@@ -2755,6 +2773,29 @@ fn apply_rave_link_cap(
     }
 }
 
+fn screening_at_start(db: &StateStore, screener: Option<&dyn Screener>) -> Result<String> {
+    if let Some(screener) = screener {
+        return Ok(format!("screening is on: {screener}"));
+    }
+    let waiting: Vec<String> = [WorkState::Screening, WorkState::Held]
+        .into_iter()
+        .map(|state| db.list_work_items("lock", state, 5000))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .map(|row| format!("{} ({})", row.item_id, row.state))
+        .collect();
+    Ok(if waiting.is_empty() {
+        "screening is off".to_string()
+    } else {
+        format!(
+            "screening is off, so {} lock(s) stay where they wait: {}",
+            waiting.len(),
+            waiting.join(", ")
+        )
+    })
+}
+
 /// The `HamConfig` every connection this orchestrator makes is built from.
 /// Lair signing is required, never best-effort: the bridging agent carries its
 /// key across migrations, and the signing path `ham` would otherwise use
@@ -3119,6 +3160,7 @@ mod tests {
     use zfuel::fuel::Precision;
 
     mod in_transit;
+    mod screening;
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
@@ -3182,6 +3224,7 @@ mod tests {
                     confirmations: 5,
                 },
                 signer: CouponSigner::with_key(PrivateKeySigner::random()),
+                screener: None,
             }),
         }
     }
@@ -3225,6 +3268,7 @@ mod tests {
                 confirmations: 5,
             },
             signer: CouponSigner::with_key(PrivateKeySigner::random()),
+            screener: None,
         };
         BridgeOrchestrator::new(test_config(path.clone()), None)
             .expect("NETWORK=none binds nothing");
@@ -5666,12 +5710,21 @@ mod tests {
     }
 
     impl Lines {
+        /// tracing caches a callsite's interest from the dispatchers registered when it is first
+        /// hit, and from the hitting thread's alone while only one is. Every level is enabled and
+        /// filtered at the writer, and a second dispatcher stays registered, so a callsite another
+        /// test hits first is never left disabled for this capture.
         fn at(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            SECOND.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             let writer = self.clone();
             tracing_subscriber::fmt()
-                .with_max_level(level)
+                .with_max_level(tracing::Level::TRACE)
                 .with_ansi(false)
-                .with_writer(move || writer.clone())
+                .with_writer((move || writer.clone()).with_max_level(level))
                 .finish()
         }
 
@@ -5990,6 +6043,7 @@ mod tests {
 
         let selection = select_bridging_links(
             Some(&signer),
+            &screening_off(&unscreened()),
             &bridging_agent(),
             std::slice::from_ref(&copy),
             usize::MAX,
@@ -6047,10 +6101,16 @@ mod tests {
             *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
         }
 
-        let selection =
-            select_bridging_links(Some(&signer), &bridging_agent(), &[forged], usize::MAX, 1)
-                .await
-                .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &[forged],
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert!(selection.deposits.is_empty());
         assert!(selection.withdrawals.is_empty());
@@ -7159,6 +7219,7 @@ mod tests {
 
         let selection = select_bridging_links(
             None,
+            &screening_off(&unscreened()),
             &bridging_agent(),
             &[misfiled, foreign, own.clone()],
             usize::MAX,
@@ -8465,6 +8526,14 @@ mod tests {
         tx
     }
 
+    fn unscreened() -> StateStore {
+        StateStore::open(test_db_path("unscreened")).unwrap()
+    }
+
+    fn screening_off(db: &StateStore) -> WithdrawalGate<'_> {
+        WithdrawalGate::new(db, None)
+    }
+
     fn ids(links: &[Transaction]) -> Vec<String> {
         links.iter().map(|tx| tx.id.to_string()).collect()
     }
@@ -8478,9 +8547,16 @@ mod tests {
             parked_withdrawal_tx(0x62),
         ];
 
-        let selection = select_bridging_links(None, &bridging_agent(), &links, usize::MAX, 1)
-            .await
-            .unwrap();
+        let selection = select_bridging_links(
+            None,
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &links,
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert!(selection.withdrawals.is_empty());
@@ -8499,10 +8575,16 @@ mod tests {
             withdrawals[1].clone(),
         ];
 
-        let selection =
-            select_bridging_links(Some(&signer), &bridging_agent(), &links, usize::MAX, 1)
-                .await
-                .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &links,
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals));
@@ -8518,9 +8600,16 @@ mod tests {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
-        let selection = select_bridging_links(Some(&signer), &bridging_agent(), &withdrawals, 1, 1)
-            .await
-            .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &withdrawals,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
         assert_eq!(selection.coupons.len(), 1);
@@ -8535,6 +8624,7 @@ mod tests {
 
         let selection = select_bridging_links(
             Some(&signer),
+            &screening_off(&unscreened()),
             &bridging_agent(),
             &[withdrawal.clone()],
             usize::MAX,
@@ -8577,10 +8667,16 @@ mod tests {
         ];
         let links = [&unpayable[..], &[payable.clone(), deposit.clone()]].concat();
 
-        let selection =
-            select_bridging_links(Some(&signer), &bridging_agent(), &links, usize::MAX, 1)
-                .await
-                .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &links,
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
@@ -8600,9 +8696,16 @@ mod tests {
         ]
         .concat();
 
-        let selection = select_bridging_links(Some(&signer), &bridging_agent(), &links, 1, 1)
-            .await
-            .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &links,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
         assert_eq!(unpayable_ids(&selection), ids(&[unpayable]));

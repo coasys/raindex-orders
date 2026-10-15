@@ -20,7 +20,17 @@ fn node(dir: &Path) -> Vec<(&'static str, String)> {
         ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
         ("DB_PATH", db(dir).display().to_string()),
         durable_conductor(dir),
+        ("SCREENING", "on".to_string()),
+        ("SCREENING_DENYLIST", listed()),
     ]
+}
+
+/// Checksummed, as a person copies a listed address in.
+fn listed() -> String {
+    "0x8589427373d6d84e98730d7795d8f6f8731fda16"
+        .parse::<alloy::primitives::Address>()
+        .unwrap()
+        .to_checksum(None)
 }
 
 fn durable_conductor(dir: &Path) -> (&'static str, String) {
@@ -500,4 +510,105 @@ fn run_refuses_a_conductor_a_power_loss_can_roll_back() {
         !db(dir.path()).exists(),
         "the refusal came before the database was opened"
     );
+}
+
+const BASE_SEPOLIA: [(&str, &str); 4] = [
+    ("NETWORK", "base-sepolia"),
+    ("ETH_RPC_URL", ""),
+    ("MAINNET_LOCK_VAULT_ADDRESS", ""),
+    (
+        "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
+        "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6",
+    ),
+];
+
+fn with(
+    env: &[(&'static str, String)],
+    set: &[(&'static str, &str)],
+) -> Vec<(&'static str, String)> {
+    let mut env: Vec<_> = env
+        .iter()
+        .filter(|(key, _)| set.iter().all(|(set_key, _)| set_key != key))
+        .cloned()
+        .collect();
+    env.extend(set.iter().map(|(key, value)| (*key, value.to_string())));
+    env
+}
+
+#[test]
+fn run_and_screen_refuse_a_bad_screening_configuration_before_either_writes_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mainnet = node(dir.path());
+    mainnet.extend(signer());
+    let base_sepolia = with(&mainnet, &BASE_SEPOLIA);
+    let mistyped = listed().replacen("85", "58", 1);
+    let mismatch = format!("SCREENING_DENYLIST entry {mistyped} does not match its checksum");
+
+    for (env, refusal) in [
+        (
+            with(&mainnet, &[("SCREENING", "off")]),
+            "SCREENING=off is refused on mainnet",
+        ),
+        (
+            with(&mainnet, &[("SCREENING", "")]),
+            "SCREENING is required for NETWORK=mainnet",
+        ),
+        (
+            with(&mainnet, &[("SCREENING_DENYLIST", " , ")]),
+            "SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
+        ),
+        (
+            with(&base_sepolia, &[("SCREENING", "maybe")]),
+            "SCREENING=maybe is not on or off",
+        ),
+        (
+            with(&base_sepolia, &[("SCREENING_DENYLIST", "0x11,0x2")]),
+            "SCREENING_DENYLIST entry 0x11 is not an address; SCREENING_DENYLIST entry 0x2 is not an address",
+        ),
+        (
+            with(&base_sepolia, &[("SCREENING_DENYLIST", &mistyped)]),
+            &mismatch,
+        ),
+    ] {
+        for args in [&["run"][..], &["screen", &listed()][..]] {
+            let output = orchestrator(dir.path(), &env, args);
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{args:?} {refusal}");
+            assert!(stderr.contains(refusal), "{args:?}: {stderr}");
+            assert!(!db(dir.path()).exists());
+        }
+    }
+}
+
+#[test]
+fn screen_answers_from_the_configured_list_and_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = node(dir.path());
+
+    for (address, verdict) in [
+        (listed().to_lowercase(), "hit"),
+        (
+            "0x6c6EE5e31d828De241282B9606C8e98Ea48526E2".to_string(),
+            "clear",
+        ),
+    ] {
+        let output = orchestrator(dir.path(), &env, &["screen", &address]);
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let answer: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(answer["verdict"], verdict, "{answer}");
+        assert_eq!(answer["provider"], "denylist");
+        assert_eq!(answer["address"], address.to_lowercase());
+    }
+    assert!(!db(dir.path()).exists(), "screen opened the database");
+
+    let off = with(&with(&env, &BASE_SEPOLIA), &[("SCREENING", "off")]);
+    let output = orchestrator(dir.path(), &off, &["screen", &listed()]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SCREENING=off"));
 }

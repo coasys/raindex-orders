@@ -1,3 +1,4 @@
+use crate::screening::{DenyList, Screener};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use holo_hash::AgentPubKeyB64;
@@ -68,7 +69,7 @@ impl Network {
 /// contracts are at the same address on every chain, Base Sepolia included.
 /// TestNet's mock HOT, vault and claim order are chain-specific, and the
 /// orchestrator has no defaults for them, so a base-sepolia run names those too.
-const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
+const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 7] = [
     ("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),
     (
         "ORDERBOOK_ADDRESS",
@@ -84,6 +85,7 @@ const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
         "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
     ),
     ("CLAIM_STORE", "0x1Aa775533E28B1D843e1A589034984E3a62005DC"),
+    ("SCREENING", "on"),
 ];
 
 /// `setting`, with TestNet's value for each network value a base-sepolia run is not
@@ -141,14 +143,85 @@ pub struct Ethereum {
     pub confirmations: u64,
 }
 
-/// The Ethereum variables `setting` holds a value for, which NETWORK=none ignores.
+/// The variables `setting` holds a value for that NETWORK=none ignores.
 pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
     [Network::BaseSepolia, Network::Mainnet]
         .into_iter()
         .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
         .chain(crate::signer::env_variables())
+        .chain(SCREENING_VARIABLES)
         .filter(|key| setting(key).is_some_and(|value| !value.is_empty()))
         .collect()
+}
+
+const SCREENING_VARIABLES: [&str; 2] = ["SCREENING", "SCREENING_DENYLIST"];
+
+/// The denylist `SCREENING_DENYLIST` configures.
+pub fn screener_from_env(network: Network) -> Result<Option<Box<dyn Screener>>> {
+    screening_settings(network, |key| env::var(key).ok())
+}
+
+fn screening_settings(
+    network: Network,
+    setting: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Box<dyn Screener>>> {
+    log_testnet_defaults(network, &setting, &SCREENING_VARIABLES);
+    let setting = with_network_defaults(network, setting);
+    let mut faults = Vec::new();
+    let on = match setting("SCREENING").as_deref() {
+        Some("on") => true,
+        Some("off") if network == Network::Mainnet => {
+            faults.push(
+                "SCREENING=off is refused on mainnet, which screens every transfer".to_string(),
+            );
+            false
+        }
+        Some("off") => false,
+        Some(other) => {
+            faults.push(format!("SCREENING={other} is not on or off"));
+            false
+        }
+        None => {
+            faults.push(format!(
+                "SCREENING is required for NETWORK={}",
+                network.name()
+            ));
+            false
+        }
+    };
+    let mut addresses = Vec::new();
+    for entry in setting("SCREENING_DENYLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        match denylist_entry(entry) {
+            Ok(address) => addresses.push(address),
+            Err(why) => faults.push(format!("SCREENING_DENYLIST entry {entry} {why}")),
+        }
+    }
+    if network == Network::Mainnet && addresses.is_empty() {
+        faults.push(
+            "SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address"
+                .to_string(),
+        );
+    }
+    anyhow::ensure!(faults.is_empty(), "{}", faults.join("; "));
+    Ok(on.then(|| Box::new(DenyList::new(addresses)) as Box<dyn Screener>))
+}
+
+/// A mixed-case entry must carry its EIP-55 checksum, so a mistyped digit is refused rather than
+/// listing another address.
+fn denylist_entry(entry: &str) -> Result<Address, &'static str> {
+    let address: Address = entry.parse().map_err(|_| "is not an address")?;
+    let hex = entry.trim_start_matches("0x");
+    let mixed_case =
+        hex.chars().any(|c| c.is_ascii_lowercase()) && hex.chars().any(|c| c.is_ascii_uppercase());
+    if mixed_case && Address::parse_checksummed(entry, None).is_err() {
+        return Err("does not match its checksum");
+    }
+    Ok(address)
 }
 
 /// The network `NETWORK` names, base-sepolia when it is unset or empty.
@@ -167,7 +240,7 @@ fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
     }
 }
 
-/// `NETWORK`'s chain, read and checked for every command, though only `run` uses it.
+/// `NETWORK`'s chain, read and checked for every command.
 pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
     ethereum_settings(|key| env::var(key).ok())
 }
