@@ -854,3 +854,35 @@ async fn the_worked_example_in_the_signer_service_doc() {
         "0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c"
     );
 }
+
+/// A service that redirects is not followed: a 307 or 308 could move the
+/// request to plain http on another host, past the https rule.
+#[tokio::test]
+async fn a_signer_service_redirect_is_not_followed() {
+    let target = owner_service(owner_key(0)).await;
+    let location: &'static str = Box::leak(
+        format!("307 Temporary Redirect\r\nLocation: {}signer", target.url).into_boxed_str(),
+    );
+    let redirecting = fake_service(move |_, _| (location, "{}".to_string())).await;
+    let service = OwnerService::new(Network::Mainnet, owner(0), &redirecting.url).unwrap();
+
+    let message = format!("{:#}", service.identity().await.unwrap_err());
+
+    assert_eq!(message, "answered GET /signer with HTTP 307");
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
+/// An answer over MAX_ANSWER_BYTES is refused, not read into memory whole.
+#[tokio::test]
+async fn a_signer_service_answer_over_the_size_cap_is_refused() {
+    let big =
+        fake_service(|_, _| ("200 OK", format!("\"{}\"", "a".repeat(MAX_ANSWER_BYTES)))).await;
+    let service = OwnerService::new(Network::Mainnet, owner(0), &big.url).unwrap();
+
+    let message = format!("{:#}", service.identity().await.unwrap_err());
+
+    assert_eq!(
+        message,
+        format!("answered more than {MAX_ANSWER_BYTES} bytes")
+    );
+}

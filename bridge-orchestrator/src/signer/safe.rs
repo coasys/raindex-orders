@@ -34,6 +34,10 @@ pub const EIP1271_MAGIC_VALUE: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
 /// A Safe coupon signer has at least 2 owners to ask, its threshold being 2 or
 /// more, and the website reads at most 20 owner signatures.
+/// The most a signer service's answer may hold. A signature answer is under
+/// 300 bytes; a refusal's reason is cut to 200 characters in the log anyway.
+const MAX_ANSWER_BYTES: usize = 64 * 1024;
+
 const MIN_OWNERS: usize = 2;
 const MAX_OWNERS: usize = 20;
 
@@ -483,8 +487,11 @@ impl OwnerService {
             parsed.query().is_none() && parsed.fragment().is_none(),
             "SAFE_OWNER_SERVICES names a URL with a query or fragment for {owner}: name the service's base URL"
         );
+        // No redirects: a 307 or 308 could move the request to plain http on
+        // another host, past the https rule below.
         let client = reqwest::Client::builder()
             .timeout(SIGN_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("the HTTP client for SAFE_OWNER_SERVICES")?;
         let service = Self {
@@ -545,9 +552,23 @@ impl OwnerService {
             "answered GET /signer with HTTP {}",
             status.as_u16()
         );
-        answer.json().await.map_err(|_| {
+        let body = self.read_answer(answer).await?;
+        serde_json::from_slice(&body).map_err(|_| {
             anyhow!("answered GET /signer with something other than {{\"owner\", \"safe\", \"chainId\"}}")
         })
+    }
+
+    /// The answer's body, refused when it holds more than MAX_ANSWER_BYTES.
+    async fn read_answer(&self, mut answer: reqwest::Response) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = answer.chunk().await.map_err(|err| self.unreachable(&err))? {
+            anyhow::ensure!(
+                body.len() + chunk.len() <= MAX_ANSWER_BYTES,
+                "answered more than {MAX_ANSWER_BYTES} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     async fn request_signature(&self, request: &OwnerRequest<'_>) -> Result<Vec<u8>> {
@@ -573,9 +594,8 @@ impl OwnerService {
             .map_err(|err| self.unreachable(&err))?;
         let status = answer.status();
         if status == reqwest::StatusCode::CONFLICT {
-            let refused = answer
-                .json::<Refused>()
-                .await
+            let body = self.read_answer(answer).await?;
+            let refused = serde_json::from_slice::<Refused>(&body)
                 .map(|r| {
                     let reason: String = r.reason.chars().take(200).collect();
                     let code: String = r.code.chars().take(40).collect();
@@ -589,7 +609,8 @@ impl OwnerService {
             anyhow::bail!("refused: {refused}");
         }
         anyhow::ensure!(status.is_success(), "answered HTTP {}", status.as_u16());
-        let signed: Signed = answer.json().await.map_err(|_| {
+        let body = self.read_answer(answer).await?;
+        let signed: Signed = serde_json::from_slice(&body).map_err(|_| {
             anyhow!("answered with something other than {{\"owner\", \"signature\"}}")
         })?;
         anyhow::ensure!(signed.owner == self.owner, "answered for {}", signed.owner);

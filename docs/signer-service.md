@@ -78,7 +78,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `hash_mismatch` | the service's own digest or SafeMessage hash differs from the one sent |
 | `not_ready` | the service cannot check now, for example its node is not in sync (HTTP 503 works too) |
 
-Any other status (400 for a malformed body, 401 or 403 for authentication, 500, 503) counts as "did not sign", and the orchestrator logs the status.
+Any other status (400 for a malformed body, 401 or 403 for authentication, 500, 503) counts as "did not sign", and the orchestrator logs the status. So does a redirect, which the orchestrator does not follow, and an answer of more than 64 KiB.
 
 ## The hash an owner signs
 
