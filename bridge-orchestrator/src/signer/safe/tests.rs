@@ -733,6 +733,168 @@ async fn a_signer_service_that_does_not_answer_is_left_out_after_the_timeout() {
     );
 }
 
+/// A signer service that takes the connection and never answers.
+async fn silent_service() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    url
+}
+
+/// Why `owners`' owner `i` did not sign `request`, when asked with the others.
+async fn why_not(owners: &SafeOwners, i: usize) -> String {
+    let (_, answers) = owners.collect(&request(Some(withdrawal()))).await.unwrap();
+    format!("{:#}", answers[i].1.as_ref().unwrap_err())
+}
+
+fn timed_out(why: &str, name: &str) -> bool {
+    why == format!("{name}: did not answer within 20s")
+        || why == format!("{name} did not sign within 20s")
+}
+
+/// A service that does not answer costs one timeout a cycle, not one for each
+/// withdrawal: while the other owners are at least the threshold it is not
+/// asked again this cycle, and the others sign. A new cycle asks it again.
+#[tokio::test(start_paused = true)]
+async fn a_signer_service_that_timed_out_is_not_asked_again_this_cycle_while_the_others_reach_m() {
+    let chain = FakeSafe::new(2, &[0, 1, 2]);
+    let url = chain.serve().await;
+    let silent = silent_service().await;
+    let owners = safe_owners(
+        vec![
+            Owner::Service(OwnerService::new(Network::Mainnet, owner(0), &silent).unwrap()),
+            Owner::Key(owner_key(1)),
+            Owner::Key(owner_key(2)),
+        ],
+        &url,
+    );
+    let name = owners.owners()[0].name();
+
+    let first = why_not(&owners, 0).await;
+    assert!(timed_out(&first, &name), "{first}");
+
+    for _ in 0..3 {
+        let signature = owners
+            .sign_request(&request(Some(withdrawal())))
+            .await
+            .unwrap();
+        assert_eq!(signature.len(), 130);
+    }
+    assert_eq!(
+        why_not(&owners, 0).await,
+        format!("{name} was not asked: it did not answer within 20s earlier this cycle")
+    );
+
+    owners.new_cycle();
+    let again = why_not(&owners, 0).await;
+    assert!(timed_out(&again, &name), "{again}");
+}
+
+/// An owner that timed out is still asked while the other owners are fewer
+/// than the threshold: no coupon could be signed without it.
+#[tokio::test(start_paused = true)]
+async fn a_signer_service_that_timed_out_is_asked_again_while_the_others_are_fewer_than_m() {
+    let chain = FakeSafe::new(2, &[0, 1, 2]);
+    let url = chain.serve().await;
+    let silent = silent_service().await;
+    let owners = safe_owners(
+        vec![
+            Owner::Service(OwnerService::new(Network::Mainnet, owner(0), &silent).unwrap()),
+            Owner::Key(owner_key(1)),
+        ],
+        &url,
+    );
+    let name = owners.owners()[0].name();
+
+    for _ in 0..2 {
+        let why = why_not(&owners, 0).await;
+        assert!(timed_out(&why, &name), "{why}");
+    }
+}
+
+/// A signer service that, while `silent` is set, takes the connection and
+/// never answers, and otherwise refuses with `not_ready`.
+async fn sometimes_silent_service(silent: Arc<std::sync::atomic::AtomicBool>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if silent.load(std::sync::atomic::Ordering::SeqCst) {
+                held.push(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                read_request(&mut socket).await;
+                let reply = json!({"code": "not_ready"}).to_string();
+                let response = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    url
+}
+
+/// An owner that timed out and then answered, asked again because the others
+/// were fewer than the threshold, counts as answering again: another owner
+/// that times out is then the one left out. On the real clock, with 500 ms to
+/// sign: a paused clock would run out while a service's answer is on its way.
+#[tokio::test]
+async fn an_owner_that_answers_after_timing_out_is_asked_again_this_cycle() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let chain = FakeSafe::new(2, &[0, 1, 2]);
+    let url = chain.serve().await;
+    let (a_silent, c_silent) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let a = sometimes_silent_service(Arc::clone(&a_silent)).await;
+    let c = sometimes_silent_service(Arc::clone(&c_silent)).await;
+    let owners = safe_owners(
+        vec![
+            Owner::Service(OwnerService::new(Network::Mainnet, owner(0), &a).unwrap()),
+            Owner::Key(owner_key(1)),
+            Owner::Service(OwnerService::new(Network::Mainnet, owner(2), &c).unwrap()),
+        ],
+        &url,
+    )
+    .with_sign_timeout(std::time::Duration::from_millis(500));
+    let (a_name, c_name) = (owners.owners()[0].name(), owners.owners()[2].name());
+    let not_asked = |name: &str| {
+        format!("{name} was not asked: it did not answer within 500ms earlier this cycle")
+    };
+    let timed_out = |why: &str, name: &str| why == format!("{name} did not sign within 500ms");
+
+    let why = why_not(&owners, 0).await;
+    assert!(timed_out(&why, &a_name), "{why}");
+
+    a_silent.store(false, Ordering::SeqCst);
+    c_silent.store(true, Ordering::SeqCst);
+    let (_, answers) = owners.collect(&request(Some(withdrawal()))).await.unwrap();
+    assert_eq!(
+        format!("{:#}", answers[0].1.as_ref().unwrap_err()),
+        not_asked(&a_name)
+    );
+    let why = format!("{:#}", answers[2].1.as_ref().unwrap_err());
+    assert!(timed_out(&why, &c_name), "{why}");
+
+    let (_, answers) = owners.collect(&request(Some(withdrawal()))).await.unwrap();
+    assert_eq!(
+        format!("{:#}", answers[0].1.as_ref().unwrap_err()),
+        format!("{a_name}: refused: not_ready")
+    );
+
+    assert_eq!(why_not(&owners, 2).await, not_asked(&c_name));
+}
+
 #[tokio::test]
 async fn an_unreachable_signer_service_is_named_by_its_host_alone() {
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();

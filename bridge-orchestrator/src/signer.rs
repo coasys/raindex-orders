@@ -109,6 +109,8 @@ pub trait CouponKey: Send + Sync {
     fn safe(&self) -> Option<&SafeOwners> {
         None
     }
+    /// A new bridge cycle begins: a Safe asks again the owners that timed out.
+    fn new_cycle(&self) {}
 }
 
 impl CouponKey for PrivateKeySigner {
@@ -287,6 +289,12 @@ impl CouponSigner {
             )
             .await?;
         Ok(serialize(&coupon))
+    }
+
+    /// A new bridge cycle begins: a Safe asks again the owners that timed out
+    /// in the last one.
+    pub fn new_cycle(&self) {
+        self.key.new_cycle();
     }
 
     /// A coupon for one wei to the signer itself, which expires at the latest

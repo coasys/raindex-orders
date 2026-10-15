@@ -129,6 +129,11 @@ async fn select_bridging_links(
         unsigned: Vec::new(),
     };
     let mut withdrawal_capped = false;
+    // One selection is one cycle's signing: an owner of a Safe signer that
+    // timed out in the last is asked again.
+    if let Some(signer) = signer {
+        signer.new_cycle();
+    }
 
     for tx in bridging_links {
         let withdraw_to = match bridging_spend(tx, bridging_agent) {
@@ -6057,6 +6062,49 @@ mod tests {
             ids(&conductor.parked.borrow()[&action_hash(BR_EA)]),
             ids(&planted)
         );
+    }
+
+    /// A key that counts the cycles it is told of.
+    struct CycleCountingKey {
+        key: PrivateKeySigner,
+        cycles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::signer::CouponKey for CycleCountingKey {
+        fn address(&self) -> alloy::primitives::Address {
+            crate::signer::CouponKey::address(&self.key)
+        }
+
+        fn sign<'a>(
+            &'a self,
+            request: &'a crate::signer::SignRequest,
+        ) -> crate::signer::Signing<'a> {
+            crate::signer::CouponKey::sign(&self.key, request)
+        }
+
+        fn new_cycle(&self) {
+            self.cycles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Each cycle's selection starts a new cycle for the signer, so a Safe's
+    /// owner that timed out in one is asked again in the next.
+    #[tokio::test]
+    async fn each_selection_starts_a_new_cycle_for_the_signer() {
+        let cycles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signer = CouponSigner::with_key(CycleCountingKey {
+            key: PrivateKeySigner::random(),
+            cycles: std::sync::Arc::clone(&cycles),
+        });
+
+        for _ in 0..2 {
+            select_bridging_links(Some(&signer), &bridging_agent(), &[], usize::MAX, 1)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(cycles.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
