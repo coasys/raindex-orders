@@ -12,7 +12,22 @@ import {
 } from "raindex-interface-0.1.7/src/interface/IRaindexV6.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {ClaimInputToken} from "src/ClaimInputToken.sol";
-import {ICompatibilityFallbackHandler, LibSafeSetup} from "./Safe.sol";
+import {
+    ICompatibilityFallbackHandler,
+    ISafe,
+    LibSafeSetup,
+    SAFE_SINGLETON,
+    SAFE_L2_SINGLETON,
+    SAFE_FALLBACK_HANDLER,
+    SAFE_SINGLETON_CODEHASH,
+    SAFE_L2_SINGLETON_CODEHASH,
+    SAFE_FALLBACK_HANDLER_CODEHASH,
+    SAFE_PROXY_CODEHASH,
+    SAFE_SINGLETON_SLOT,
+    SAFE_FALLBACK_HANDLER_SLOT,
+    SAFE_GUARD_SLOT,
+    SAFE_SENTINEL_MODULES
+} from "./Safe.sol";
 import {
     RAINDEX,
     RAINDEX_CODEHASH,
@@ -136,7 +151,7 @@ abstract contract ClaimOrderScript is Script {
     /// coupons Raindex V6 refuses (it asks any account with code through EIP-1271,
     /// never by the key's signature), and a contract signer whose signatures the
     /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
-    /// as a key's.
+    /// as a key's. A Safe must be one only its owners act as (`safeFault`).
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
         require(signer != address(0), "VALID_SIGNER must be a nonzero address");
         require(
@@ -157,7 +172,65 @@ abstract contract ClaimOrderScript is Script {
                 hashesSafeMessages(signer),
                 "VALID_SIGNER is a Safe whose fallback handler does not hash coupons as Safe's CompatibilityFallbackHandler does, so it would refuse every coupon: set that handler on it (docs/enable-multisig.md)"
             );
+            requireOnlyOwnersAct("VALID_SIGNER", signer);
         }
+    }
+
+    /// Refuses `safe`, the account `name` names, unless only its threshold of
+    /// owners can act as it (`safeFault`).
+    function requireOnlyOwnersAct(string memory name, address safe) internal view {
+        string memory fault = safeFault(safe);
+        require(
+            bytes(fault).length == 0,
+            string.concat(
+                name,
+                " ",
+                vm.toString(safe),
+                " is not a Safe 1.4.1 that only its owners act as: ",
+                fault,
+                " (docs/enable-multisig.md)"
+            )
+        );
+    }
+
+    /// Why something other than `safe`'s threshold of owners could act as it, or
+    /// "" when nothing can. It must be Safe's SafeProxy 1.4.1 on the Safe 1.4.1 or
+    /// SafeL2 1.4.1 singleton, with the CompatibilityFallbackHandler 1.4.1, each
+    /// byte for byte, and have no guard and no module. A module executes the
+    /// Safe's transactions with no owner's signature: as the vault admin it could
+    /// take the vault's HOT, and as the coupon signer mark any coupon signed. A
+    /// guard can refuse any transaction the owners sign, and another handler
+    /// answers the coupons' EIP-1271 question as it likes.
+    function safeFault(address safe) internal view returns (string memory) {
+        if (safe.codehash != SAFE_PROXY_CODEHASH) {
+            return "its code is not Safe's SafeProxy 1.4.1";
+        }
+        address singleton = address(uint160(uint256(vm.load(safe, SAFE_SINGLETON_SLOT))));
+        if (
+            !(singleton == SAFE_SINGLETON && singleton.codehash == SAFE_SINGLETON_CODEHASH)
+                && !(singleton == SAFE_L2_SINGLETON && singleton.codehash == SAFE_L2_SINGLETON_CODEHASH)
+        ) {
+            return string.concat("it runs the singleton ", vm.toString(singleton), ", not Safe 1.4.1 or SafeL2 1.4.1");
+        }
+        address handler = address(uint160(uint256(vm.load(safe, SAFE_FALLBACK_HANDLER_SLOT))));
+        if (handler != address(SAFE_FALLBACK_HANDLER) || handler.codehash != SAFE_FALLBACK_HANDLER_CODEHASH) {
+            return string.concat(
+                "its fallback handler is ", vm.toString(handler), ", not the CompatibilityFallbackHandler 1.4.1"
+            );
+        }
+        address guard = address(uint160(uint256(vm.load(safe, SAFE_GUARD_SLOT))));
+        if (guard != address(0)) {
+            return string.concat("it has the guard ", vm.toString(guard), ", which can refuse what its owners sign");
+        }
+        (address[] memory modules,) = ISafe(safe).getModulesPaginated(SAFE_SENTINEL_MODULES, 1);
+        if (modules.length != 0) {
+            return string.concat(
+                "it has the module ",
+                vm.toString(modules[0]),
+                " enabled, which acts as the Safe with no owner's signature"
+            );
+        }
+        return "";
     }
 
     /// Whether the Safe `safe` answers EIP-1271 for coupons: its fallback
@@ -203,7 +276,8 @@ abstract contract ClaimOrderScript is Script {
     /// controls the vault. `given` is what the operator takes the Safe to be, its
     /// threshold and owners, and must match what it answers, so the vault cannot
     /// go to a Safe other than the one meant. One key, or a Safe of threshold 1,
-    /// is refused unless the override is set, which is logged.
+    /// is refused unless the override is set, which is logged. A Safe must also
+    /// be one only its owners act as, with no module or guard (`safeFault`).
     function requireAdmin(address admin, AdminInputs memory given) internal view {
         require(admin != address(0), "ADMIN_ADDRESS must be a nonzero address");
         string memory at = vm.toString(admin);
@@ -271,6 +345,7 @@ abstract contract ClaimOrderScript is Script {
                 ": is it the Safe meant?"
             )
         );
+        requireOnlyOwnersAct("ADMIN_ADDRESS", admin);
         console2.log(string.concat("ADMIN_ADDRESS ", at, " is ", shape, ": ", joined(owners)));
         if (threshold < 2) {
             console2.log(string.concat(SINGLE_KEY_ADMIN_OVERRIDE, "=yes: one of those keys alone controls the vault"));

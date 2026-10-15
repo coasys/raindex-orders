@@ -135,7 +135,8 @@ contract CreateSafe is ClaimOrderScript {
 
     /// The Safe at the predicted address must be the one these inputs create,
     /// and still have their owners and threshold: owners changed since would
-    /// mean it is not the Safe the operator states.
+    /// mean it is not the Safe the operator states. A module or guard added
+    /// since is refused too.
     function requireFound(Plan memory plan) internal view {
         ISafe safe = ISafe(plan.safe);
         string memory at = vm.toString(plan.safe);
@@ -159,6 +160,7 @@ contract CreateSafe is ClaimOrderScript {
             )
         );
         require(hashesSafeMessages(plan.safe), string.concat("the Safe at ", at, " does not hash coupons as expected"));
+        requireOnlyOwnersAct("the Safe at", plan.safe);
     }
 
     /// What the deploy takes next, under its names: the Safe as the vault admin,

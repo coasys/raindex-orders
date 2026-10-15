@@ -133,12 +133,28 @@ contract TestClaimOrderScript is Test {
         harness.acceptAdmin(address(harness), singleKeyAllowed(inputs(2, ownersOf(3))));
     }
 
-    function testASafeOfThresholdTwoWhoseThresholdAndOwnersAreAsStatedIsTheAdmin() public {
+    /// The refusal a contract answering as a Safe gets once its threshold and
+    /// owners pass: it is not Safe's own proxy, so something other than its
+    /// owners may act as it. test/TestOneSafeAdminAndSigner.t.sol takes a real
+    /// Safe 1.4.1 on a fork of mainnet.
+    function notSafesProxy(address safe) internal pure returns (bytes memory) {
+        return bytes(
+            string.concat(
+                "ADMIN_ADDRESS ",
+                vm.toString(safe),
+                " is not a Safe 1.4.1 that only its owners act as: its code is not Safe's SafeProxy 1.4.1 (docs/enable-multisig.md)"
+            )
+        );
+    }
+
+    function testAContractAnsweringAsTheStatedSafeIsRefusedUnlessItIsSafesProxy() public {
         MockSafe safe = new MockSafe(2, ownersOf(3));
         address[] memory reversed = new address[](3);
         (reversed[0], reversed[1], reversed[2]) = (owners[2], owners[0], owners[1]);
 
+        vm.expectRevert(notSafesProxy(address(safe)));
         harness.acceptAdmin(address(safe), inputs(2, owners));
+        vm.expectRevert(notSafesProxy(address(safe)));
         harness.acceptAdmin(address(safe), inputs(2, reversed));
     }
 
@@ -156,6 +172,7 @@ contract TestClaimOrderScript is Test {
         );
         harness.acceptAdmin(address(safe), inputs(1, owners));
 
+        vm.expectRevert(notSafesProxy(address(safe)));
         harness.acceptAdmin(address(safe), singleKeyAllowed(inputs(1, owners)));
     }
 

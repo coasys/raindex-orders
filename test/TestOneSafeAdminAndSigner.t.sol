@@ -27,9 +27,41 @@ import {
 } from "src/Constants.sol";
 import {ClaimOrderScript, AdminInputs} from "script/ClaimOrderScript.sol";
 import {CreateSafe} from "script/CreateSafe.s.sol";
-import {SAFE_L2_SINGLETON, SAFE_FALLBACK_HANDLER, LibSafeSetup} from "script/Safe.sol";
+import {
+    SAFE_L2_SINGLETON,
+    SAFE_FALLBACK_HANDLER,
+    SAFE_PROXY_CODEHASH,
+    SAFE_SINGLETON_SLOT,
+    SAFE_FALLBACK_HANDLER_SLOT,
+    SAFE_GUARD_SLOT,
+    LibSafeSetup
+} from "script/Safe.sol";
 import {LibCoupon} from "./lib/LibCoupon.sol";
 import {ISafe, LibSafe, SAFE_PROXY_FACTORY, SAFE_SINGLETON} from "./rehearsal/Safe.sol";
+
+/// A guard as Safe 1.4.1's setGuard takes one: it answers ERC-165 for the Guard
+/// interface, and lets every transaction through.
+contract PassingGuard {
+    function supportsInterface(bytes4) external pure returns (bool) {
+        return true;
+    }
+
+    function checkTransaction(
+        address,
+        uint256,
+        bytes memory,
+        uint8,
+        uint256,
+        uint256,
+        uint256,
+        address,
+        address payable,
+        bytes memory,
+        address
+    ) external {}
+
+    function checkAfterExecution(bytes32, bool) external {}
+}
 
 contract OneSafeHarness is ClaimOrderScript {
     function acceptAdmin(address admin, AdminInputs memory given) external view {
@@ -263,6 +295,89 @@ contract TestOneSafeAdminAndSigner is Test {
         expectInvalidSignature(SignedContextV1(address(safe), c, abi.encodePacked(r, s, v)));
     }
 
+    /// A Safe CreateSafe makes, on Safe 1.4.1 here or on SafeL2 1.4.1 as on Base
+    /// Sepolia, is Safe's own proxy with no module or guard: the deploy's checks
+    /// take it as the admin, its owners in any order, and as the coupon signer.
+    function testASafeAsCreateSafeMakesItOnEitherSingletonPassesTheDeployChecks() public {
+        address[] memory reversed = new address[](3);
+        (reversed[0], reversed[1], reversed[2]) = (owners[2], owners[0], owners[1]);
+        address l2 = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_L2_SINGLETON, LibSafeSetup.setupCall(owners, 2), 3);
+
+        assertEq(address(safe).codehash, SAFE_PROXY_CODEHASH);
+        assertEq(l2.codehash, SAFE_PROXY_CODEHASH);
+        harness.acceptAdmin(address(safe), AdminInputs(false, 2, reversed));
+        harness.acceptAdmin(l2, AdminInputs(false, 2, owners));
+        harness.acceptSigner(l2);
+    }
+
+    /// A Safe of threshold 1 is the admin only with the override.
+    function testASafeOfThresholdOneIsTheAdminWithTheOverride() public {
+        address one = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, LibSafeSetup.setupCall(owners, 1), 4);
+        vm.expectRevert(
+            bytes(
+                string.concat(
+                    "ADMIN_ADDRESS ",
+                    vm.toString(one),
+                    " is a Safe of threshold 1 with 3 owners, which one key controls. Use a Safe of threshold 2 or more, or set UNSAFE_ALLOW_SINGLE_KEY_ADMIN=yes"
+                )
+            )
+        );
+        harness.acceptAdmin(one, AdminInputs(false, 1, owners));
+        harness.acceptAdmin(one, AdminInputs(true, 1, owners));
+    }
+
+    /// `safe` with `fault` is refused as the vault admin and as the coupon signer.
+    function expectRefusedForBothRoles(address refused, string memory fault) internal {
+        string memory why =
+            string.concat(" is not a Safe 1.4.1 that only its owners act as: ", fault, " (docs/enable-multisig.md)");
+        vm.expectRevert(bytes(string.concat("ADMIN_ADDRESS ", vm.toString(refused), why)));
+        harness.acceptAdmin(refused, AdminInputs(false, 2, owners));
+        vm.expectRevert(bytes(string.concat("VALID_SIGNER ", vm.toString(refused), why)));
+        harness.acceptSigner(refused);
+    }
+
+    /// A module executes the Safe's transactions with no owner's signature: it
+    /// could take the vault's HOT as the admin, or mark any coupon signed.
+    function testASafeWithAModuleIsRefusedAsTheAdminAndTheCouponSigner() public {
+        address module = makeAddr("module");
+        vm.prank(address(safe));
+        (bool enabled,) = address(safe).call(abi.encodeWithSignature("enableModule(address)", module));
+        assertTrue(enabled);
+
+        expectRefusedForBothRoles(
+            address(safe),
+            string.concat(
+                "it has the module ", vm.toString(module), " enabled, which acts as the Safe with no owner's signature"
+            )
+        );
+    }
+
+    function testASafeWithAGuardIsRefusedAsTheAdminAndTheCouponSigner() public {
+        address guard = address(new PassingGuard());
+        vm.prank(address(safe));
+        (bool set,) = address(safe).call(abi.encodeWithSignature("setGuard(address)", guard));
+        assertTrue(set);
+        assertEq(address(uint160(uint256(vm.load(address(safe), SAFE_GUARD_SLOT)))), guard);
+
+        expectRefusedForBothRoles(
+            address(safe),
+            string.concat("it has the guard ", vm.toString(guard), ", which can refuse what its owners sign")
+        );
+    }
+
+    /// Safe 1.3.0's singleton in place of 1.4.1's, as a Safe's owners could
+    /// set it: the checks pin the release.
+    function testASafeOnAnotherSingletonIsRefusedAsTheAdminAndTheCouponSigner() public {
+        address safe130 = 0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552;
+        assertTrue(safe130.code.length > 0);
+        vm.store(address(safe), SAFE_SINGLETON_SLOT, bytes32(uint256(uint160(safe130))));
+
+        expectRefusedForBothRoles(
+            address(safe),
+            string.concat("it runs the singleton ", vm.toString(safe130), ", not Safe 1.4.1 or SafeL2 1.4.1")
+        );
+    }
+
     /// A Safe whose fallback handler is not the CompatibilityFallbackHandler
     /// refuses every coupon, so the deploy refuses it as the coupon signer.
     function testASafeWithoutTheFallbackHandlerIsRefusedAsTheCouponSigner() public {
@@ -275,6 +390,37 @@ contract TestOneSafeAdminAndSigner is Test {
             )
         );
         harness.acceptSigner(bare);
+
+        vm.expectRevert(
+            bytes(
+                string.concat(
+                    "ADMIN_ADDRESS ",
+                    vm.toString(bare),
+                    " is not a Safe 1.4.1 that only its owners act as: its fallback handler is ",
+                    vm.toString(address(0)),
+                    ", not the CompatibilityFallbackHandler 1.4.1 (docs/enable-multisig.md)"
+                )
+            )
+        );
+        harness.acceptAdmin(bare, AdminInputs(false, 2, owners));
+    }
+
+    /// The CompatibilityFallbackHandler's code at another address hashes coupons
+    /// as the real one does, but the deploy pins the handler itself: whoever
+    /// deployed the copy could have deployed anything else with it.
+    function testASafeWithACopyOfTheFallbackHandlerIsRefusedAsTheAdminAndTheCouponSigner() public {
+        address copy = makeAddr("handler copy");
+        vm.etch(copy, address(SAFE_FALLBACK_HANDLER).code);
+        vm.prank(address(safe));
+        (bool set,) = address(safe).call(abi.encodeWithSignature("setFallbackHandler(address)", copy));
+        assertTrue(set);
+        assertEq(address(uint160(uint256(vm.load(address(safe), SAFE_FALLBACK_HANDLER_SLOT)))), copy);
+        assertEq(copy.codehash, address(SAFE_FALLBACK_HANDLER).codehash);
+
+        expectRefusedForBothRoles(
+            address(safe),
+            string.concat("its fallback handler is ", vm.toString(copy), ", not the CompatibilityFallbackHandler 1.4.1")
+        );
     }
 }
 
@@ -314,6 +460,29 @@ contract TestCreateSafe is Test {
         assertTrue(ok);
         vm.expectRevert();
         harness.found(owners, 2, 43, SAFE_SINGLETON);
+    }
+
+    function testAFoundSafeWithAModuleIsRefused() public {
+        bytes memory initializer = LibSafeSetup.setupCall(owners, 2);
+        address created = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, initializer, 44);
+        harness.found(owners, 2, 44, SAFE_SINGLETON);
+        address module = makeAddr("module");
+        vm.prank(created);
+        (bool enabled,) = created.call(abi.encodeWithSignature("enableModule(address)", module));
+        assertTrue(enabled);
+
+        vm.expectRevert(
+            bytes(
+                string.concat(
+                    "the Safe at ",
+                    vm.toString(created),
+                    " is not a Safe 1.4.1 that only its owners act as: it has the module ",
+                    vm.toString(module),
+                    " enabled, which acts as the Safe with no owner's signature (docs/enable-multisig.md)"
+                )
+            )
+        );
+        harness.found(owners, 2, 44, SAFE_SINGLETON);
     }
 
     function testTheOwnersAreTwoToTwentyKeysNoneTwiceAndTheThresholdTwoOrMore() public {

@@ -47,6 +47,10 @@ interface ISafe {
     function getOwners() external view returns (address[] memory);
     function getThreshold() external view returns (uint256);
     function domainSeparator() external view returns (bytes32);
+    function getModulesPaginated(address start, uint256 pageSize)
+        external
+        view
+        returns (address[] memory array, address next);
 }
 
 interface ISafeProxyFactory {
@@ -76,11 +80,18 @@ bytes32 constant SAFE_PROXY_FACTORY_CODEHASH = 0x50c3cdc4074750a7a974204a716c999
 bytes32 constant SAFE_SINGLETON_CODEHASH = 0x1fe2df852ba3299d6534ef416eefa406e56ced995bca886ab7a553e6d0c5e1c4;
 bytes32 constant SAFE_L2_SINGLETON_CODEHASH = 0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff;
 bytes32 constant SAFE_FALLBACK_HANDLER_CODEHASH = 0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9;
+// SafeProxy 1.4.1, the code of every Safe SAFE_PROXY_FACTORY creates: it
+// delegates every call to the singleton in its storage slot 0.
+bytes32 constant SAFE_PROXY_CODEHASH = 0xd7d408ebcd99b2b70be43e20253d6d92a8ea8fab29bd3be7f55b10032331fb4c;
 
 // A Safe keeps its singleton in storage slot 0, and its fallback handler at
 // keccak256("fallback_manager.handler.address").
 bytes32 constant SAFE_SINGLETON_SLOT = bytes32(0);
 bytes32 constant SAFE_FALLBACK_HANDLER_SLOT = 0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5;
+// Its guard, which checks each of its transactions, at
+// keccak256("guard_manager.guard.address"), and the start of its module list.
+bytes32 constant SAFE_GUARD_SLOT = 0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8;
+address constant SAFE_SENTINEL_MODULES = address(0x1);
 
 library LibSafeSetup {
     /// The call that sets a new Safe up: `owners`, `threshold`, the
