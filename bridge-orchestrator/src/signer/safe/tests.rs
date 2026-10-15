@@ -11,11 +11,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 
 /// Anvil's accounts 1, 2 and 3: the owners of the Safe of threshold 2 at SAFE
-/// on mainnet in test/TestSafeCouponSignature.t.sol.
-pub(crate) const OWNER_KEYS: [&str; 3] = [
+/// on mainnet in test/TestSafeCouponSignature.t.sol. Then account 4, a fourth
+/// owner for a Safe of 4.
+pub(crate) const OWNER_KEYS: [&str; 4] = [
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
     "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
     "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+    "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
 ];
 pub(crate) const SAFE: Address = address!("3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22");
 const NOW: u64 = 1_750_000_000;
@@ -1105,4 +1107,137 @@ fn the_amount_vectors_in_the_signer_service_doc() {
             amount
         );
     }
+}
+
+/// A service that keeps the record "One order per withdrawal" in
+/// docs/signer-service.md requires: the order hash, word 3, it signed each
+/// withdrawal for. It refuses a withdrawal recorded under another order hash
+/// with already_signed, and otherwise records it and signs.
+async fn recording_service(key: PrivateKeySigner) -> FakeService {
+    let record = Mutex::new(std::collections::HashMap::<String, Value>::new());
+    fake_service(move |path, body| match path {
+        "/holo/signer" => (
+            "200 OK",
+            json!({"owner": key.address(), "safe": SAFE, "chainId": 1}).to_string(),
+        ),
+        "/holo/sign" => {
+            let withdrawal = body["withdrawal"].as_str().unwrap().to_string();
+            let order = body["context"][3].clone();
+            let mut record = record.lock().unwrap();
+            if record
+                .get(&withdrawal)
+                .is_some_and(|signed| *signed != order)
+            {
+                return (
+                    "409 Conflict",
+                    json!({"code": "already_signed"}).to_string(),
+                );
+            }
+            record.insert(withdrawal, order);
+            (
+                "200 OK",
+                signature_json(key.address(), &typed_data_signature(&own_hash(body), &key)),
+            )
+        }
+        _ => ("404 Not Found", "{}".to_string()),
+    })
+    .await
+}
+
+/// The request for `withdrawal()` under the claim order whose hash is 32
+/// bytes of `order`.
+fn request_for_order(order: u8) -> SignRequest {
+    let mut context: Vec<B256> = (0u8..9).map(B256::with_last_byte).collect();
+    context[3] = B256::repeat_byte(order);
+    SignRequest {
+        digest: context_digest(&context),
+        context,
+        withdrawal: Some(withdrawal()),
+    }
+}
+
+/// Owner `i`'s service asked for `request` alone, as any orchestrator can.
+async fn asked_alone(i: usize, service: &FakeService, request: &SignRequest) -> Result<Vec<u8>> {
+    let Owner::Service(service) = service_owner(&owner_key(i), service) else {
+        unreachable!()
+    };
+    service
+        .request_signature(&OwnerRequest {
+            safe: SAFE,
+            chain_id: 1,
+            sign: request,
+            safe_message_hash: safe_message_hash(1, SAFE, &request.digest),
+        })
+        .await
+}
+
+/// Lal's replay on PR #2. In a Safe of 2 of 4, owners A and B sign withdrawal W
+/// for claim order O1. After a rotation to O2, A refuses W with already_signed,
+/// but C and D never signed W, have no record of it, and would sign it for O2:
+/// a second coupon for W, which O1's used nonce does not stop on O2. So a Safe
+/// whose threshold is half its owners or fewer signs no coupon, and no owner is
+/// asked. With 3 of 4, every three owners hold one that signed W for O1, and it
+/// refuses: the records stop the second coupon once quorums intersect.
+#[tokio::test]
+async fn a_safe_whose_quorums_can_be_disjoint_signs_no_coupon() {
+    let (o1, o2) = (request_for_order(1), request_for_order(2));
+    let mut services = Vec::new();
+    for i in 0..4 {
+        services.push(recording_service(owner_key(i)).await);
+    }
+    for i in [0, 1] {
+        asked_alone(i, &services[i], &o1).await.unwrap();
+    }
+    let control = asked_alone(0, &services[0], &o2).await.unwrap_err();
+    assert_eq!(format!("{control:#}"), "refused: already_signed");
+
+    let chain = FakeSafe::new(2, &[0, 1, 2, 3]);
+    let url = chain.serve().await;
+    let owners = safe_owners(
+        vec![
+            service_owner(&owner_key(2), &services[2]),
+            service_owner(&owner_key(3), &services[3]),
+        ],
+        &url,
+    );
+    let err = owners
+        .sign_request(&o2)
+        .await
+        .expect_err("C and D signed W for O2");
+    assert_eq!(
+        format!("{err:#}"),
+        format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal). No owner was asked. To sign regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+    );
+    for service in &services[2..] {
+        assert!(service.requests.lock().unwrap().is_empty());
+    }
+
+    let mut services = Vec::new();
+    for i in 0..4 {
+        services.push(recording_service(owner_key(i)).await);
+    }
+    for i in [0, 1, 2] {
+        asked_alone(i, &services[i], &o1).await.unwrap();
+    }
+    let chain = FakeSafe::new(3, &[0, 1, 2, 3]);
+    let url = chain.serve().await;
+    for left_out in 0..4 {
+        let owners = safe_owners(
+            (0..4)
+                .filter(|i| *i != left_out)
+                .map(|i| service_owner(&owner_key(i), &services[i]))
+                .collect(),
+            &url,
+        );
+        let err = format!(
+            "{:#}",
+            owners
+                .sign_request(&o2)
+                .await
+                .expect_err("three owners signed W for O2")
+        );
+        assert!(err.contains("needs 3"), "{err}");
+        assert!(err.contains("refused: already_signed"), "{err}");
+    }
+    assert!(chain.asked.lock().unwrap().is_empty());
 }

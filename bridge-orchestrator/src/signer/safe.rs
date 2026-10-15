@@ -3,7 +3,7 @@
 //! services, and the Safe's EIP-1271 `isValidSignature` checks M of them
 //! (docs/signer-service.md).
 
-use super::{SignRequest, Signing, SIGN_TIMEOUT};
+use super::{SignRequest, Signing, ONE_PARTY_OVERRIDE, SIGN_TIMEOUT};
 use crate::config::Network;
 use alloy::primitives::{keccak256, Address, Bytes, PrimitiveSignature, B256, U256};
 use alloy::providers::{ProviderBuilder, RootProvider};
@@ -49,6 +49,21 @@ const MAX_OWNERS: usize = 20;
 /// Holochain node, so a service that takes longer is down, and the startup
 /// check, which asks every service at once, waits this long at most for them.
 pub const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why two sets of `threshold` of a Safe's `owners` owners can share none, or
+/// nothing when its threshold is more than half its owners. Each signer
+/// service refuses a withdrawal it signed for another claim order hash, so
+/// after a rotation the owners that signed a withdrawal for the old order
+/// refuse it for the new one. Only a threshold of more than half the owners
+/// puts one of them in every set that can sign
+/// (docs/signer-service.md#one-order-per-withdrawal).
+pub fn disjoint_quorums(safe: Address, threshold: usize, owners: usize) -> Option<String> {
+    (threshold.saturating_mul(2) <= owners).then(|| {
+        format!(
+            "CLAIM_SIGNER {safe} is a Safe of threshold {threshold} with {owners} owners, so two sets of {threshold} of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal)"
+        )
+    })
+}
 
 /// A Safe's EIP-712 domain separator, as Safe 1.3.0 and later compute it:
 /// `EIP712Domain(uint256 chainId,address verifyingContract)`.
@@ -167,6 +182,9 @@ pub struct OwnerSignature {
 /// silent service costs one timeout per cycle, not one per withdrawal. The
 /// startup check leaves out, until the first cycle, an owner whose service did
 /// not answer `GET /signer`.
+///
+/// A Safe whose threshold is half its owners or fewer signs nothing, unless
+/// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes (`disjoint_quorums`).
 pub struct SafeOwners {
     safe: Address,
     chain_id: u64,
@@ -174,7 +192,8 @@ pub struct SafeOwners {
     rpc_url: String,
     /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes: on mainnet, start even when this
     /// process alone can sign as the Safe, or holds owner keys of a Safe that is
-    /// also the vault admin.
+    /// also the vault admin; on any network, sign for a Safe whose threshold is
+    /// half its owners or fewer.
     one_party_allowed: bool,
     /// The owners left out this cycle, each with why: it did not answer within
     /// `sign_timeout`, or its service did not answer `GET /signer` at startup.
@@ -360,11 +379,20 @@ impl SafeOwners {
     /// it needs M signatures, and a service that never answers would otherwise
     /// hold the startup check up for its SIGN_TIMEOUT. A withdrawal waits for
     /// every owner, so that each refusal is logged.
+    ///
+    /// A Safe whose threshold is half its owners or fewer is refused before any
+    /// owner is asked, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
     pub async fn collect(
         &self,
         request: &SignRequest,
     ) -> Result<(SafeState, Vec<(Address, Result<OwnerSignature>)>)> {
         let state = self.state().await?;
+        if let Some(fault) = disjoint_quorums(self.safe, state.threshold, state.owners.len()) {
+            anyhow::ensure!(
+                self.one_party_allowed,
+                "{fault}. No owner was asked. To sign regardless, set {ONE_PARTY_OVERRIDE}=yes"
+            );
+        }
         let owner_request = OwnerRequest {
             safe: self.safe,
             chain_id: self.chain_id,

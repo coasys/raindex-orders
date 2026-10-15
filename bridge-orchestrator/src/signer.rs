@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub(crate) mod safe;
 #[cfg(test)]
 pub use safe::safe_message_hash;
-pub use safe::{safe_domain_separator, ISafe, Owner, OwnerService, SafeOwners};
+pub use safe::{disjoint_quorums, safe_domain_separator, ISafe, Owner, OwnerService, SafeOwners};
 
 /// The coupon signer whose private key is committed in `src/Constants.sol`.
 pub const TEST_SIGNER: Address = address!("8E72b7568738da52ca3DCd9b24E178127A4E7d37");
