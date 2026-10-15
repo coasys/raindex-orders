@@ -699,7 +699,12 @@ async fn a_coupon_the_safe_refuses_is_an_error() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+/// The tests of a silent service run on the real clock, with `SHORT_SIGN_TIMEOUT`
+/// to sign: under a paused clock the RPC's read timer would run out while the
+/// Safe's answer is on its way over the socket.
+const SHORT_SIGN_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[tokio::test]
 async fn a_signer_service_that_does_not_answer_is_left_out_after_the_timeout() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let url = chain.serve().await;
@@ -717,7 +722,8 @@ async fn a_signer_service_that_does_not_answer_is_left_out_after_the_timeout() {
             Owner::Key(owner_key(1)),
         ],
         &url,
-    );
+    )
+    .with_sign_timeout(SHORT_SIGN_TIMEOUT);
     let name = owners.owners()[0].name();
 
     let err = format!(
@@ -729,8 +735,8 @@ async fn a_signer_service_that_does_not_answer_is_left_out_after_the_timeout() {
     );
 
     assert!(
-        err.ends_with(&format!("{name}: did not answer within 20s"))
-            || err.ends_with(&format!("{name} did not sign within 20s")),
+        err.ends_with(&format!("{name}: did not answer within 500ms"))
+            || err.ends_with(&format!("{name} did not sign within 500ms")),
         "{err}"
     );
 }
@@ -754,15 +760,16 @@ async fn why_not(owners: &SafeOwners, i: usize) -> String {
     format!("{:#}", answers[i].1.as_ref().unwrap_err())
 }
 
+/// Whether `why` says the owner `name` ran out of SHORT_SIGN_TIMEOUT.
 fn timed_out(why: &str, name: &str) -> bool {
-    why == format!("{name}: did not answer within 20s")
-        || why == format!("{name} did not sign within 20s")
+    why == format!("{name}: did not answer within 500ms")
+        || why == format!("{name} did not sign within 500ms")
 }
 
 /// A service that does not answer costs one timeout a cycle, not one for each
 /// withdrawal: while the other owners are at least the threshold it is not
 /// asked again this cycle, and the others sign. A new cycle asks it again.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_signer_service_that_timed_out_is_not_asked_again_this_cycle_while_the_others_reach_m() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let url = chain.serve().await;
@@ -774,7 +781,8 @@ async fn a_signer_service_that_timed_out_is_not_asked_again_this_cycle_while_the
             Owner::Key(owner_key(2)),
         ],
         &url,
-    );
+    )
+    .with_sign_timeout(SHORT_SIGN_TIMEOUT);
     let name = owners.owners()[0].name();
 
     let first = why_not(&owners, 0).await;
@@ -789,7 +797,7 @@ async fn a_signer_service_that_timed_out_is_not_asked_again_this_cycle_while_the
     }
     assert_eq!(
         why_not(&owners, 0).await,
-        format!("{name} was not asked: it did not answer within 20s earlier this cycle")
+        format!("{name} was not asked: it did not answer within 500ms earlier this cycle")
     );
 
     owners.new_cycle();
@@ -799,7 +807,7 @@ async fn a_signer_service_that_timed_out_is_not_asked_again_this_cycle_while_the
 
 /// An owner that timed out is still asked while the other owners are fewer
 /// than the threshold: no coupon could be signed without it.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_signer_service_that_timed_out_is_asked_again_while_the_others_are_fewer_than_m() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let url = chain.serve().await;
@@ -810,7 +818,8 @@ async fn a_signer_service_that_timed_out_is_asked_again_while_the_others_are_few
             Owner::Key(owner_key(1)),
         ],
         &url,
-    );
+    )
+    .with_sign_timeout(SHORT_SIGN_TIMEOUT);
     let name = owners.owners()[0].name();
 
     for _ in 0..2 {
@@ -1240,4 +1249,84 @@ async fn a_safe_whose_quorums_can_be_disjoint_signs_no_coupon() {
         assert!(err.contains("refused: already_signed"), "{err}");
     }
     assert!(chain.asked.lock().unwrap().is_empty());
+}
+
+/// An RPC for a Safe of 2 of owners 0 and 1 that answers getThreshold and
+/// getOwners, and takes isValidSignature without ever answering it.
+async fn rpc_holding_is_valid_signature() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let body = read_request(&mut socket).await;
+                let call: Value = serde_json::from_slice(&body).unwrap();
+                let input = call["params"][0]["input"]
+                    .as_str()
+                    .or(call["params"][0]["data"].as_str())
+                    .unwrap();
+                let input = hex::decode(input.trim_start_matches("0x")).unwrap();
+                let selector: [u8; 4] = input[..4].try_into().unwrap();
+                let result = match selector {
+                    ISafe::getThresholdCall::SELECTOR => U256::from(2).abi_encode(),
+                    ISafe::getOwnersCall::SELECTOR => vec![owner(0), owner(1)].abi_encode(),
+                    _ => std::future::pending().await,
+                };
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": call["id"],
+                    "result": format!("0x{}", hex::encode(result)),
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    url
+}
+
+/// Each coupon reads the Safe's threshold and owners through the RPC, and has
+/// the Safe accept the signatures through it. Nothing else bounds those reads:
+/// an RPC that took one and never answered would hold the bridge cycle up for
+/// good, the deposits behind the withdrawal included. Each read has
+/// `rpc_timeout` instead, and the withdrawal stays parked for the cycle.
+#[tokio::test]
+async fn an_rpc_that_never_answers_a_read_of_the_safe_parks_the_coupon_within_the_rpc_timeout() {
+    for (rpc, read) in [
+        (silent_service().await, "getThreshold() and getOwners()"),
+        (
+            rpc_holding_is_valid_signature().await,
+            "isValidSignature(...)",
+        ),
+    ] {
+        let owners = safe_owners(
+            vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
+            &rpc,
+        )
+        .with_rpc_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            owners.sign_request(&request(Some(withdrawal()))),
+        )
+        .await;
+
+        let err = result
+            .unwrap_or_else(|_| panic!("the coupon hung for 5s on an RPC holding {read}"))
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!("CLAIM_SIGNER {SAFE}: {read} did not answer within 300ms")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{read} took {:?}",
+            started.elapsed()
+        );
+    }
 }

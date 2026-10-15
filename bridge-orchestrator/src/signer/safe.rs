@@ -5,6 +5,7 @@
 
 use super::{SignRequest, Signing, ONE_PARTY_OVERRIDE, SIGN_TIMEOUT};
 use crate::config::Network;
+use crate::preflight::RPC_TIMEOUT;
 use alloy::primitives::{keccak256, Address, Bytes, PrimitiveSignature, B256, U256};
 use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
@@ -200,6 +201,11 @@ pub struct SafeOwners {
     left_out: Mutex<HashMap<Address, String>>,
     /// How long each owner has to sign: SIGN_TIMEOUT, shorter in tests.
     sign_timeout: std::time::Duration,
+    /// How long the RPC has to answer each read of the Safe for a coupon:
+    /// RPC_TIMEOUT, shorter in tests. Nothing else bounds those reads, and an
+    /// RPC that took one and never answered would hold the bridge cycle up for
+    /// good, the deposits behind the withdrawal included.
+    rpc_timeout: Duration,
 }
 
 impl std::fmt::Debug for SafeOwners {
@@ -256,6 +262,7 @@ impl SafeOwners {
             one_party_allowed: false,
             left_out: Mutex::default(),
             sign_timeout: SIGN_TIMEOUT,
+            rpc_timeout: RPC_TIMEOUT,
         })
     }
 
@@ -272,6 +279,15 @@ impl SafeOwners {
     pub fn with_sign_timeout(self, timeout: std::time::Duration) -> Self {
         Self {
             sign_timeout: timeout,
+            ..self
+        }
+    }
+
+    /// These owners, whose RPC is given `timeout` to answer each read of the Safe.
+    #[cfg(test)]
+    pub fn with_rpc_timeout(self, timeout: Duration) -> Self {
+        Self {
+            rpc_timeout: timeout,
             ..self
         }
     }
@@ -325,37 +341,63 @@ impl SafeOwners {
         Ok(ProviderBuilder::new().on_http(url))
     }
 
+    /// `read`, a read of the Safe through the RPC, within `rpc_timeout`. The
+    /// RPC not answering is an error like any other: the withdrawal stays
+    /// parked for the cycle, and the cycle goes on.
+    async fn within<T>(
+        &self,
+        what: &str,
+        read: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::time::timeout(self.rpc_timeout, read)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "CLAIM_SIGNER {}: {what} did not answer within {:?}",
+                    self.safe,
+                    self.rpc_timeout
+                )
+            })?
+    }
+
     /// The Safe's threshold and owners, as it answers them now.
     pub async fn state(&self) -> Result<SafeState> {
         let provider = self.provider()?;
         let contract = ISafe::new(self.safe, &provider);
         let failed = |what: &str| format!("CLAIM_SIGNER {}: {what} failed", self.safe);
-        let threshold = contract
-            .getThreshold()
-            .call()
-            .await
-            .map_err(|_| anyhow!(failed("getThreshold()")))?
-            ._0;
-        let owners = contract
-            .getOwners()
-            .call()
-            .await
-            .map_err(|_| anyhow!(failed("getOwners()")))?
-            ._0;
-        Ok(SafeState {
-            threshold: usize::try_from(threshold).unwrap_or(usize::MAX),
-            owners,
+        self.within("getThreshold() and getOwners()", async {
+            let threshold = contract
+                .getThreshold()
+                .call()
+                .await
+                .map_err(|_| anyhow!(failed("getThreshold()")))?
+                ._0;
+            let owners = contract
+                .getOwners()
+                .call()
+                .await
+                .map_err(|_| anyhow!(failed("getOwners()")))?
+                ._0;
+            Ok(SafeState {
+                threshold: usize::try_from(threshold).unwrap_or(usize::MAX),
+                owners,
+            })
         })
+        .await
     }
 
     /// Whether the Safe's `isValidSignature(digest, signature)` answers the
     /// EIP-1271 magic value: what Raindex V6 asks it for a coupon.
     pub async fn accepts(&self, digest: &B256, signature: &[u8]) -> Result<bool> {
         let provider = self.provider()?;
-        let answer = ISafe::new(self.safe, &provider)
-            .isValidSignature(*digest, Bytes::copy_from_slice(signature))
-            .call()
-            .await;
+        let answer = self
+            .within("isValidSignature(...)", async {
+                Ok(ISafe::new(self.safe, &provider)
+                    .isValidSignature(*digest, Bytes::copy_from_slice(signature))
+                    .call()
+                    .await)
+            })
+            .await?;
         match answer {
             Ok(answer) => Ok(answer._0.0 == EIP1271_MAGIC_VALUE),
             Err(alloy::contract::Error::TransportError(
