@@ -141,6 +141,10 @@ pub struct SafeOwners {
     chain_id: u64,
     owners: Vec<Owner>,
     rpc_url: String,
+    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes: on mainnet, start even when this
+    /// process alone can sign as the Safe, or holds owner keys of a Safe that is
+    /// also the vault admin.
+    one_party_allowed: bool,
 }
 
 impl std::fmt::Debug for SafeOwners {
@@ -194,7 +198,21 @@ impl SafeOwners {
             chain_id,
             owners,
             rpc_url,
+            one_party_allowed: false,
         })
+    }
+
+    /// These owners, with UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes when `allowed`.
+    pub fn allowing_one_party(self, allowed: bool) -> Self {
+        Self {
+            one_party_allowed: allowed,
+            ..self
+        }
+    }
+
+    /// Whether UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes is set.
+    pub fn one_party_allowed(&self) -> bool {
+        self.one_party_allowed
     }
 
     pub fn safe(&self) -> Address {

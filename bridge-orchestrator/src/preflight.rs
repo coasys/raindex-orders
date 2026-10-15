@@ -1,6 +1,7 @@
 use crate::config::Network;
 use crate::signer::{
     safe_domain_separator, ClaimOrder, CouponSigner, ISafe, Owner, SafeOwners, SignedCoupon,
+    ONE_PARTY_OVERRIDE,
 };
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -61,6 +62,7 @@ sol! {
         function token() external view returns (address);
         function orderbook() external view returns (address);
         function vaultId() external view returns (bytes32);
+        function admin() external view returns (address);
     }
 
     #[sol(rpc)]
@@ -254,7 +256,13 @@ async fn read_and_compare(
                     order.signer
                 );
             }
-            check_safe(&provider, network, safe, rpc_var).await?;
+            let admin = lock_vault
+                .admin()
+                .call()
+                .await
+                .map_err(|e| call_failed("admin()", e))?
+                ._0;
+            check_safe(&provider, network, safe, admin, rpc_var).await?;
         }
     }
 
@@ -318,10 +326,16 @@ where
 /// Safe and this chain. A service that does not answer is logged, and the check
 /// passes while the owners that can sign are at least the threshold: a
 /// withdrawal stays parked while fewer sign.
+///
+/// On mainnet it also refuses, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes, a Safe
+/// this process alone could sign as: one of threshold 1, or one whose threshold
+/// of owner keys it holds. And it refuses any owner key held here when the Safe
+/// is also the vault `admin`, as that key also approves `adminWithdraw`.
 async fn check_safe<T, P>(
     provider: &P,
     network: Network,
     signer: &SafeOwners,
+    admin: Address,
     rpc_var: &str,
 ) -> Result<()>
 where
@@ -434,12 +448,40 @@ where
         signer.owners().len(),
         able.join("; ")
     );
+    let mut one_party = Vec::new();
+    if threshold < 2 {
+        one_party.push(format!(
+            "CLAIM_SIGNER {safe} is a Safe of threshold {threshold}, which one owner alone signs as"
+        ));
+    }
     if keys >= threshold {
-        tracing::warn!(
-            event = "startup.one_party",
-            "this orchestrator holds the keys of {keys} owners of CLAIM_SIGNER {safe}, a Safe of threshold {threshold}, and signs as all of them, which is one party, not {threshold} (docs/signer-service.md)"
+        one_party.push(format!(
+            "this orchestrator holds the keys of {keys} owners of CLAIM_SIGNER {safe}, a Safe of threshold {threshold}, and signs as all of them, which is one party, not {threshold}"
+        ));
+    }
+    if keys > 0 && admin == safe {
+        one_party.push(format!(
+            "CLAIM_SIGNER {safe} is also the vault's admin, so the {keys} owner keys in SAFE_OWNER_KEYS also approve its admin transactions, adminWithdraw among them"
+        ));
+    }
+    if one_party.is_empty() {
+        return Ok(());
+    }
+    let one_party = one_party.join("; ");
+    if network == Network::Mainnet && !signer.one_party_allowed() {
+        bail!(
+            "{one_party}. Mainnet takes owners at independent signer services, SAFE_OWNER_SERVICES (docs/signer-service.md). To start regardless, set {ONE_PARTY_OVERRIDE}=yes"
         );
     }
+    tracing::warn!(
+        event = "startup.one_party",
+        "{one_party} (docs/signer-service.md){}",
+        if network == Network::Mainnet {
+            format!(": {ONE_PARTY_OVERRIDE}=yes")
+        } else {
+            String::new()
+        }
+    );
     Ok(())
 }
 
@@ -659,6 +701,8 @@ mod tests {
         valid_signer: Address,
         signer_code: &'static str,
         vault_balance: U256,
+        /// The vault's admin.
+        admin: Address,
         /// What the claim signer answers as a Safe, when it is one.
         safe: Option<FakeSafe>,
     }
@@ -694,6 +738,7 @@ mod tests {
                 valid_signer: key().address(),
                 signer_code: "0x",
                 vault_balance: U256::from(10),
+                admin: OTHER,
                 safe: None,
             }
         }
@@ -736,6 +781,7 @@ mod tests {
                             IHoloLockVault::tokenCall::SELECTOR => self.token.abi_encode(),
                             IHoloLockVault::orderbookCall::SELECTOR => self.orderbook.abi_encode(),
                             IHoloLockVault::vaultIdCall::SELECTOR => self.vault_id.abi_encode(),
+                            IHoloLockVault::adminCall::SELECTOR => self.admin.abi_encode(),
                             _ => return empty,
                         }
                     } else if to == self.orderbook
@@ -990,9 +1036,22 @@ mod tests {
         asked: Vec<Owner>,
         signer_chain: u64,
     ) -> Result<()> {
+        safe_check_allowing(network, chain, order, asked, signer_chain, false).await
+    }
+
+    /// As `safe_check`, with UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes when `one_party`.
+    async fn safe_check_allowing(
+        network: Network,
+        chain: Chain,
+        order: ClaimOrder,
+        asked: Vec<Owner>,
+        signer_chain: u64,
+        one_party: bool,
+    ) -> Result<()> {
         let url =
             serve(move |method, params| chain.answer(method, params).map(Value::String)).await;
-        let owners = SafeOwners::new(SAFE, signer_chain, asked, url.clone())?;
+        let owners =
+            SafeOwners::new(SAFE, signer_chain, asked, url.clone())?.allowing_one_party(one_party);
         check(
             network,
             &url,
@@ -1014,15 +1073,90 @@ mod tests {
 
     /// The Safe's isValidSignature checks the owners' signatures over the
     /// SafeMessage hash, as the probe has it do through takeOrders4, with M
-    /// signatures, and refuses M-1.
+    /// signatures, and refuses M-1. Mainnet needs the override for M keys here.
     #[tokio::test]
     async fn passes_a_safe_claim_signer_whose_threshold_of_owner_keys_it_holds() {
-        for network in [Network::BaseSepolia, Network::Mainnet] {
+        for (network, one_party) in [(Network::BaseSepolia, false), (Network::Mainnet, true)] {
             let (chain, order) = safe_setup(network, 2);
-            safe_check(network, chain, order, held(&[2, 0]), network.chain_id())
-                .await
-                .unwrap();
+            safe_check_allowing(
+                network,
+                chain,
+                order,
+                held(&[2, 0]),
+                network.chain_id(),
+                one_party,
+            )
+            .await
+            .unwrap();
         }
+    }
+
+    /// The Safe's threshold of owner keys in one process is one party signing as
+    /// the Safe, and the Safe is the vault admin too at launch: mainnet refuses
+    /// it unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
+    #[tokio::test]
+    async fn mainnet_refuses_the_safes_threshold_of_owner_keys_without_the_override() {
+        let (chain, _) = safe_setup(Network::Mainnet, 2);
+
+        assert_eq!(
+            safe_refusal(Network::Mainnet, chain, held(&[2, 0])).await,
+            format!("this orchestrator holds the keys of 2 owners of CLAIM_SIGNER {SAFE}, a Safe of threshold 2, and signs as all of them, which is one party, not 2. Mainnet takes owners at independent signer services, SAFE_OWNER_SERVICES (docs/signer-service.md). To start regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+        );
+    }
+
+    /// When the Safe is also the vault admin, an owner key held here approves
+    /// admin transactions as well as coupons: mainnet refuses even one, unless
+    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes. A Safe that is not the admin takes it.
+    #[tokio::test]
+    async fn mainnet_refuses_an_owner_key_of_a_safe_that_is_also_the_vault_admin() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+        let service = owner_service(owners()[0].clone()).await;
+        let asked = || {
+            vec![
+                service_owner(&owners()[0], &service),
+                Owner::Key(owners()[2].clone()),
+            ]
+        };
+        let admin = Chain {
+            admin: SAFE,
+            ..chain.clone()
+        };
+
+        assert_eq!(
+            safe_refusal(Network::Mainnet, admin.clone(), asked()).await,
+            format!("CLAIM_SIGNER {SAFE} is also the vault's admin, so the 1 owner keys in SAFE_OWNER_KEYS also approve its admin transactions, adminWithdraw among them. Mainnet takes owners at independent signer services, SAFE_OWNER_SERVICES (docs/signer-service.md). To start regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+        );
+        safe_check_allowing(Network::Mainnet, admin, order.clone(), asked(), 1, true)
+            .await
+            .unwrap();
+        safe_check(Network::Mainnet, chain, order, asked(), 1)
+            .await
+            .unwrap();
+    }
+
+    /// A Safe of threshold 1 is one owner signing as the Safe: mainnet refuses
+    /// it unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes; base-sepolia takes it.
+    #[tokio::test]
+    async fn mainnet_refuses_a_safe_of_threshold_1_without_the_override() {
+        let services = [
+            owner_service(owners()[0].clone()).await,
+            owner_service(owners()[1].clone()).await,
+        ];
+        let asked = || {
+            vec![
+                service_owner(&owners()[0], &services[0]),
+                service_owner(&owners()[1], &services[1]),
+            ]
+        };
+        let (chain, order) = safe_setup(Network::Mainnet, 1);
+
+        assert_eq!(
+            safe_refusal(Network::Mainnet, chain.clone(), asked()).await,
+            format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 1, which one owner alone signs as. Mainnet takes owners at independent signer services, SAFE_OWNER_SERVICES (docs/signer-service.md). To start regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+        );
+        safe_check_allowing(Network::Mainnet, chain, order, asked(), 1, true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1115,7 +1249,7 @@ mod tests {
     async fn a_safe_refusing_its_owners_signatures_is_reported() {
         let (chain, order) = safe_setup(Network::Mainnet, 2);
 
-        let err = safe_check(Network::Mainnet, chain, order, held(&[0, 1]), 84_532)
+        let err = safe_check_allowing(Network::Mainnet, chain, order, held(&[0, 1]), 84_532, true)
             .await
             .unwrap_err();
 
@@ -1132,7 +1266,7 @@ mod tests {
         let (mut chain, order) = safe_setup(Network::Mainnet, 2);
         chain.safe.as_mut().unwrap().takes_one = true;
 
-        let err = safe_check(Network::Mainnet, chain, order, held(&[0, 1]), 1)
+        let err = safe_check_allowing(Network::Mainnet, chain, order, held(&[0, 1]), 1, true)
             .await
             .unwrap_err();
 

@@ -54,6 +54,12 @@ refuses to start, naming each variable at fault, when:
   them, and the simulated claim with M-1 of them must fail.
 - on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
   signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+- on `mainnet`, unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`: the Safe
+  `CLAIM_SIGNER` has a threshold of 1; `SAFE_OWNER_KEYS` holds as many keys as
+  its threshold, so this process alone signs as the Safe; or `SAFE_OWNER_KEYS`
+  holds any key while the Safe is also the vault's `admin()`, as that key also
+  approves the vault's admin transactions, `adminWithdraw` among them. Off
+  mainnet these are logged (`startup.one_party`) and the orchestrator starts
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
 its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
@@ -354,7 +360,8 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 |----------|----------|-----------------|
 | `SIGNER_PRIVATE_KEY` | For a key | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
 | `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 20 seconds each, takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
-| `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)). On mainnet it needs `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` when it holds the threshold's worth, or any key of a Safe that is also the vault admin |
+| `UNSAFE_ALLOW_ONE_PARTY_SIGNER` | No | -- `yes` lets a mainnet orchestrator start although it alone can sign as the Safe `CLAIM_SIGNER` (a threshold of 1, or the threshold's worth of `SAFE_OWNER_KEYS`), or holds owner keys of a Safe that is also the vault admin. It logs that, as `startup.one_party`. Any value other than `yes` is refused |
 | `ORDER_HASH` | Yes | -- |
 | `ORDER_OWNER` | Yes | -- (the vault) |
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |

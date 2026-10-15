@@ -18,7 +18,7 @@ fork=http://127.0.0.1:$PORT
 plain=http://127.0.0.1:$((PORT + 1))
 
 unset ETH_RPC_URL SEPOLIA_RPC_URL ADMIN_ADDRESS VALID_SIGNER ADMIN_SAFE_THRESHOLD ADMIN_SAFE_OWNERS \
-	UNSAFE_ALLOW_SINGLE_KEY_ADMIN SAFE_OWNERS SAFE_THRESHOLD SAFE_SALT_NONCE
+	UNSAFE_ALLOW_SINGLE_KEY_ADMIN UNSAFE_ALLOW_ONE_PARTY_SIGNER SAFE_OWNERS SAFE_THRESHOLD SAFE_SALT_NONCE
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 work=$(mktemp -d)
@@ -331,8 +331,13 @@ bridge_owner() { address_of "${bridge_owner_keys[$1]}"; }
 at() { echo "$(bridge_owner "$1")=http://127.0.0.1:$2"; }
 
 step "Starting the orchestrator for the bridge's Safe"
-expect_startup "$work/one.log" "with the keys of 2 of the Safe's 3 owners" \
+# Owner keys held by the orchestrator are one party, and here they are the vault
+# admin's keys too: mainnet refuses them unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
+expect_orchestrator_refusal "$work/one.log" \
+	"this orchestrator holds the keys of 2 owners of CLAIM_SIGNER $bridge_safe, a Safe of threshold 2, and signs as all of them, which is one party, not 2; CLAIM_SIGNER $bridge_safe is also the vault's admin" \
 	SAFE_OWNER_KEYS="${bridge_owner_keys[0]},${bridge_owner_keys[1]}"
+expect_startup "$work/one.log" "with the keys of 2 of the Safe's 3 owners and UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes" \
+	SAFE_OWNER_KEYS="${bridge_owner_keys[0]},${bridge_owner_keys[1]}" UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes
 grep -qF "which is one party, not 2" "$work/orchestrator.log" || fail "the orchestrator did not say it is one party"
 expect_startup "$work/one.log" "with the Safe's 3 owners at their signer services" \
 	SAFE_OWNER_SERVICES="$(at 0 $service_port),$(at 1 $((service_port + 1))),$(at 2 $((service_port + 2)))"
@@ -346,8 +351,12 @@ grep -qF "the signer service for $(bridge_owner 0) at 127.0.0.1:$down_port could
 expect_startup "$work/one.log" "with one owner's signer service refusing" \
 	SAFE_OWNER_SERVICES="$(at 0 $service_port),$(at 1 $((service_port + 1))),$(at 2 $((service_port + 4)))"
 grep -qF "refused: refused_by_operator" "$work/orchestrator.log" || fail "the orchestrator did not log the refusal's code"
-expect_startup "$work/one.log" "with one owner key held here and one owner's signer service" \
+expect_orchestrator_refusal "$work/one.log" \
+	"CLAIM_SIGNER $bridge_safe is also the vault's admin, so the 1 owner keys in SAFE_OWNER_KEYS also approve its admin transactions" \
 	SAFE_OWNER_KEYS="${bridge_owner_keys[2]}" SAFE_OWNER_SERVICES="$(at 1 $((service_port + 1)))"
+expect_startup "$work/one.log" "with one owner key held here, one owner's signer service and UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes" \
+	SAFE_OWNER_KEYS="${bridge_owner_keys[2]}" SAFE_OWNER_SERVICES="$(at 1 $((service_port + 1)))" \
+	UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes
 expect_orchestrator_refusal "$work/one.log" \
 	"1 of the owners this orchestrator asks can sign now, and CLAIM_SIGNER $bridge_safe is a Safe of threshold 2" \
 	SAFE_OWNER_SERVICES="$(at 0 $down_port),$(at 1 $((service_port + 1)))"
@@ -488,7 +497,11 @@ new_bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/rotated.log")
 
 step "Starting the orchestrator for the Safe coupon signer with its owners' keys"
 two_owner_keys="${signer_owner_keys[1]},${signer_owner_keys[2]}"
-expect_startup "$work/rotated.log" "with the keys of 2 of the signer Safe's 3 owners" SAFE_OWNER_KEYS="$two_owner_keys"
+expect_orchestrator_refusal "$work/rotated.log" \
+	"this orchestrator holds the keys of 2 owners of CLAIM_SIGNER $signer_safe, a Safe of threshold 2, and signs as all of them, which is one party, not 2. Mainnet takes owners at independent signer services" \
+	SAFE_OWNER_KEYS="$two_owner_keys"
+expect_startup "$work/rotated.log" "with the keys of 2 of the signer Safe's 3 owners and UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes" \
+	SAFE_OWNER_KEYS="$two_owner_keys" UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes
 grep -qF "CLAIM_SIGNER is a Safe of threshold 2" "$work/orchestrator.log" ||
 	fail "the orchestrator did not log the Safe's threshold"
 expect_orchestrator_refusal "$work/rotated.log" \

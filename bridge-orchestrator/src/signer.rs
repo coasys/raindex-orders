@@ -34,6 +34,12 @@ const CLAIM_ORDER_VARIABLES: [&str; 10] = [
 
 const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
 
+/// Lets a mainnet orchestrator start although it alone can sign as the Safe
+/// CLAIM_SIGNER, or holds owner keys of a Safe that is also the vault admin. As
+/// `UNSAFE_ALLOW_SINGLE_KEY_ADMIN` in script/ClaimOrderScript.sol, only `yes`
+/// sets it.
+pub const ONE_PARTY_OVERRIDE: &str = "UNSAFE_ALLOW_ONE_PARTY_SIGNER";
+
 /// HOT's decimals on Ethereum, which the coupon's amount float carries as its
 /// exponent.
 const HOT_DECIMALS: u32 = 18;
@@ -43,6 +49,7 @@ pub(crate) fn env_variables() -> impl Iterator<Item = &'static str> {
         "SIGNER_PRIVATE_KEY",
         "SAFE_OWNER_KEYS",
         "SAFE_OWNER_SERVICES",
+        ONE_PARTY_OVERRIDE,
         "EXPIRY_SECONDS",
     ])
 }
@@ -196,6 +203,7 @@ impl CouponSigner {
                 keys,
                 services,
                 setting(network.rpc_url_var()),
+                setting(ONE_PARTY_OVERRIDE),
                 &mut faults,
             )
             .map(|owners| Box::new(owners) as Box<dyn CouponKey>),
@@ -345,9 +353,20 @@ fn safe_owners_from(
     keys: Option<String>,
     services: Option<String>,
     rpc_url: Option<String>,
+    one_party: Option<String>,
     faults: &mut Vec<String>,
 ) -> Option<SafeOwners> {
     let before = faults.len();
+    let one_party_allowed = match one_party.as_deref() {
+        None | Some("") => false,
+        Some("yes") => true,
+        Some(other) => {
+            faults.push(format!(
+                "{ONE_PARTY_OVERRIDE}={other} is not yes: set it to yes or leave it unset"
+            ));
+            false
+        }
+    };
     let mut owners = Vec::new();
     if let Some(raw) = keys {
         let parsed: std::result::Result<Vec<PrivateKeySigner>, _> = raw
@@ -404,7 +423,7 @@ fn safe_owners_from(
         return None;
     }
     match SafeOwners::new(safe, network.chain_id(), owners, rpc_url) {
-        Ok(owners) => Some(owners),
+        Ok(owners) => Some(owners.allowing_one_party(one_party_allowed)),
         Err(err) => {
             faults.push(format!("{err:#}"));
             None
@@ -1003,6 +1022,35 @@ mod tests {
         assert_eq!(
             signer.safe().unwrap().addresses(),
             vec![owner_key(1).address(), owner_key(0).address()]
+        );
+    }
+
+    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER is `yes` or unset; another value is a
+    /// typo the operator should hear about, not a quiet "no".
+    #[test]
+    fn the_one_party_override_is_yes_or_unset() {
+        let two = format!("{}, {}", OWNER_KEYS[1], OWNER_KEYS[0]);
+        let with = |value: Option<&'static str>| {
+            let base = safe_settings(&two);
+            move |key: &str| match key {
+                ONE_PARTY_OVERRIDE => value.map(str::to_string),
+                other => base(other),
+            }
+        };
+        let allowed = |value| {
+            CouponSigner::from_settings(Network::Mainnet, with(value))
+                .unwrap()
+                .safe()
+                .unwrap()
+                .one_party_allowed()
+        };
+
+        assert!(!allowed(None));
+        assert!(!allowed(Some("")));
+        assert!(allowed(Some("yes")));
+        assert_eq!(
+            refusal(Network::Mainnet, with(Some("true"))),
+            "UNSAFE_ALLOW_ONE_PARTY_SIGNER=true is not yes: set it to yes or leave it unset"
         );
     }
 
