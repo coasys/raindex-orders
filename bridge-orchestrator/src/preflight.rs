@@ -1,75 +1,87 @@
 use crate::config::Network;
 use crate::signer::{ClaimOrder, CouponSigner, SignedCoupon};
-use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
-use alloy::sol_types::{Revert, SolError, SolValue};
+use alloy::sol_types::{Revert, SolCall, SolError, SolValue};
 use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use anyhow::{anyhow, bail, Result};
 use std::error::Error;
 use std::time::Duration;
 
 sol! {
-    struct IO {
+    struct IOV2 {
         address token;
-        uint8 decimals;
-        uint256 vaultId;
+        bytes32 vaultId;
     }
 
-    struct EvaluableV2 {
+    struct EvaluableV4 {
         address interpreter;
         address store;
-        address expression;
+        bytes bytecode;
     }
 
-    struct OrderV2 {
+    struct OrderV4 {
         address owner;
-        bool handleIO;
-        EvaluableV2 evaluable;
-        IO[] validInputs;
-        IO[] validOutputs;
+        EvaluableV4 evaluable;
+        IOV2[] validInputs;
+        IOV2[] validOutputs;
+        bytes32 nonce;
     }
 
     struct SignedContextV1 {
         address signer;
-        uint256[] context;
+        bytes32[] context;
         bytes signature;
     }
 
-    struct TakeOrderConfigV2 {
-        OrderV2 order;
+    struct TakeOrderConfigV4 {
+        OrderV4 order;
         uint256 inputIOIndex;
         uint256 outputIOIndex;
         SignedContextV1[] signedContext;
     }
 
-    struct TakeOrdersConfigV2 {
-        uint256 minimumInput;
-        uint256 maximumInput;
-        uint256 maximumIORatio;
-        TakeOrderConfigV2[] orders;
+    /// Every amount is a decimal float, a bytes32.
+    struct TakeOrdersConfigV5 {
+        bytes32 minimumIO;
+        bytes32 maximumIO;
+        bytes32 maximumIORatio;
+        bool IOIsInput;
+        TakeOrderConfigV4[] orders;
         bytes data;
     }
 
-    error MinimumInput(uint256 minimumInput, uint256 input);
+    error MinimumIO(bytes32 minimumIO, bytes32 actualIO);
 
     #[sol(rpc)]
     interface IHoloLockVault {
         function token() external view returns (address);
         function orderbook() external view returns (address);
-        function vaultId() external view returns (uint256);
+        function vaultId() external view returns (bytes32);
     }
 
     #[sol(rpc)]
-    interface IOrderBookV3 {
+    interface IRaindexV6 {
         function orderExists(bytes32 orderHash) external view returns (bool);
-        function takeOrders(TakeOrdersConfigV2 calldata config)
+        function takeOrders4(TakeOrdersConfigV5 calldata config)
             external
-            returns (uint256 totalTakerInput, uint256 totalTakerOutput);
+            returns (bytes32 totalTakerInput, bytes32 totalTakerOutput);
     }
 }
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The claim order's io-ratio, `1e-30` in src/holo-claim.rain, as the float the
+/// parser makes of it: coefficient 1, exponent -30 (`CLAIM_IO_RATIO` in
+/// src/Constants.sol). A claim passes it as its maximum ratio.
+pub const CLAIM_IO_RATIO: B256 = B256::new([
+    0xff, 0xff, 0xff, 0xe2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 1,
+]);
+
+/// The claim order's nonce, `CLAIM_ORDER_NONCE` in src/Constants.sol.
+pub const CLAIM_ORDER_NONCE: B256 = B256::ZERO;
 
 /// Refuses to run the bridge unless the RPC answers for `network`, the vault and
 /// claim order the configuration names are the ones deployed there, and that order
@@ -168,7 +180,7 @@ async fn read_and_compare(
     }
     if vault_id != order.vault_id {
         faults.push(format!(
-            "VAULT_ID {:#x} is not the vault's vaultId {vault_id:#x}",
+            "VAULT_ID {} is not the vault's vaultId {vault_id}",
             order.vault_id
         ));
     }
@@ -180,7 +192,7 @@ async fn read_and_compare(
     }
     if order_hash(&claim_order(order)) != order.order_hash {
         faults.push(
-            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION and CLAIM_INPUT_TOKEN describe"
+            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_BYTECODE and CLAIM_INPUT_TOKEN describe"
                 .to_string(),
         );
     }
@@ -190,7 +202,7 @@ async fn read_and_compare(
             order.orderbook
         ));
     } else {
-        let exists = IOrderBookV3::new(orderbook, &provider)
+        let exists = IRaindexV6::new(orderbook, &provider)
             .orderExists(order.order_hash)
             .call()
             .await
@@ -211,7 +223,13 @@ async fn read_and_compare(
         .get_code_at(order.signer)
         .await
         .map_err(|e| read_failed("eth_getCode(CLAIM_SIGNER)", e))?;
-    if !signer_code.is_empty() && !is_delegated_key(&signer_code) {
+    if is_delegated_key(&signer_code) {
+        bail!(
+            "CLAIM_SIGNER {} has an EIP-7702 delegation: Raindex V6 asks the delegate contract for a coupon's signature in place of the key, so the key's coupons are refused. Use a key with no delegation",
+            order.signer
+        );
+    }
+    if !signer_code.is_empty() {
         bail!(
             "CLAIM_SIGNER {} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it",
             order.signer
@@ -226,35 +244,42 @@ async fn read_and_compare(
     }
 
     let probe = signer.probe_coupon().await?;
-    let taken = IOrderBookV3::new(order.orderbook, &provider)
-        .takeOrders(take_one(order, probe))
+    let call = take_one(order, probe);
+    tracing::debug!(
+        event = "startup.probe",
+        calldata = %Bytes::from(IRaindexV6::takeOrders4Call { config: call.clone() }.abi_encode()),
+        "simulating the claim order probe"
+    );
+    let taken = IRaindexV6::new(order.orderbook, &provider)
+        .takeOrders4(call)
         .from(order.signer)
         .call()
         .await;
     accepts_signer(order.signer, taken.map(|_| ()), rpc_var)
 }
 
-/// Whether simulating takeOrders with the probe coupon shows the claim order accepts
-/// its signer. Its first check is the signer, so any other outcome comes after it.
-/// Only a claim, or MinimumInput for a vault that cannot pay the one wei, counts.
+/// Whether simulating takeOrders4 with the probe coupon shows the claim order
+/// accepts its signer. Its first check is the signer, so any other outcome comes
+/// after it. Only a claim, or MinimumIO for a vault that cannot pay the one wei,
+/// counts.
 fn accepts_signer(
     signer: Address,
     taken: std::result::Result<(), alloy::contract::Error>,
     rpc_var: &str,
 ) -> Result<()> {
-    let what = "the claim order probe (takeOrders)";
+    let what = "the claim order probe (takeOrders4)";
     let payload = match taken {
         Ok(()) => return Ok(()),
         Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(payload))) => payload,
         Err(alloy::contract::Error::TransportError(e)) => {
             return Err(rpc_failure(rpc_var, what, &e))
         }
-        Err(_) => bail!("{what} answered with data that is not takeOrders' result"),
+        Err(_) => bail!("{what} answered with data that is not takeOrders4's result"),
     };
     let Some(revert) = payload.as_revert_data() else {
         return Err(rpc_failure(rpc_var, what, &RpcError::ErrorResp(payload)));
     };
-    if MinimumInput::abi_decode(&revert, true).is_ok() {
+    if MinimumIO::abi_decode(&revert, true).is_ok() {
         return Ok(());
     }
     if Revert::abi_decode(&revert, true).is_ok_and(|r| r.reason == "Wrong signer") {
@@ -266,46 +291,50 @@ fn accepts_signer(
     )
 }
 
-/// An EIP-7702 delegation leaves an account a key, which the orderbook checks by its
-/// ECDSA signature before it asks any code.
+/// An account with an EIP-7702 delegation. OrderBookV3 checked such a signer's
+/// coupons by their ECDSA signature; Raindex V6 (OpenZeppelin 5's SignatureChecker)
+/// asks any account with code, a delegation included, through EIP-1271 only, so a
+/// delegated key's coupons are refused.
 fn is_delegated_key(code: &Bytes) -> bool {
     code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x00])
 }
 
-/// The OrderV2 the vault added, as script/ClaimOrderScript.sol adds it.
-fn claim_order(order: &ClaimOrder) -> OrderV2 {
-    let io = |token| IO {
+/// The OrderV4 the vault added, as script/ClaimOrderScript.sol adds it.
+fn claim_order(order: &ClaimOrder) -> OrderV4 {
+    let io = |token| IOV2 {
         token,
-        decimals: 18,
         vaultId: order.vault_id,
     };
-    OrderV2 {
+    OrderV4 {
         owner: order.order_owner,
-        handleIO: true,
-        evaluable: EvaluableV2 {
+        evaluable: EvaluableV4 {
             interpreter: order.interpreter,
             store: order.store,
-            expression: order.expression,
+            bytecode: order.bytecode.clone(),
         },
         validInputs: vec![io(order.input_token)],
         validOutputs: vec![io(order.token)],
+        nonce: CLAIM_ORDER_NONCE,
     }
 }
 
-fn order_hash(order: &OrderV2) -> B256 {
+fn order_hash(order: &OrderV4) -> B256 {
     keccak256(order.abi_encode())
 }
 
-fn take_one(order: &ClaimOrder, probe: SignedCoupon) -> TakeOrdersConfigV2 {
+/// The claim as the website sends it: takeOrders4 for exactly the coupon's
+/// amount, the taker's input being the order's output.
+fn take_one(order: &ClaimOrder, probe: SignedCoupon) -> TakeOrdersConfigV5 {
     let amount = probe.context[1];
-    TakeOrdersConfigV2 {
-        minimumInput: amount,
-        maximumInput: amount,
-        maximumIORatio: U256::ZERO,
-        orders: vec![TakeOrderConfigV2 {
+    TakeOrdersConfigV5 {
+        minimumIO: amount,
+        maximumIO: amount,
+        maximumIORatio: CLAIM_IO_RATIO,
+        IOIsInput: true,
+        orders: vec![TakeOrderConfigV4 {
             order: claim_order(order),
-            inputIOIndex: U256::ZERO,
-            outputIOIndex: U256::ZERO,
+            inputIOIndex: alloy::primitives::U256::ZERO,
+            outputIOIndex: alloy::primitives::U256::ZERO,
             signedContext: vec![SignedContextV1 {
                 signer: probe.signer,
                 context: probe.context,
@@ -362,7 +391,8 @@ fn causes(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use crate::fake_rpc::{read_request, serve};
-    use alloy::primitives::{address, PrimitiveSignature};
+    use crate::signer::{amount_word, context_digest};
+    use alloy::primitives::{address, PrimitiveSignature, U256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
     use serde_json::{json, Value};
@@ -371,11 +401,11 @@ mod tests {
 
     const VAULT: Address = address!("E3E064e3C2EEf66cb93dA8D8114F5084E92F48D6");
     const HOT: Address = address!("6c6EE5e31d828De241282B9606C8e98Ea48526E2");
-    const ORDERBOOK: Address = address!("f1224A483ad7F1E9aA46A8CE41229F32d7549A74");
+    const ORDERBOOK: Address = address!("37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
     const OTHER: Address = address!("1111111111111111111111111111111111111111");
     const KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 
-    fn vault_id() -> U256 {
+    fn vault_id() -> B256 {
         "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
             .parse()
             .unwrap()
@@ -394,10 +424,10 @@ mod tests {
             token: HOT,
             vault_id: vault_id(),
             signer: key().address(),
-            interpreter: address!("4C7436641da0505A8012218c1524Db0060Fd7253"),
-            store: address!("32a868432101C516647E7Ee217CA641B288953C6"),
-            expression: address!("1e814F560938B7Ed82Ba00Cc075a822E4789309E"),
-            input_token: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
+            interpreter: address!("4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf"),
+            store: address!("1Aa775533E28B1D843e1A589034984E3a62005DC"),
+            bytecode: Bytes::from_static(&[0x00, 0xab]),
+            input_token: address!("1234567890123456789012345678901234567890"),
         };
         order.order_hash = order_hash(&claim_order(&order));
         order
@@ -405,6 +435,16 @@ mod tests {
 
     fn signer_for(order: ClaimOrder) -> CouponSigner {
         CouponSigner::for_order(key(), order)
+    }
+
+    /// The wei a coupon's amount word carries: its exponent must be -18.
+    fn wei_of(word: B256) -> U256 {
+        assert_eq!(
+            &word.0[..4],
+            &[0xff, 0xff, 0xff, 0xee],
+            "the amount word's exponent"
+        );
+        U256::from_be_bytes(word.0) & ((U256::from(1) << 224) - U256::from(1))
     }
 
     /// What a JSON-RPC endpoint answers about one chain: the vault deployed with
@@ -416,7 +456,7 @@ mod tests {
         vault_deployed: bool,
         token: Address,
         orderbook: Address,
-        vault_id: U256,
+        vault_id: B256,
         orders: Vec<B256>,
         valid_signer: Address,
         signer_code: &'static str,
@@ -471,14 +511,14 @@ mod tests {
                             _ => return empty,
                         }
                     } else if to == self.orderbook
-                        && selector == IOrderBookV3::orderExistsCall::SELECTOR
+                        && selector == IRaindexV6::orderExistsCall::SELECTOR
                     {
-                        let asked = IOrderBookV3::orderExistsCall::abi_decode(&input, true)
+                        let asked = IRaindexV6::orderExistsCall::abi_decode(&input, true)
                             .unwrap()
                             .orderHash;
                         self.orders.contains(&asked).abi_encode()
                     } else if to == self.orderbook
-                        && selector == IOrderBookV3::takeOrdersCall::SELECTOR
+                        && selector == IRaindexV6::takeOrders4Call::SELECTOR
                     {
                         return self.take_orders(&input);
                     } else {
@@ -490,26 +530,15 @@ mod tests {
             }
         }
 
-        /// takeOrders as OrderBookV3 runs the claim order: the coupon's signature
+        /// takeOrders4 as RaindexV6 runs the claim order: the coupon's signature
         /// first, then the expression's signer check, then the vault's balance.
         fn take_orders(&self, input: &[u8]) -> Answer {
-            let config = IOrderBookV3::takeOrdersCall::abi_decode(input, true)
+            let config = IRaindexV6::takeOrders4Call::abi_decode(input, true)
                 .unwrap()
                 .config;
             let take = &config.orders[0];
             let coupon = &take.signedContext[0];
-            let packed: Vec<u8> = coupon
-                .context
-                .iter()
-                .flat_map(|v| v.to_be_bytes::<32>())
-                .collect();
-            let digest = keccak256(
-                [
-                    b"\x19Ethereum Signed Message:\n32".as_slice(),
-                    keccak256(&packed).as_slice(),
-                ]
-                .concat(),
-            );
+            let digest = context_digest(&coupon.context);
             let recovered = PrimitiveSignature::try_from(coupon.signature.as_ref())
                 .unwrap()
                 .recover_address_from_prehash(&digest)
@@ -519,6 +548,14 @@ mod tests {
                 self.orders.contains(&order_hash(&take.order)),
                 "the probe named an order the orderbook does not hold"
             );
+            assert!(
+                config.IOIsInput,
+                "a claim takes the order's output as its input"
+            );
+            assert_eq!(
+                config.maximumIORatio, CLAIM_IO_RATIO,
+                "the claim's maximum ratio"
+            );
             if coupon.signer != self.valid_signer {
                 return reverted(
                     Revert {
@@ -527,18 +564,18 @@ mod tests {
                     .abi_encode(),
                 );
             }
-            if self.vault_balance < config.minimumInput {
+            if self.vault_balance < wei_of(config.minimumIO) {
                 return reverted(
-                    MinimumInput {
-                        minimumInput: config.minimumInput,
-                        input: U256::ZERO,
+                    MinimumIO {
+                        minimumIO: config.minimumIO,
+                        actualIO: B256::ZERO,
                     }
                     .abi_encode(),
                 );
             }
             Ok(format!(
                 "0x{}",
-                hex::encode((config.minimumInput, U256::ZERO).abi_encode_params())
+                hex::encode((config.minimumIO, B256::ZERO).abi_encode_params())
             ))
         }
     }
@@ -610,7 +647,7 @@ mod tests {
         order.order_hash = order_hash(&claim_order(&order));
         let chain = Chain {
             orders: vec![order.order_hash],
-            ..Chain::of(Network::Sepolia)
+            ..Chain::of(Network::BaseSepolia)
         };
         (order, chain)
     }
@@ -626,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn passes_when_the_chain_holds_the_configured_vault_and_order() {
-        for network in [Network::Sepolia, Network::Mainnet] {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
             check_against(network, Chain::of(network), &order())
                 .await
                 .unwrap();
@@ -636,12 +673,12 @@ mod tests {
     #[tokio::test]
     async fn refuses_an_rpc_that_answers_for_the_other_network() {
         assert_eq!(
-            refusal(Network::Mainnet, Chain::of(Network::Sepolia), &order()).await,
-            "ETH_RPC_URL answers for chain 11155111, and NETWORK=mainnet is chain 1"
+            refusal(Network::Mainnet, Chain::of(Network::BaseSepolia), &order()).await,
+            "ETH_RPC_URL answers for chain 84532, and NETWORK=mainnet is chain 1"
         );
         assert_eq!(
-            refusal(Network::Sepolia, Chain::of(Network::Mainnet), &order()).await,
-            "SEPOLIA_RPC_URL answers for chain 1, and NETWORK=sepolia is chain 11155111"
+            refusal(Network::BaseSepolia, Chain::of(Network::Mainnet), &order()).await,
+            "BASE_SEPOLIA_RPC_URL answers for chain 1, and NETWORK=base-sepolia is chain 84532"
         );
     }
 
@@ -660,6 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn names_each_value_the_vault_does_not_hold() {
+        let one = B256::with_last_byte(1);
         let differing = [
             (
                 Chain {
@@ -670,10 +708,10 @@ mod tests {
             ),
             (
                 Chain {
-                    vault_id: U256::from(1),
+                    vault_id: one,
                     ..Chain::of(Network::Mainnet)
                 },
-                format!("VAULT_ID {:#x} is not the vault's vaultId 0x1", vault_id()),
+                format!("VAULT_ID {} is not the vault's vaultId {one}", vault_id()),
             ),
             (
                 Chain {
@@ -693,8 +731,8 @@ mod tests {
         let (order, chain) = changed(|order| order.order_owner = OTHER);
 
         assert_eq!(
-            refusal(Network::Sepolia, chain, &order).await,
-            format!("ORDER_OWNER {OTHER} is not the vault SEPOLIA_LOCK_VAULT_ADDRESS {VAULT}")
+            refusal(Network::BaseSepolia, chain, &order).await,
+            format!("ORDER_OWNER {OTHER} is not the vault BASE_SEPOLIA_LOCK_VAULT_ADDRESS {VAULT}")
         );
     }
 
@@ -748,7 +786,7 @@ mod tests {
             Duration::from_secs(10),
             check_within(
                 Duration::from_millis(200),
-                Network::Sepolia,
+                Network::BaseSepolia,
                 &url,
                 VAULT,
                 &signer_for(order()),
@@ -761,7 +799,7 @@ mod tests {
 
         assert_eq!(
             format!("{err:#}"),
-            "SEPOLIA_RPC_URL did not answer within 200ms"
+            "BASE_SEPOLIA_RPC_URL did not answer within 200ms"
         );
     }
 
@@ -792,20 +830,27 @@ mod tests {
 
         assert_eq!(
             refusal(Network::Mainnet, Chain::of(Network::Mainnet), &order).await,
-            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION and CLAIM_INPUT_TOKEN describe"
+            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_BYTECODE and CLAIM_INPUT_TOKEN describe"
         );
     }
 
+    /// The order hash test vector: test/TestCouponSignature.t.sol hashes the same
+    /// OrderV4 with Solidity's abi.encode, and ui/src/lib/network.test.ts with viem.
     #[test]
-    fn rebuilds_the_hash_of_the_claim_order_on_sepolia() {
-        let sepolia = ClaimOrder::sepolia();
+    fn hashes_the_claim_order_as_raindex_does() {
+        let vector = ClaimOrder::vector();
 
-        assert_eq!(order_hash(&claim_order(&sepolia)), sepolia.order_hash);
+        assert_eq!(
+            order_hash(&claim_order(&vector)),
+            "0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b"
+                .parse::<B256>()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
     async fn refuses_a_key_the_claim_order_does_not_accept() {
-        for network in [Network::Sepolia, Network::Mainnet] {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
             let chain = Chain {
                 valid_signer: OTHER,
                 ..Chain::of(network)
@@ -835,7 +880,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_a_claim_signer_that_is_a_contract() {
-        for network in [Network::Sepolia, Network::Mainnet] {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
             let chain = Chain {
                 signer_code: "0x608060405260043610",
                 ..Chain::of(network)
@@ -860,7 +905,7 @@ mod tests {
         };
 
         assert_eq!(
-            refusal(Network::Sepolia, chain, &order).await,
+            refusal(Network::BaseSepolia, chain, &order).await,
             format!(
                 "CLAIM_SIGNER {OTHER} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it"
             )
@@ -872,7 +917,7 @@ mod tests {
         let (order, chain) = changed(|order| order.signer = OTHER);
 
         assert_eq!(
-            refusal(Network::Sepolia, chain, &order).await,
+            refusal(Network::BaseSepolia, chain, &order).await,
             format!(
                 "SIGNER_PRIVATE_KEY is the key of {}, not of CLAIM_SIGNER {OTHER}",
                 key().address()
@@ -880,16 +925,90 @@ mod tests {
         );
     }
 
+    /// Anvil's public accounts carry such a delegation on mainnet, which is how
+    /// this was found: Raindex V6 refused their coupons with InvalidSignature.
     #[tokio::test]
-    async fn passes_a_claim_signer_that_is_a_key_with_an_eip_7702_delegation() {
+    async fn refuses_a_claim_signer_that_is_a_key_with_an_eip_7702_delegation() {
         let chain = Chain {
             signer_code: "0xef01001111111111111111111111111111111111111111",
             ..Chain::of(Network::Mainnet)
         };
 
-        check_against(Network::Mainnet, chain, &order())
-            .await
-            .unwrap();
+        assert_eq!(
+            refusal(Network::Mainnet, chain, &order()).await,
+            format!(
+                "CLAIM_SIGNER {} has an EIP-7702 delegation: Raindex V6 asks the delegate contract for a coupon's signature in place of the key, so the key's coupons are refused. Use a key with no delegation",
+                key().address()
+            )
+        );
+    }
+
+    #[test]
+    fn the_probe_claims_one_wei_at_the_claim_orders_ratio() {
+        let probe = SignedCoupon {
+            signer: key().address(),
+            context: vec![B256::ZERO, amount_word(U256::from(1)).unwrap()],
+            signature: vec![],
+        };
+
+        let config = take_one(&order(), probe);
+
+        assert_eq!(wei_of(config.minimumIO), U256::from(1));
+        assert_eq!(config.maximumIO, config.minimumIO);
+        assert_eq!(config.maximumIORatio, CLAIM_IO_RATIO);
+        assert!(config.IOIsInput);
+        assert_eq!(
+            CLAIM_IO_RATIO,
+            "0xffffffe200000000000000000000000000000000000000000000000000000001"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
+
+    /// The claim calldata test vector: test/TestCouponSignature.t.sol encodes the
+    /// same takeOrders4 call with abi.encodeCall, and ui/src/lib/claim.test.ts sends it.
+    #[test]
+    fn encodes_the_claim_as_forge_does() {
+        let signer = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+        let order = ClaimOrder {
+            order_hash: "0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b"
+                .parse()
+                .unwrap(),
+            signer,
+            ..ClaimOrder::vector()
+        };
+        let words: Vec<B256> = [
+            "0x0000000000000000000000001111111111111111111111111111111111111111",
+            "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+            "0x0000000000000000000000000000000000000000000000000000000068581c00",
+            "0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b",
+            "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
+            "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
+            "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
+            "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+            "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+        ]
+        .iter()
+        .map(|word| word.parse().unwrap())
+        .collect();
+        let signature = hex::decode("f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b").unwrap();
+        let coupon = SignedCoupon {
+            signer,
+            context: words,
+            signature,
+        };
+
+        let calldata = IRaindexV6::takeOrders4Call {
+            config: take_one(&order, coupon),
+        }
+        .abi_encode();
+
+        assert_eq!(
+            keccak256(&calldata),
+            "0x9c90a13c518aa17629ca92bb5947f54e0fcfb1c0ef65376c17d8ea02e7763522"
+                .parse::<B256>()
+                .unwrap()
+        );
     }
 
     #[test]

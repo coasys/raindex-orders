@@ -42,7 +42,7 @@ fn signer() -> Vec<(&'static str, String)> {
         ("ORDER_OWNER", "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
         (
             "ORDERBOOK_ADDRESS",
-            "0xf1224A483ad7F1E9aA46A8CE41229F32d7549A74",
+            "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20",
         ),
         (
             "TOKEN_ADDRESS",
@@ -59,16 +59,13 @@ fn signer() -> Vec<(&'static str, String)> {
         ("CLAIM_SIGNER", "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
         (
             "CLAIM_INTERPRETER",
-            "0x4C7436641da0505A8012218c1524Db0060Fd7253",
+            "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
         ),
-        ("CLAIM_STORE", "0x32a868432101C516647E7Ee217CA641B288953C6"),
-        (
-            "CLAIM_EXPRESSION",
-            "0x1e814F560938B7Ed82Ba00Cc075a822E4789309E",
-        ),
+        ("CLAIM_STORE", "0x1Aa775533E28B1D843e1A589034984E3a62005DC"),
+        ("CLAIM_BYTECODE", "0x00ab"),
         (
             "CLAIM_INPUT_TOKEN",
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "0x1234567890123456789012345678901234567890",
         ),
     ]
     .into_iter()
@@ -192,7 +189,7 @@ fn status_and_clear_refuse_an_unknown_network() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{args:?}");
         assert!(
-            stderr.contains("NETWORK=goerli is not sepolia, mainnet or none"),
+            stderr.contains("NETWORK=goerli is not base-sepolia, mainnet or none"),
             "{args:?}: {stderr}"
         );
     }
@@ -287,11 +284,12 @@ fn mainnet_rpc() -> String {
     url
 }
 
-/// A sepolia node told only its agent, its key and where its RPC is.
+/// A base-sepolia node given its RPC, the test signer's key, and the mock HOT,
+/// vault and claim order, which are chain-specific and have no defaults.
 fn sepolia_node(dir: &Path, rpc: String) -> Vec<(&'static str, String)> {
     let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
     vec![
-        ("SEPOLIA_RPC_URL", rpc),
+        ("BASE_SEPOLIA_RPC_URL", rpc),
         ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
         ("DB_PATH", db(dir).display().to_string()),
         durable_conductor(dir),
@@ -299,11 +297,32 @@ fn sepolia_node(dir: &Path, rpc: String) -> Vec<(&'static str, String)> {
             "SIGNER_PRIVATE_KEY",
             "0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd".to_string(),
         ),
+        (
+            "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
+            "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6".to_string(),
+        ),
+        (
+            "ORDER_HASH",
+            "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9".to_string(),
+        ),
+        (
+            "ORDER_OWNER",
+            "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6".to_string(),
+        ),
+        (
+            "TOKEN_ADDRESS",
+            "0x6c6EE5e31d828De241282B9606C8e98Ea48526E2".to_string(),
+        ),
+        ("CLAIM_BYTECODE", "0x00ab".to_string()),
+        (
+            "CLAIM_INPUT_TOKEN",
+            "0x1234567890123456789012345678901234567890".to_string(),
+        ),
     ]
 }
 
 #[test]
-fn run_with_nothing_set_but_its_key_takes_testnet_values_and_says_so() {
+fn run_with_nothing_set_but_its_key_and_bridge_takes_testnet_values_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
     let rpc = format!("http://{}/", closed.local_addr().unwrap());
@@ -317,18 +336,45 @@ fn run_with_nothing_set_but_its_key_takes_testnet_values_and_says_so() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!output.status.success());
-    assert!(logged.contains("NETWORK is unset: sepolia"), "{logged}");
     assert!(
-        logged.contains("using TestNet's values for SEPOLIA_LOCK_VAULT_ADDRESS"),
+        logged.contains("NETWORK is unset: base-sepolia"),
         "{logged}"
     );
     assert!(
-        logged.contains("using TestNet's values for ORDER_HASH, ORDER_OWNER, ORDERBOOK_ADDRESS, TOKEN_ADDRESS, VAULT_ID, CLAIM_SIGNER, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION, CLAIM_INPUT_TOKEN"),
+        logged.contains("using TestNet's values for ORDERBOOK_ADDRESS, VAULT_ID, CLAIM_SIGNER, CLAIM_INTERPRETER, CLAIM_STORE"),
         "{logged}"
     );
     assert!(
-        logged.contains("SEPOLIA_RPC_URL: eth_chainId failed"),
+        logged.contains("BASE_SEPOLIA_RPC_URL: eth_chainId failed"),
         "{logged}"
+    );
+    assert!(!db(dir.path()).exists());
+}
+
+/// TestNet's vault and claim order are chain-specific and have no defaults, so
+/// a base-sepolia run names them when it lacks them, as a mainnet run does.
+#[test]
+fn run_with_nothing_set_but_its_key_names_the_bridge_it_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = sepolia_node(dir.path(), "http://127.0.0.1:9/".to_string());
+    env.retain(|(key, _)| {
+        !matches!(
+            *key,
+            "BASE_SEPOLIA_LOCK_VAULT_ADDRESS"
+                | "ORDER_HASH"
+                | "ORDER_OWNER"
+                | "CLAIM_BYTECODE"
+                | "CLAIM_INPUT_TOKEN"
+        )
+    });
+
+    let output = orchestrator(dir.path(), &env, &["run"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("BASE_SEPOLIA_LOCK_VAULT_ADDRESS is required for NETWORK=base-sepolia"),
+        "{stderr}"
     );
     assert!(!db(dir.path()).exists());
 }
@@ -346,8 +392,9 @@ fn a_run_on_testnet_values_refuses_a_mainnet_rpc() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr
-            .contains("SEPOLIA_RPC_URL answers for chain 1, and NETWORK=sepolia is chain 11155111"),
+        stderr.contains(
+            "BASE_SEPOLIA_RPC_URL answers for chain 1, and NETWORK=base-sepolia is chain 84532"
+        ),
         "{stderr}"
     );
     assert!(!db(dir.path()).exists());
@@ -362,7 +409,7 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
     env.extend([
         ("NETWORK", "none".to_string()),
         (
-            "SEPOLIA_LOCK_VAULT_ADDRESS",
+            "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
             format!("{:#x}", alloy::primitives::Address::ZERO),
         ),
         (
@@ -384,7 +431,7 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
     );
     assert!(logged.contains("NETWORK=none: Ethereum is off"), "{logged}");
     assert!(
-        logged.contains("NETWORK=none ignores SEPOLIA_RPC_URL, SEPOLIA_LOCK_VAULT_ADDRESS, ORDER_HASH, SIGNER_PRIVATE_KEY"),
+        logged.contains("NETWORK=none ignores BASE_SEPOLIA_RPC_URL, BASE_SEPOLIA_LOCK_VAULT_ADDRESS, ORDER_HASH, ORDER_OWNER, TOKEN_ADDRESS, CLAIM_BYTECODE, CLAIM_INPUT_TOKEN, SIGNER_PRIVATE_KEY"),
         "{logged}"
     );
     assert!(

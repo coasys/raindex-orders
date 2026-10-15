@@ -9,7 +9,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
-    Sepolia,
+    BaseSepolia,
 }
 
 impl FromStr for Network {
@@ -18,7 +18,7 @@ impl FromStr for Network {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "mainnet" => Ok(Network::Mainnet),
-            "sepolia" => Ok(Network::Sepolia),
+            "base-sepolia" => Ok(Network::BaseSepolia),
             _ => Err(anyhow::anyhow!("Unknown network: {}", s)),
         }
     }
@@ -30,81 +30,63 @@ impl Network {
     pub fn name(self) -> &'static str {
         match self {
             Network::Mainnet => "mainnet",
-            Network::Sepolia => "sepolia",
+            Network::BaseSepolia => "base-sepolia",
         }
     }
 
     pub fn chain_id(self) -> u64 {
         match self {
             Network::Mainnet => 1,
-            Network::Sepolia => 11_155_111,
+            Network::BaseSepolia => 84_532,
         }
     }
 
     pub fn rpc_url_var(self) -> &'static str {
         match self {
             Network::Mainnet => "ETH_RPC_URL",
-            Network::Sepolia => "SEPOLIA_RPC_URL",
+            Network::BaseSepolia => "BASE_SEPOLIA_RPC_URL",
         }
     }
 
     pub fn lock_vault_var(self) -> &'static str {
         match self {
             Network::Mainnet => "MAINNET_LOCK_VAULT_ADDRESS",
-            Network::Sepolia => "SEPOLIA_LOCK_VAULT_ADDRESS",
+            Network::BaseSepolia => "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
         }
     }
 
     fn other(self) -> Network {
         match self {
-            Network::Mainnet => Network::Sepolia,
-            Network::Sepolia => Network::Mainnet,
+            Network::Mainnet => Network::BaseSepolia,
+            Network::BaseSepolia => Network::Mainnet,
         }
     }
 }
 
-/// TestNet's values: a sepolia run takes each one it is not given. Mainnet has none,
-/// so a mainnet run names every value it lacks.
-const SEPOLIA_DEFAULTS: [(&str, &str); 12] = [
-    ("SEPOLIA_RPC_URL", "https://1rpc.io/sepolia"),
-    (
-        "SEPOLIA_LOCK_VAULT_ADDRESS",
-        "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6",
-    ),
-    (
-        "TOKEN_ADDRESS",
-        "0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749",
-    ),
+/// TestNet's values: a base-sepolia run takes each one it is not given. Mainnet has none,
+/// so a mainnet run names every value it lacks. Raindex V6 and the Rainlang
+/// contracts are at the same address on every chain, Base Sepolia included.
+/// TestNet's mock HOT, vault and claim order are chain-specific, and the
+/// orchestrator has no defaults for them, so a base-sepolia run names those too.
+const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
+    ("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),
     (
         "ORDERBOOK_ADDRESS",
-        "0xfca89cD12Ba1346b1ac570ed988AB43b812733fe",
+        "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20",
     ),
     (
         "VAULT_ID",
         "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
     ),
-    (
-        "ORDER_HASH",
-        "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
-    ),
-    ("ORDER_OWNER", "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
     ("CLAIM_SIGNER", "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"),
     (
         "CLAIM_INTERPRETER",
-        "0x8853d126bc23a45b9f807739b6ea0b38ef569005",
+        "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
     ),
-    ("CLAIM_STORE", "0x23f77e7bc935503e437166498d7d72f2ea290e1f"),
-    (
-        "CLAIM_EXPRESSION",
-        "0x0a1369aee76570cc7404492d55a5d1468d5a9b4b",
-    ),
-    (
-        "CLAIM_INPUT_TOKEN",
-        "0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028",
-    ),
+    ("CLAIM_STORE", "0x1Aa775533E28B1D843e1A589034984E3a62005DC"),
 ];
 
-/// `setting`, with TestNet's value for each network value a sepolia run is not
+/// `setting`, with TestNet's value for each network value a base-sepolia run is not
 /// given. An empty value counts as not given.
 pub(crate) fn with_network_defaults(
     network: Network,
@@ -119,7 +101,7 @@ pub(crate) fn with_network_defaults(
 
 fn testnet_default(network: Network, key: &str) -> Option<&'static str> {
     match network {
-        Network::Sepolia => SEPOLIA_DEFAULTS
+        Network::BaseSepolia => BASE_SEPOLIA_DEFAULTS
             .iter()
             .find(|(default_key, _)| *default_key == key)
             .map(|(_, value)| *value),
@@ -161,7 +143,7 @@ pub struct Ethereum {
 
 /// The Ethereum variables `setting` holds a value for, which NETWORK=none ignores.
 pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
-    [Network::Sepolia, Network::Mainnet]
+    [Network::BaseSepolia, Network::Mainnet]
         .into_iter()
         .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
         .chain(crate::signer::env_variables())
@@ -169,19 +151,19 @@ pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec
         .collect()
 }
 
-/// The network `NETWORK` names, sepolia when it is unset or empty.
+/// The network `NETWORK` names, base-sepolia when it is unset or empty.
 fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
     match setting("NETWORK").filter(|raw| !raw.is_empty()) {
         None => {
             tracing::info!(
                 event = "config.testnet_defaults",
-                "NETWORK is unset: sepolia"
+                "NETWORK is unset: base-sepolia"
             );
-            Ok(Network::Sepolia)
+            Ok(Network::BaseSepolia)
         }
         Some(raw) => raw
             .parse::<Network>()
-            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia, mainnet or none")),
+            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not base-sepolia, mainnet or none")),
     }
 }
 
@@ -810,14 +792,14 @@ mod tests {
     #[test]
     fn each_network_reads_its_own_rpc_url_and_vault() {
         let sepolia = chain(&[
-            ("NETWORK", "sepolia"),
-            ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
-            ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+            ("NETWORK", "base-sepolia"),
+            ("BASE_SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+            ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
         ]);
         assert_eq!(
             sepolia,
             Ethereum {
-                network: Network::Sepolia,
+                network: Network::BaseSepolia,
                 rpc_url: "https://sepolia.rpc.test".to_string(),
                 lock_vault_address: VAULT.parse().unwrap(),
                 confirmations: 5,
@@ -834,14 +816,22 @@ mod tests {
         assert_eq!(mainnet.confirmations, 5);
     }
 
+    /// TestNet's RPC is a default; its vault is chain-specific and has no
+    /// default, so a base-sepolia run names it.
     #[test]
     fn an_unset_network_is_sepolia_with_testnet_values() {
         for unset in [vec![], vec![("NETWORK", "")]] {
             assert_eq!(
-                chain(&unset),
+                network_refusal(&unset),
+                "BASE_SEPOLIA_LOCK_VAULT_ADDRESS is required for NETWORK=base-sepolia"
+            );
+            let mut given = unset.clone();
+            given.push(("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT));
+            assert_eq!(
+                chain(&given),
                 Ethereum {
-                    network: Network::Sepolia,
-                    rpc_url: "https://1rpc.io/sepolia".to_string(),
+                    network: Network::BaseSepolia,
+                    rpc_url: "https://sepolia.base.org".to_string(),
                     lock_vault_address: VAULT.parse().unwrap(),
                     confirmations: 5,
                 }
@@ -849,15 +839,18 @@ mod tests {
         }
         assert_eq!(
             network_refusal(&[("NETWORK", "goerli")]),
-            "NETWORK=goerli is not sepolia, mainnet or none"
+            "NETWORK=goerli is not base-sepolia, mainnet or none"
         );
     }
 
     #[test]
     fn a_sepolia_run_still_refuses_mainnet_variables() {
         assert_eq!(
-            network_refusal(&[("ETH_RPC_URL", "https://eth.rpc.test")]),
-            "ETH_RPC_URL is a mainnet variable and NETWORK is sepolia: unset it"
+            network_refusal(&[
+                ("ETH_RPC_URL", "https://eth.rpc.test"),
+                ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+            ]),
+            "ETH_RPC_URL is a mainnet variable and NETWORK is base-sepolia: unset it"
         );
     }
 
@@ -873,10 +866,10 @@ mod tests {
         );
         assert_eq!(
             network_refusal(&[
-                ("NETWORK", "sepolia"),
-                ("SEPOLIA_LOCK_VAULT_ADDRESS", "0xE3E0"),
+                ("NETWORK", "base-sepolia"),
+                ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", "0xE3E0"),
             ]),
-            "SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E0 is not an address"
+            "BASE_SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E0 is not an address"
         );
     }
 
@@ -889,13 +882,13 @@ mod tests {
                     ("ETH_RPC_URL", "https://eth.rpc.test"),
                     ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
                 ],
-                ["SEPOLIA_RPC_URL", "SEPOLIA_LOCK_VAULT_ADDRESS"],
+                ["BASE_SEPOLIA_RPC_URL", "BASE_SEPOLIA_LOCK_VAULT_ADDRESS"],
             ),
             (
-                "sepolia",
+                "base-sepolia",
                 [
-                    ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
-                    ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+                    ("BASE_SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+                    ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
                 ],
                 ["ETH_RPC_URL", "MAINNET_LOCK_VAULT_ADDRESS"],
             ),
@@ -910,7 +903,7 @@ mod tests {
                     format!(
                         "{key} is a {} variable and NETWORK is {network}: unset it",
                         if network == "mainnet" {
-                            "sepolia"
+                            "base-sepolia"
                         } else {
                             "mainnet"
                         }
@@ -926,24 +919,28 @@ mod tests {
             ("NETWORK", "mainnet"),
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
-            ("SEPOLIA_RPC_URL", ""),
-            ("SEPOLIA_LOCK_VAULT_ADDRESS", ""),
+            ("BASE_SEPOLIA_RPC_URL", ""),
+            ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", ""),
         ]);
         assert_eq!(mainnet.network, Network::Mainnet);
         assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
 
-        let sepolia = chain(&[("ETH_RPC_URL", ""), ("MAINNET_LOCK_VAULT_ADDRESS", "")]);
-        assert_eq!(sepolia.network, Network::Sepolia);
-        assert_eq!(sepolia.rpc_url, "https://1rpc.io/sepolia");
+        let sepolia = chain(&[
+            ("ETH_RPC_URL", ""),
+            ("MAINNET_LOCK_VAULT_ADDRESS", ""),
+            ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+        ]);
+        assert_eq!(sepolia.network, Network::BaseSepolia);
+        assert_eq!(sepolia.rpc_url, "https://sepolia.base.org");
     }
 
     #[test]
     fn network_none_names_no_chain_and_ignores_every_chain_variable() {
         let set = [
             ("NETWORK", "none"),
-            ("SEPOLIA_RPC_URL", "http://127.0.0.1:8545"),
+            ("BASE_SEPOLIA_RPC_URL", "http://127.0.0.1:8545"),
             (
-                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
                 "0x0000000000000000000000000000000000000000",
             ),
             ("ETH_RPC_URL", "https://eth.rpc.test"),
@@ -959,8 +956,8 @@ mod tests {
         assert_eq!(
             ignored_without_ethereum(test_settings(&set)),
             [
-                "SEPOLIA_RPC_URL",
-                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "BASE_SEPOLIA_RPC_URL",
+                "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
                 "ETH_RPC_URL",
                 "SIGNER_PRIVATE_KEY"
             ]
@@ -969,11 +966,15 @@ mod tests {
 
     #[test]
     fn only_an_explicit_none_turns_ethereum_off() {
-        assert_eq!(chain(&[]).network, Network::Sepolia);
-        assert_eq!(chain(&[("NETWORK", "")]).network, Network::Sepolia);
+        let vault = ("BASE_SEPOLIA_LOCK_VAULT_ADDRESS", VAULT);
+        assert_eq!(chain(&[vault]).network, Network::BaseSepolia);
+        assert_eq!(
+            chain(&[("NETWORK", ""), vault]).network,
+            Network::BaseSepolia
+        );
         assert_eq!(
             network_refusal(&[("NETWORK", "off")]),
-            "NETWORK=off is not sepolia, mainnet or none"
+            "NETWORK=off is not base-sepolia, mainnet or none"
         );
     }
 

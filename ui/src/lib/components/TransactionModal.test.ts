@@ -3,7 +3,7 @@ import type { transactionStore as Store } from '$lib/stores/transactionStore'
 import { asBuild, BUILDS } from '$lib/testing/builds'
 
 const EXPLORERS = {
-	sepolia: 'https://sepolia.etherscan.io',
+	'base-sepolia': 'https://sepolia.basescan.org',
 	mainnet: 'https://etherscan.io'
 }
 
@@ -11,7 +11,7 @@ const HASH = '0x7d3c9b2a51e8f4c6a0b9d2e7f1c3a5b8d6e4f2a0c9b7d5e3f1a8c6b4d2e0f9a7
 const hasX = (html: string) => html.includes('aria-label="Close modal"')
 const hasCloseButton = (html: string) => />\s*Close\s*<\/button>/.test(html)
 
-describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network => {
+describe.each(['base-sepolia', 'mainnet'] as const)('TransactionModal on %s', network => {
 	const ETHERSCAN = `href="${EXPLORERS[network]}/tx/${HASH}"`
 	let transactionStore: typeof Store
 	let render: () => string

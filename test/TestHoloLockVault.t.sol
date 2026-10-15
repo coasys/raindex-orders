@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: CAL
-pragma solidity =0.8.19;
+pragma solidity =0.8.25;
 
-import {console2, Test, Vm} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {MockHOT} from "src/test/MockHOT.sol";
-import {MockOrderBook} from "src/test/MockOrderBook.sol";
-import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-import {IOrderBookV3} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
+import {MockRaindex} from "src/test/MockRaindex.sol";
+import {Float, LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
 
 contract TestHoloLockVault is Test {
+    using LibDecimalFloat for Float;
+
     HoloLockVault public lockVault;
     MockHOT public token;
-    MockOrderBook public orderbook;
+    MockRaindex public orderbook;
 
     address public admin;
     address public user1;
     address public user2;
 
-    uint256 public constant VAULT_ID = 0x1234;
+    bytes32 public constant VAULT_ID = bytes32(uint256(0x1234));
     uint256 public constant MIN_LOCK_AMOUNT = 1e18; // 1 token minimum
 
     // Example Holochain agent pub keys (32 bytes)
@@ -36,7 +37,7 @@ contract TestHoloLockVault is Test {
 
         // Deploy mock contracts
         token = new MockHOT();
-        orderbook = new MockOrderBook();
+        orderbook = new MockRaindex();
 
         // Deploy HoloLockVault
         lockVault = new HoloLockVault(address(token), address(orderbook), VAULT_ID, admin, MIN_LOCK_AMOUNT);
@@ -50,6 +51,7 @@ contract TestHoloLockVault is Test {
 
     function testConstructorSetsImmutables() public view {
         assertEq(address(lockVault.token()), address(token));
+        assertEq(lockVault.tokenDecimals(), 18);
         assertEq(address(lockVault.orderbook()), address(orderbook));
         assertEq(lockVault.vaultId(), VAULT_ID);
         assertEq(lockVault.admin(), admin);
@@ -69,6 +71,11 @@ contract TestHoloLockVault is Test {
     function testConstructorRevertsZeroOrderbook() public {
         vm.expectRevert("HoloLockVault: zero orderbook address");
         new HoloLockVault(address(token), address(0), VAULT_ID, admin, MIN_LOCK_AMOUNT);
+    }
+
+    function testConstructorRevertsZeroVaultId() public {
+        vm.expectRevert("HoloLockVault: zero vault id");
+        new HoloLockVault(address(token), address(orderbook), bytes32(0), admin, MIN_LOCK_AMOUNT);
     }
 
     function testConstructorRevertsZeroAdmin() public {
@@ -93,6 +100,24 @@ contract TestHoloLockVault is Test {
         assertEq(lockId, 0);
         assertEq(token.balanceOf(user1), 900e18);
         assertEq(lockVault.vaultBalance(), amount);
+    }
+
+    /// The vault deposits the wei as a float of exponent -18, so Raindex holds
+    /// the amount to the wei.
+    function testLockDepositsTheAmountAsALosslessFloat() public {
+        uint256 amount = 123456789012345678901;
+
+        vm.startPrank(user1);
+        token.approve(address(lockVault), amount);
+        lockVault.lock(amount, AGENT_1);
+        vm.stopPrank();
+
+        Float held = orderbook.vaultBalance2(address(lockVault), address(token), VAULT_ID);
+        (int256 coefficient, int256 exponent) = held.unpack();
+        assertEq(coefficient, int256(amount));
+        assertEq(exponent, -18);
+        assertEq(held.toFixedDecimalLossless(18), amount);
+        assertEq(token.balanceOf(address(orderbook)), amount);
     }
 
     function testLockMultipleTimes() public {
@@ -174,6 +199,20 @@ contract TestHoloLockVault is Test {
         vm.stopPrank();
     }
 
+    /// A float's coefficient is an int224, so a larger amount has no lossless
+    /// float. No token has such a supply; the vault refuses rather than rounds.
+    function testLockRevertsAnAmountNoFloatCarries() public {
+        uint256 amount = uint256(uint224(type(int224).max)) + 1;
+        token.mint(user1, amount);
+
+        vm.startPrank(user1);
+        token.approve(address(lockVault), amount);
+
+        vm.expectRevert("HoloLockVault: amount too large for a float");
+        lockVault.lock(amount, AGENT_1);
+        vm.stopPrank();
+    }
+
     // ========== Vault Balance Tests ==========
 
     function testVaultBalanceInitiallyZero() public view {
@@ -239,6 +278,18 @@ contract TestHoloLockVault is Test {
         vm.prank(admin);
         vm.expectRevert("HoloLockVault: zero amount");
         lockVault.adminWithdraw(0, admin);
+    }
+
+    function testAdminWithdrawRevertsMoreThanTheVaultHolds() public {
+        uint256 lockAmount = 100e18;
+        vm.startPrank(user1);
+        token.approve(address(lockVault), lockAmount);
+        lockVault.lock(lockAmount, AGENT_1);
+        vm.stopPrank();
+
+        vm.prank(admin);
+        vm.expectRevert();
+        lockVault.adminWithdraw(lockAmount + 1, admin);
     }
 
     // ========== Admin Recover Tokens Tests ==========

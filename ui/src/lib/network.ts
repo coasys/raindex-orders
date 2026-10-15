@@ -9,25 +9,25 @@ import {
 	type Address,
 	type Hex
 } from 'viem'
-import { mainnet, sepolia } from 'viem/chains'
+import { baseSepolia, mainnet } from 'viem/chains'
 
 /** The coupon signer whose private key is committed in `src/Constants.sol`. */
 export const TEST_SIGNER: Address = '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37'
 
 /** What `PUBLIC_NETWORK` selects. Every other network value is a build variable. */
 export const NETWORKS = {
-	sepolia: {
-		chain: sepolia,
+	'base-sepolia': {
+		chain: baseSepolia,
 		tokenName: 'mock HOT',
-		networkName: 'Sepolia Testnet',
-		explorer: 'https://sepolia.etherscan.io',
+		networkName: 'Base Sepolia',
+		explorer: 'https://sepolia.basescan.org',
 		faucet: true,
-		rpcSecret: 'SEPOLIA_RPC_URL',
+		rpcSecret: 'BASE_SEPOLIA_RPC_URL',
 		addToWallet: {
-			chainName: 'Sepolia Testnet',
+			chainName: 'Base Sepolia',
 			nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
-			rpcUrls: ['https://rpc.sepolia.org'],
-			blockExplorerUrls: ['https://sepolia.etherscan.io']
+			rpcUrls: ['https://sepolia.base.org'],
+			blockExplorerUrls: ['https://sepolia.basescan.org']
 		}
 	},
 	mainnet: {
@@ -44,38 +44,52 @@ export const NETWORKS = {
 export type NetworkName = keyof typeof NETWORKS
 
 /** `HOLO_VAULT_ID` in src/Constants.sol, on both networks. */
-export const HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334bn
+export const HOLO_VAULT_ID: Hex =
+	'0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'
 
-const ORDER_V2 = parseAbiParameters(
-	'(address owner, bool handleIO, (address interpreter, address store, address expression) evaluable, (address token, uint8 decimals, uint256 vaultId)[] validInputs, (address token, uint8 decimals, uint256 vaultId)[] validOutputs)'
+/** `CLAIM_ORDER_NONCE` in src/Constants.sol: one claim order per signer. */
+export const CLAIM_ORDER_NONCE: Hex = `0x${'0'.repeat(64)}`
+
+/**
+ * `CLAIM_IO_RATIO` in src/Constants.sol: the claim order's io-ratio, `1e-30` in
+ * src/holo-claim.rain, as the decimal float the parser makes of it (coefficient 1,
+ * exponent -30). A claim passes it as its maximum ratio.
+ */
+export const CLAIM_IO_RATIO: Hex =
+	'0xffffffe200000000000000000000000000000000000000000000000000000001'
+
+const ORDER_V4 = parseAbiParameters(
+	'(address owner, (address interpreter, address store, bytes bytecode) evaluable, (address token, bytes32 vaultId)[] validInputs, (address token, bytes32 vaultId)[] validOutputs, bytes32 nonce)'
 )
 
 type ClaimValues = {
 	lockVaultAddress: Address
 	tokenAddress: Address
-	claimOrder: { interpreter: Address; store: Address; expression: Address; inputToken: Address }
+	claimOrder: { interpreter: Address; store: Address; bytecode: Hex; inputToken: Address }
 }
 
 /**
- * The OrderV2 the vault added and takeOrders names. Both IOs declare 18 decimals, as
- * script/ClaimOrderScript.sol adds them.
+ * The OrderV4 the vault added and takeOrders4 names, as script/ClaimOrderScript.sol
+ * adds it: its bytecode is the parsed claim expression, and both IOs pay out of
+ * HOLO_VAULT_ID.
  */
 export function claimOrderStruct({ lockVaultAddress, tokenAddress, claimOrder }: ClaimValues) {
 	return {
 		owner: lockVaultAddress,
-		handleIO: true,
 		evaluable: {
 			interpreter: claimOrder.interpreter,
 			store: claimOrder.store,
-			expression: claimOrder.expression
+			bytecode: claimOrder.bytecode
 		},
-		validInputs: [{ token: claimOrder.inputToken, decimals: 18, vaultId: HOLO_VAULT_ID }],
-		validOutputs: [{ token: tokenAddress, decimals: 18, vaultId: HOLO_VAULT_ID }]
+		validInputs: [{ token: claimOrder.inputToken, vaultId: HOLO_VAULT_ID }],
+		validOutputs: [{ token: tokenAddress, vaultId: HOLO_VAULT_ID }],
+		nonce: CLAIM_ORDER_NONCE
 	}
 }
 
+/** The order's hash as Raindex V6 hashes it: keccak256 of abi.encode(OrderV4). */
 export const orderHashOf = (values: ClaimValues): Hex =>
-	keccak256(encodeAbiParameters(ORDER_V2, [claimOrderStruct(values)]))
+	keccak256(encodeAbiParameters(ORDER_V4, [claimOrderStruct(values)]))
 
 export type BridgeConfig = (typeof NETWORKS)[NetworkName] & {
 	network: NetworkName
@@ -87,7 +101,7 @@ export type BridgeConfig = (typeof NETWORKS)[NetworkName] & {
 		signer: Address
 		interpreter: Address
 		store: Address
-		expression: Address
+		bytecode: Hex
 		inputToken: Address
 	}
 }
@@ -99,7 +113,6 @@ const ADDRESS_VARIABLES = [
 	'PUBLIC_CLAIM_SIGNER',
 	'PUBLIC_CLAIM_INTERPRETER',
 	'PUBLIC_CLAIM_STORE',
-	'PUBLIC_CLAIM_EXPRESSION',
 	'PUBLIC_CLAIM_INPUT_TOKEN'
 ] as const
 
@@ -107,39 +120,55 @@ const ADDRESS_VARIABLES = [
 export const BUILD_VARIABLES = [
 	'PUBLIC_NETWORK',
 	'PUBLIC_CLAIM_ORDER_HASH',
+	'PUBLIC_CLAIM_BYTECODE',
 	...ADDRESS_VARIABLES
 ] as const
 
 type BuildEnv = Partial<Record<string, string>>
 
-/** TestNet's values: a sepolia build takes each one it is not given. Mainnet has none. */
-export const SEPOLIA_DEFAULTS: Record<
-	Exclude<(typeof BUILD_VARIABLES)[number], 'PUBLIC_NETWORK'>,
-	string
+/**
+ * The bytecode of TestNet's claim order on Base Sepolia, as its AddOrderV3 event
+ * carries it (transaction 0x633f34c0e9652d5c06bf22f3e12fde9ab456feadcd0484e12a78322e0a65f896,
+ * broadcast/DeployClaimOrderViaVault.s.sol/84532/run-latest.json).
+ */
+const BASE_SEPOLIA_CLAIM_BYTECODE: Hex =
+	'0x000000000000000000000000000000000000000000000000000000000000000d0000000000000000000000008e72b7568738da52ca3dcd9b24e178127a4e7d370000000000000000000000000000000000000057726f6e67207369676e6572ec0000000000000000000000000000000057726f6e6720726563697069656e74ef0000000000000000000000000000000000004f726465722065787069726564ed00000000000000000000000000000057726f6e67206f726465722068617368f0000000000000000000000000000057726f6e67206f72646572206f776e6572f10000000000000000000000000000000057726f6e67206f72646572626f6f6bef0000000000000000000000000057726f6e67206f757470757420746f6b656ef20000000000000000000057726f6e67206f7574707574207661756c74206964f5000000000000000000000000004e6f6e636520616c72656164792075736564f20000000000000000000000000000000000000000000000000000000000000001ffffffe20000000000000000000000000000000000000000000000000000000100000000000000000000000057726f6e67206f757470757420616d6f756e74f300000000000000000000000000000000000000000000000000000000000000f902000000dc360300020110000101100000031000051c1200001e0200000110000203100201031000061c1200001e020000011000030310020618100000251200001e0200000110000403100001031003061c1200001e0200000110000503100101031004061c1200001e0200000110000603100100031005061c1200001e0200000110000703100004031006061c1200001e0200000110000803100204031007061c1200001e0200000110000903100806031000010c12000046110000241100001e0200000110000a03100806031000010c12000047020000031001060110000b050300000110000c03100106031004041f1200001e020000'
+
+/**
+ * TestNet's values: a base-sepolia build takes each one it is not given. Some are
+ * the same on every chain: Raindex V6, the Rainlang interpreter and store, and the
+ * test signer. The rest are TestNet's deploy on Base Sepolia (README.md, TestNet on
+ * Base Sepolia): mock HOT, the lock vault, its ClaimInputToken and the claim order.
+ * A build that names a new deploy names all of it: a vault or token given alone
+ * pairs with this order's hash, and the order hash check refuses the build.
+ * Mainnet has no defaults.
+ */
+export const BASE_SEPOLIA_DEFAULTS: Partial<
+	Record<Exclude<(typeof BUILD_VARIABLES)[number], 'PUBLIC_NETWORK'>, string>
 > = {
-	PUBLIC_TOKEN_ADDRESS: '0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749',
-	PUBLIC_LOCK_VAULT_ADDRESS: '0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6',
-	PUBLIC_ORDERBOOK_ADDRESS: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
-	PUBLIC_CLAIM_ORDER_HASH: '0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9',
-	PUBLIC_CLAIM_SIGNER: '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37',
-	PUBLIC_CLAIM_INTERPRETER: '0x8853d126bc23a45b9f807739b6ea0b38ef569005',
-	PUBLIC_CLAIM_STORE: '0x23f77e7bc935503e437166498d7d72f2ea290e1f',
-	PUBLIC_CLAIM_EXPRESSION: '0x0a1369aee76570cc7404492d55a5d1468d5a9b4b',
-	PUBLIC_CLAIM_INPUT_TOKEN: '0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028'
+	PUBLIC_ORDERBOOK_ADDRESS: '0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20',
+	PUBLIC_CLAIM_SIGNER: TEST_SIGNER,
+	PUBLIC_CLAIM_INTERPRETER: '0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf',
+	PUBLIC_CLAIM_STORE: '0x1Aa775533E28B1D843e1A589034984E3a62005DC',
+	PUBLIC_TOKEN_ADDRESS: '0x916A830d1603252152fE17258bb10A393F173a72',
+	PUBLIC_LOCK_VAULT_ADDRESS: '0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937',
+	PUBLIC_CLAIM_INPUT_TOKEN: '0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928',
+	PUBLIC_CLAIM_ORDER_HASH: '0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb',
+	PUBLIC_CLAIM_BYTECODE: BASE_SEPOLIA_CLAIM_BYTECODE
 }
 
 /**
- * `env` with TestNet's values for the network values a sepolia build is not given,
- * PUBLIC_NETWORK itself sepolia when unset. An empty value counts as not given.
- * Returns the names it filled.
+ * `env` with TestNet's values for the network values a base-sepolia build is not
+ * given, PUBLIC_NETWORK itself base-sepolia when unset. An empty value counts as
+ * not given. Returns the names it filled.
  */
 export function withTestnetDefaults(env: BuildEnv): { env: BuildEnv; defaulted: string[] } {
 	const given = (key: string) => (env[key] ? env[key] : undefined)
-	const network = given('PUBLIC_NETWORK') ?? 'sepolia'
+	const network = given('PUBLIC_NETWORK') ?? 'base-sepolia'
 	const filled: BuildEnv = { ...env, PUBLIC_NETWORK: network }
 	const defaulted = given('PUBLIC_NETWORK') ? [] : ['PUBLIC_NETWORK']
-	if (network === 'sepolia') {
-		for (const [key, value] of Object.entries(SEPOLIA_DEFAULTS)) {
+	if (network === 'base-sepolia') {
+		for (const [key, value] of Object.entries(BASE_SEPOLIA_DEFAULTS)) {
 			if (!given(key)) {
 				filled[key] = value
 				defaulted.push(key)
@@ -151,15 +180,15 @@ export function withTestnetDefaults(env: BuildEnv): { env: BuildEnv; defaulted: 
 
 /**
  * The website's network values, or an error naming every build variable that is
- * missing or malformed, and the test signer on mainnet. A sepolia build takes
+ * missing or malformed, and the test signer on mainnet. A base-sepolia build takes
  * TestNet's value for any it is not given.
  */
 export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
 	const { env } = withTestnetDefaults(given)
 	const faults: string[] = []
 	const network = env.PUBLIC_NETWORK
-	if (network !== 'sepolia' && network !== 'mainnet') {
-		faults.push(`PUBLIC_NETWORK must be sepolia or mainnet, not ${network}`)
+	if (network !== 'base-sepolia' && network !== 'mainnet') {
+		faults.push(`PUBLIC_NETWORK must be base-sepolia or mainnet, not ${network}`)
 	}
 
 	const addresses: Partial<Record<(typeof ADDRESS_VARIABLES)[number], Address>> = {}
@@ -175,6 +204,12 @@ export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
 	if (!orderHash) faults.push('PUBLIC_CLAIM_ORDER_HASH is required')
 	else if (!isHex(orderHash, { strict: true }) || orderHash.length !== 66) {
 		faults.push(`PUBLIC_CLAIM_ORDER_HASH=${orderHash} is not a 32-byte hash`)
+	}
+
+	const bytecode = env.PUBLIC_CLAIM_BYTECODE
+	if (!bytecode) faults.push('PUBLIC_CLAIM_BYTECODE is required')
+	else if (!isHex(bytecode, { strict: true }) || bytecode.length % 2 !== 0 || bytecode.length < 4) {
+		faults.push(`PUBLIC_CLAIM_BYTECODE=${bytecode} is not hex bytecode`)
 	}
 
 	const signer = addresses.PUBLIC_CLAIM_SIGNER
@@ -197,13 +232,13 @@ export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
 			signer: a.PUBLIC_CLAIM_SIGNER,
 			interpreter: a.PUBLIC_CLAIM_INTERPRETER,
 			store: a.PUBLIC_CLAIM_STORE,
-			expression: a.PUBLIC_CLAIM_EXPRESSION,
+			bytecode: bytecode as Hex,
 			inputToken: a.PUBLIC_CLAIM_INPUT_TOKEN
 		}
 	}
 	if (orderHashOf(config).toLowerCase() !== config.claimOrder.orderHash.toLowerCase()) {
 		throw new Error(
-			`Bridge build variables: PUBLIC_CLAIM_ORDER_HASH is not the hash of the order that PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS, PUBLIC_CLAIM_INTERPRETER, PUBLIC_CLAIM_STORE, PUBLIC_CLAIM_EXPRESSION and PUBLIC_CLAIM_INPUT_TOKEN describe`
+			`Bridge build variables: PUBLIC_CLAIM_ORDER_HASH is not the hash of the order that PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS, PUBLIC_CLAIM_INTERPRETER, PUBLIC_CLAIM_STORE, PUBLIC_CLAIM_BYTECODE and PUBLIC_CLAIM_INPUT_TOKEN describe`
 		)
 	}
 	return config

@@ -1,11 +1,18 @@
 import { vi } from 'vitest'
-import { decodeFunctionData, encodeFunctionResult, multicall3Abi, parseAbi, type Hex } from 'viem'
+import {
+	decodeFunctionData,
+	encodeFunctionResult,
+	multicall3Abi,
+	numberToHex,
+	parseAbi,
+	type Hex
+} from 'viem'
 
 const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11'
 const EIP1271_MAGIC_VALUE = '0x1626ba7e00000000000000000000000000000000000000000000000000000000'
 
 const readAbi = parseAbi([
-	'function get(uint256 namespace, uint256 key) view returns (uint256)',
+	'function get(uint256 namespace, bytes32 key) view returns (bytes32)',
 	'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes32)',
 	'function getChainId() view returns (uint256)',
 	'function getBlockNumber() view returns (uint256)',
@@ -64,8 +71,14 @@ export function fakeRpc(chain: FakeChain) {
 			if (target === chain.store && decoded.functionName === 'get') {
 				const [namespace, key] = decoded.args
 				if (namespace !== chain.namespace) throw new Error(`read namespace ${namespace}`)
-				reads.push(key)
-				value = chain.flags.get(key) ?? 0n
+				reads.push(BigInt(key))
+				const flag = chain.flags.get(BigInt(key)) ?? 0n
+				const returnData = encodeFunctionResult({
+					abi: readAbi,
+					functionName: 'get',
+					result: numberToHex(flag, { size: 32 })
+				})
+				return { success: true, returnData }
 			} else if (target === MULTICALL3 && decoded.functionName === 'getChainId') {
 				value = chain.chainId
 			} else if (target === MULTICALL3 && decoded.functionName === 'getBlockNumber') {

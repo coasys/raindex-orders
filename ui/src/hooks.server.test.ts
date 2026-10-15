@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Handle } from '@sveltejs/kit'
-import { asBuild, BUILDS, MAINNET_BUILD, SEPOLIA_BUILD } from '$lib/testing/builds'
+import { asBuild, BUILDS, MAINNET_BUILD, BASE_SEPOLIA_BUILD } from '$lib/testing/builds'
 import { NOT_PAUSED } from '$lib/testing/pause'
 
 type Route = [string, string | null]
@@ -21,16 +21,17 @@ const FAUCET_ROUTES: [string, string][] = [
 	['/api/%66aucet', '/api/faucet'],
 	['/%66aucet', '/faucet']
 ]
-const LOCK_PAGE: Route[] = [
-	['/lock', '/lock'],
+const PAGES: Route[] = [
+	...ROUTES.filter(([path]) => !path.startsWith('/api/')),
 	['/lock/', '/lock'],
 	['/%6cock', '/lock']
 ]
 const FAUCET_PAGE = FAUCET_ROUTES.filter(([, route]) => route === '/faucet')
 const FAUCET_API = FAUCET_ROUTES.filter(([, route]) => route === '/api/faucet')
-const OPEN_WHILE_PAUSED = ROUTES.filter(([, route]) => route !== '/lock')
+const OPEN_WHILE_PAUSED = ROUTES.filter(([path]) => path.startsWith('/api/'))
 const STOP_TEXT =
 	'The HOT bridge is paused. It will be back soon. For more information, contact info@unyt.co.'
+const STOP_PAGE_TEXT = "We'll be back soon For more information, contact info@unyt.co."
 
 async function request(
 	build: Record<string, string>,
@@ -62,8 +63,8 @@ describe('handle', () => {
 		}
 	)
 
-	it.each(FAUCET_ROUTES)('resolves %s on sepolia', async (path, route) => {
-		expect((await request(SEPOLIA_BUILD, [path, route])).resolved).toBe(true)
+	it.each(FAUCET_ROUTES)('resolves %s on base-sepolia', async (path, route) => {
+		expect((await request(BASE_SEPOLIA_BUILD, [path, route])).resolved).toBe(true)
 	})
 
 	it.each(ROUTES)('resolves %s on mainnet', async (path, route) => {
@@ -72,8 +73,8 @@ describe('handle', () => {
 })
 
 describe.each([
-	['sepolia', [...LOCK_PAGE, ...FAUCET_PAGE]],
-	['mainnet', LOCK_PAGE]
+	['base-sepolia', [...PAGES, ...FAUCET_PAGE]],
+	['mainnet', PAGES]
 ] as const)('while paused, a %s build', (network, stopped) => {
 	const build = BUILDS[network]
 
@@ -84,7 +85,7 @@ describe.each([
 		expect(response.status).toBe(503)
 		expect(response.headers.get('Cache-Control')).toBe('no-store')
 		expect(response.headers.get('Content-Type')).toBe('text/html; charset=utf-8')
-		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_TEXT)
+		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_PAGE_TEXT)
 		expect(html).toContain('<a href="mailto:info@unyt.co">info@unyt.co</a>')
 		expect(html).not.toContain('<script')
 		expect(resolved).toBe(false)
@@ -97,9 +98,9 @@ describe.each([
 
 describe('while paused', () => {
 	it.each(FAUCET_API)(
-		'answers %s on sepolia with the stop text as JSON, without resolving it',
+		'answers %s on base-sepolia with the stop text as JSON, without resolving it',
 		async (path, route) => {
-			const { response, resolved } = await paused(SEPOLIA_BUILD, [path, route])
+			const { response, resolved } = await paused(BASE_SEPOLIA_BUILD, [path, route])
 
 			expect(response.status).toBe(503)
 			expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*')
@@ -117,8 +118,8 @@ describe('while paused', () => {
 })
 
 describe.each(NOT_PAUSED)('with %o', env => {
-	it.each([...ROUTES, ...FAUCET_ROUTES])('resolves %s on sepolia', async (path, route) => {
-		expect((await request(SEPOLIA_BUILD, [path, route], env)).resolved).toBe(true)
+	it.each([...ROUTES, ...FAUCET_ROUTES])('resolves %s on base-sepolia', async (path, route) => {
+		expect((await request(BASE_SEPOLIA_BUILD, [path, route], env)).resolved).toBe(true)
 	})
 
 	it.each(ROUTES)('resolves %s on mainnet', async (path, route) => {

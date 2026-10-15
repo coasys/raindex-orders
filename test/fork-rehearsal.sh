@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-FORK_URL=${FORK_URL:-https://eth.drpc.org}
+FORK_URL=${FORK_URL:-https://ethereum-rpc.publicnode.com}
 ORCHESTRATOR=${ORCHESTRATOR:-bridge-orchestrator/target/debug/bridge-orchestrator}
 PORT=${REHEARSAL_PORT:-18545}
 fork=http://127.0.0.1:$PORT
@@ -63,7 +63,11 @@ keys=(
 	0x2a871d0798f97d79848a013d4936a73bf4ae7b1cfd0dddbdf9ad2d28c75e78c3
 )
 address_of() { cast wallet address --private-key "$1"; }
-deployer_key=${keys[0]} admin_key=${keys[1]} signer_key=${keys[2]}
+# Anvil's accounts carry EIP-7702 delegations on mainnet, which Raindex V6 refuses
+# as coupon signers (it asks a delegated key's delegate through EIP-1271), so the
+# coupon signers are fresh keys.
+fresh_key() { cast wallet new --json | jq -r '.data[0].private_key'; }
+deployer_key=${keys[0]} admin_key=${keys[1]} signer_key=$(fresh_key) other_signer_key=$(fresh_key)
 deployer=$(address_of "$deployer_key")
 admin=$(address_of "$admin_key")
 signer=$(address_of "$signer_key")
@@ -128,8 +132,9 @@ vault=$(record_value MAINNET_LOCK_VAULT_ADDRESS "$work/deploy.log")
 order_hash=$(record_value ORDER_HASH "$work/deploy.log")
 interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/deploy.log")
 store=$(record_value PUBLIC_CLAIM_STORE "$work/deploy.log")
-expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/deploy.log")
-[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $expression ]] ||
+bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/deploy.log")
+input_token=$(record_value PUBLIC_CLAIM_INPUT_TOKEN "$work/deploy.log")
+[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $bytecode && -n $input_token ]] ||
 	fail "the deploy printed no complete deploy record"
 
 proofs() {
@@ -140,16 +145,21 @@ proofs() {
 
 # Starts `bridge-orchestrator run` on the fork with the deploy record in `record`
 # and the key `key`, with no Holochain node: it gets past its startup checks only
-# to stop where it needs the node. Prints what it logged.
+# to stop where it needs the node. The conductor config it is given is durable
+# and names a lair socket that is not there, which is where it stops. Prints
+# what it logged.
 orchestrate() {
 	local record=$1 key=$2 dir
 	dir=$(mktemp -d -p "$work")
+	printf 'keystore:\n  type: lair_server\n  connection_url: unix:///%s/no-lair?k=abc\ndb_sync_level: Full\n' \
+		"$dir" >"$dir/conductor-config.yaml"
 	(
 		cd "$dir"
 		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
 		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" SIGNER_PRIVATE_KEY="$key" \
 			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
-			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/no-conductor.yaml" "$ORCHESTRATOR" run 2>&1 || true
+			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/conductor-config.yaml" \
+			LAIR_PASSPHRASE_FILE="$dir/no-passphrase" "$ORCHESTRATOR" run 2>&1 || true
 	)
 }
 
@@ -160,9 +170,9 @@ grep -qF "startup checks passed" "$work/orchestrator.log" || {
 	fail "the orchestrator did not pass its startup checks with the deploy record and the coupon signer's key"
 }
 echo "passed its startup checks with the record and the coupon signer's key"
-orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "${keys[3]}")/" "$work/deploy.log") "${keys[3]}" \
-	>"$work/orchestrator.log"
-grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "${keys[3]}"): it answered \"Wrong signer\"" \
+orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "$other_signer_key")/" "$work/deploy.log") \
+	"$other_signer_key" >"$work/orchestrator.log"
+grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "$other_signer_key"): it answered \"Wrong signer\"" \
 	"$work/orchestrator.log" || {
 	cat "$work/orchestrator.log"
 	fail "the orchestrator started with a key the claim order does not accept"
@@ -171,7 +181,7 @@ echo "refused: a key the claim order does not accept"
 
 step "Proving the deployed bridge on the fork"
 ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
-	PUBLIC_CLAIM_EXPRESSION=$expression proofs --match-contract EoaRehearsal
+	PUBLIC_CLAIM_BYTECODE=$bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token proofs --match-contract EoaRehearsal
 
 safe() {
 	forge script test/rehearsal/RehearsalSafe.s.sol:RehearsalSafe --rpc-url "$fork" --broadcast \
@@ -206,8 +216,7 @@ echo "minLockAmount is $min_lock_amount, set by the admin Safe"
 
 step "Rotating the coupon signer to the signer Safe through rotate-claim-signer.sh"
 rotation=(NETWORK=mainnet ETH_RPC_URL="$fork" MAINNET_LOCK_VAULT_ADDRESS="$vault" ORDER_HASH="$order_hash"
-	PUBLIC_CLAIM_INTERPRETER="$interpreter" PUBLIC_CLAIM_STORE="$store" PUBLIC_CLAIM_EXPRESSION="$expression"
-	VALID_SIGNER="$signer_safe")
+	PUBLIC_CLAIM_BYTECODE="$bytecode" PUBLIC_CLAIM_INPUT_TOKEN="$input_token" VALID_SIGNER="$signer_safe")
 if env "${rotation[@]}" VALID_SIGNER="$test_signer" ./rotate-claim-signer.sh >"$work/refusal.log" 2>&1; then
 	fail "rotate-claim-signer.sh took the test signer on mainnet"
 fi
@@ -249,21 +258,27 @@ expect_record_refusal() {
 	echo "refused: a record when $reason"
 }
 
-env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log" ||
+# The refusal must not rest on keys[2]'s live mainnet code, which its delegation's
+# owner can change or clear: give it a delegation designator on the fork.
+delegated=$(address_of "${keys[2]}")
+cast rpc anvil_setCode "$delegated" "0xef0100${deployer#0x}" --rpc-url "$fork" >/dev/null
+expect_refusal "$fork" "VALID_SIGNER has an EIP-7702 delegation" \
+	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$delegated" ./deploy-mainnet.sh "${wallet[@]}"
+# A V6 order is its bytecode, so the same signer gives the same order, which the
+# orderbook already holds: the second order is for another signer.
+env "${rotation[@]}" VALID_SIGNER="$(address_of "$other_signer_key")" ./rotate-claim-signer.sh >"$work/rogue.log" ||
 	fail "rotate-claim-signer.sh did not print the calls for a second order"
 mapfile -t rogue < <(safe_calls "$work/rogue.log")
 [[ ${#rogue[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 calls for a second order"
 expect_record_refusal "the vault holds another order" "${rogue[0]}" "${calls[@]}"
 
-real_deployer=0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9
-forwarder=$(forge create test/rehearsal/ForwardingDeployer.sol:ForwardingDeployer --rpc-url "$fork" \
-	--private-key "$deployer_key" --broadcast --constructor-args "$real_deployer" |
-	grep -oE 'Deployed to: 0x[0-9a-fA-F]{40}' | cut -d' ' -f3 || true)
-[[ -n $forwarder ]] || fail "the forwarding deployer was not deployed"
+# The claim order's call names the network's interpreter; one naming another
+# address adds, since the orderbook does not check it, and the record must refuse it.
 padded() { printf '%064s' "$(tr 'A-F' 'a-f' <<<"${1#0x}")" | tr ' ' 0; }
-forwarded=${calls[0]//$(padded "$real_deployer")/$(padded "$forwarder")}
-[[ $forwarded != "${calls[0]}" ]] || fail "the claim order's call names no deployer to replace"
-expect_record_refusal "not deployed by the network's expression deployer" "$forwarded" "${calls[1]}"
+other_interpreter=$(address_of "${keys[3]}")
+misrun=${calls[0]//$(padded "$interpreter")/$(padded "$other_interpreter")}
+[[ $misrun != "${calls[0]}" ]] || fail "the claim order's call names no interpreter to replace"
+expect_record_refusal "not run by the network's interpreter and store" "$misrun" "${calls[1]}"
 
 from_block=$(($(cast block-number --rpc-url "$fork") + 1))
 execute "${calls[@]}"
@@ -275,11 +290,10 @@ grep -qF "is not the claim expression for VALID_SIGNER" "$work/refusal.log" ||
 echo "refused: a record naming a signer the claim order does not accept"
 env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" | tee "$work/rotated.log"
 new_order_hash=$(record_value ORDER_HASH "$work/rotated.log")
-new_interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/rotated.log")
-new_store=$(record_value PUBLIC_CLAIM_STORE "$work/rotated.log")
-new_expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/rotated.log")
-[[ -n $new_order_hash && -n $new_interpreter && -n $new_store && -n $new_expression ]] ||
-	fail "the rotation printed no complete deploy record"
+new_bytecode=$(record_value PUBLIC_CLAIM_BYTECODE "$work/rotated.log")
+[[ -n $new_order_hash && -n $new_bytecode ]] || fail "the rotation printed no complete deploy record"
+[[ $(record_value PUBLIC_CLAIM_INPUT_TOKEN "$work/rotated.log") == "$input_token" ]] ||
+	fail "the new deploy record does not keep the claim input token"
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||
 	fail "the new deploy record does not name the signer Safe"
 
@@ -292,8 +306,8 @@ echo "refused: the orchestrator for a claim order whose signer is a Safe"
 
 step "Proving the Safe admin and the Safe coupon signer on the fork"
 ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash \
-	PUBLIC_CLAIM_INTERPRETER=$new_interpreter PUBLIC_CLAIM_STORE=$new_store \
-	PUBLIC_CLAIM_EXPRESSION=$new_expression \
+	PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
+	PUBLIC_CLAIM_BYTECODE=$new_bytecode PUBLIC_CLAIM_INPUT_TOKEN=$input_token \
 	ADMIN_SAFE=$admin_safe SIGNER_SAFE=$signer_safe REHEARSAL_MIN_LOCK_AMOUNT=$min_lock_amount \
 	REHEARSAL_SIGNER_OWNER_KEYS="${signer_owner_keys[1]},${signer_owner_keys[2]}" \
 	REHEARSAL_SIGNER_ONE_OWNER_KEY="${signer_owner_keys[0]}" \

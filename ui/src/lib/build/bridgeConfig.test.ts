@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ConfigEnv, UserConfig } from 'vite'
-import { BUILD_VARIABLES } from '../network'
+import { BASE_SEPOLIA_DEFAULTS, BUILD_VARIABLES } from '../network'
 import { BUILDS, MAINNET_BUILD } from '../testing/builds'
 import { bridgeConfig } from './bridgeConfig'
 
@@ -36,21 +36,23 @@ describe('the build', () => {
 		expect(build).not.toThrow()
 	})
 
-	it('passes with nothing set, naming the TestNet values it took', () => {
+	it('passes with nothing set, naming the TestNet values it took: its deploy on Base Sepolia', () => {
 		const info = vi.spyOn(console, 'info').mockImplementation(() => {})
 
 		expect(build).not.toThrow()
 		expect(info).toHaveBeenCalledWith(
-			expect.stringContaining("bridge build: TestNet's values for PUBLIC_NETWORK")
+			expect.stringContaining(
+				`bridge build: TestNet's values for ${['PUBLIC_NETWORK', ...Object.keys(BASE_SEPOLIA_DEFAULTS)].join(', ')}`
+			)
 		)
 		info.mockRestore()
 	})
 
 	it('fails with a variable missing, naming it', () => {
 		for (const [key, value] of Object.entries(MAINNET_BUILD)) vi.stubEnv(key, value)
-		vi.stubEnv('PUBLIC_CLAIM_EXPRESSION', '')
+		vi.stubEnv('PUBLIC_CLAIM_BYTECODE', '')
 
-		expect(build).toThrow('PUBLIC_CLAIM_EXPRESSION is required')
+		expect(build).toThrow('PUBLIC_CLAIM_BYTECODE is required')
 	})
 
 	it('fails on mainnet with the test signer', () => {

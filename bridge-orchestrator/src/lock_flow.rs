@@ -190,7 +190,7 @@ mod tests {
     }
 
     fn lock_flow(rpc_url: String, db: StateStore, stop: ShutdownRx) -> LockFlow {
-        lock_flow_on(Network::Sepolia, rpc_url, db, stop)
+        lock_flow_on(Network::BaseSepolia, rpc_url, db, stop)
     }
 
     fn lock_flow_on(
@@ -341,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_read_goes_no_further_than_five_blocks_below_the_head_on_both_networks() {
-        for network in [Network::Sepolia, Network::Mainnet] {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
             let dir = tempfile::tempdir().unwrap();
             let db = store(&dir);
             db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 80).unwrap();
@@ -384,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_database_starts_at_the_newest_confirmed_block_on_both_networks() {
-        for network in [Network::Sepolia, Network::Mainnet] {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
             let dir = tempfile::tempdir().unwrap();
             let db = store(&dir);
             let (url, windows) = chain(100, &[(6, 95)]).await;
@@ -523,7 +523,7 @@ mod tests {
 
         let message = format!("{e:#}");
         assert!(
-            message.starts_with("SEPOLIA_RPC_URL: eth_blockNumber failed: "),
+            message.starts_with("BASE_SEPOLIA_RPC_URL: eth_blockNumber failed: "),
             "{message}"
         );
         assert!(!message.contains("secret-api-key"), "{message}");
@@ -560,7 +560,7 @@ mod tests {
 
         assert_eq!(
             format!("{e:#}"),
-            "SEPOLIA_RPC_URL did not answer eth_blockNumber within 200ms"
+            "BASE_SEPOLIA_RPC_URL did not answer eth_blockNumber within 200ms"
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "no request after it");
     }

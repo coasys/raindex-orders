@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { encodeFunctionResult, maxUint256 } from 'viem'
+import { encodeFunctionResult, maxUint256, numberToHex } from 'viem'
 import type { SvelteComponent } from 'svelte'
 import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
 import { ACCOUNT, CHAIN, connected, injectWallet } from '$lib/testing/wallet'
 import { deserializeSignedContext } from '$lib/coupon'
 import { orderbookAbi } from '../generated'
 import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
-import { SEPOLIA_REDEEMED } from './api/coupon-status/fixtures'
+import { TESTNET_COUPONS } from './api/coupon-status/fixtures'
 
 type Page = new (options: { target: Element }) => SvelteComponent
 type Answer = (url: string, init: RequestInit) => Promise<Response>
@@ -21,7 +21,7 @@ const READS: Record<string, unknown> = {
 	decimals: 18,
 	minLockAmount: 1n,
 	orderExists: true,
-	vaultBalance: 10n ** 21n
+	vaultBalance2: '0xffffffee00000000000000000000000000000000000000000000000000000000'
 }
 const PAUSED: Answer = async () => Response.json({ paused: true })
 const OPEN: Answer = async () => Response.json({ paused: false })
@@ -123,7 +123,7 @@ async function lock(network: Network) {
 	await submitLock()
 }
 
-describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network => {
+describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, Lock', network => {
 	it('sends nothing, and shows the stop text, while the bridge is paused', async () => {
 		const fetch = stubFetch(PAUSED)
 
@@ -277,7 +277,7 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 	})
 })
 
-const TOKEN = { sepolia: 'mock HOT', mainnet: 'HOT' }
+const TOKEN = { 'base-sepolia': 'mock HOT', mainnet: 'HOT' }
 const NOT_SENT =
 	"Your wallet did not send the transaction. If your wallet's activity shows no lock, try again."
 const LOCK_FAILED =
@@ -292,7 +292,7 @@ const VIEM_FAILURE = new Error(
 	{ cause: RPC_FAILURE }
 )
 
-describe.each(['sepolia', 'mainnet'] as const)('on a %s build, a Lock that fails', network => {
+describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, a Lock that fails', network => {
 	const DECLINED = `You declined the lock in your wallet, so no ${TOKEN[network]} was locked.`
 
 	beforeEach(() => {
@@ -476,24 +476,39 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, a Lock that fails
 	})
 })
 
+async function claim() {
+	const coupon = TESTNET_COUPONS[0]
+	const amount = numberToHex(deserializeSignedContext(coupon).context[1], { size: 32 })
+	const pays = encodeFunctionResult({
+		abi: orderbookAbi,
+		functionName: 'takeOrders4',
+		result: [amount, `0x${'0'.repeat(64)}`]
+	})
+	const injected = injectWallet(CHAIN['base-sepolia'], { eth_call: pays })
+	await mount('base-sepolia', './claim/+page.svelte')
+	type('#coupon', coupon)
+	await click('Claim')
+	return injected
+}
+
 describe('Claim', () => {
-	it('sends with no status request, paused or not', async () => {
-		const fetch = stubFetch(PAUSED)
-		const { coupon } = SEPOLIA_REDEEMED[0]
-		const amount = deserializeSignedContext(coupon).context[1]
-		const pays = encodeFunctionResult({
-			abi: orderbookAbi,
-			functionName: 'takeOrders',
-			result: [amount, 0n]
-		})
-		const injected = injectWallet(CHAIN.sepolia, { eth_call: pays })
-		await mount('sepolia', './claim/+page.svelte')
+	it('sends nothing, and shows the stop text, while paused', async () => {
+		stubFetch(PAUSED)
 
-		type('#coupon', coupon)
-		await click('Claim')
+		const injected = await claim()
 
-		await until(() => expect(written()).toEqual(['takeOrders']))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
+		expect(injected).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('claims once /api/status reads not paused', async () => {
+		const fetch = stubFetch(OPEN)
+
+		const injected = await claim()
+
+		await until(() => expect(written()).toEqual(['takeOrders4']))
 		expect(injected).toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
-		expect(fetch).not.toHaveBeenCalled()
+		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
 	})
 })

@@ -6,12 +6,19 @@
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import Paused from '$lib/components/Paused.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
-	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
+	import {
+		deserializeSignedContext,
+		floatToWei,
+		parseCoupon,
+		type SignedContextV1Struct
+	} from '$lib/coupon'
 	import { getOrderConfig, type OrderConfig } from '$lib/orderConfig'
 	import { claimCoupon } from '$lib/claim'
 	import { ethereumStore, onWrongNetwork, connectWallet, readContract } from '$lib/ethereum'
 	import { errorMessage } from '$lib/utils'
+	import { bridgeStatus } from '$lib/pause'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
 
@@ -86,13 +93,14 @@
 		if (!orderConfig) return
 
 		try {
+			// Raindex V6 answers a decimal float: the vault's HOT, read back as wei.
 			const balance = await readContract({
 				address: bridge.orderbookAddress,
 				abi: orderbookAbi,
-				functionName: 'vaultBalance',
+				functionName: 'vaultBalance2',
 				args: [orderConfig.owner, orderConfig.outputToken, orderConfig.outputVaultId]
 			})
-			vaultBalance = balance as bigint
+			vaultBalance = floatToWei(BigInt(balance as Hex))
 		} catch (e) {
 			console.error('Failed to get vault balance:', e)
 			vaultBalance = undefined
@@ -104,6 +112,7 @@
 	let isLoading = false
 	let error = ''
 	let errorUnconfirmed = false
+	let paused = false
 	let success = false
 	let successTxHash = ''
 
@@ -112,10 +121,15 @@
 		if (!orderConfig) return
 
 		error = ''
+		errorUnconfirmed = false
+		paused = false
 		success = false
 		isLoading = true
 
 		try {
+			const status = await bridgeStatus()
+			;({ paused, error } = status)
+			if (!status.open) return
 			const hash = await claimCoupon(signedContext)
 			success = true
 			successTxHash = hash
@@ -150,7 +164,7 @@
 			{#if coupon && orderConfig}
 				<span class="text-gray-600">Amount:</span>
 				<span class="font-semibold">
-					{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+					{formatUnits(coupon.withdrawAmount, 18)}
 					{bridge.tokenName}
 				</span>
 
@@ -167,7 +181,7 @@
 	{:else}
 		<h1 class="text-2xl font-bold">Claim {bridge.tokenName}</h1>
 		<p class="text-gray-600">
-			Redeem your {bridge.tokenName} claim coupon to receive {bridge.tokenName} tokens on Ethereum.
+			Redeem your {bridge.tokenName} claim coupon to receive {bridge.tokenName} tokens on {bridge.networkName}.
 		</p>
 
 		{#if !isConnected}
@@ -219,7 +233,7 @@
 
 							<span class="text-gray-600">Amount:</span>
 							<span class="font-semibold">
-								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+								{formatUnits(coupon.withdrawAmount, 18)}
 								{bridge.tokenName}
 							</span>
 
@@ -234,12 +248,14 @@
 
 					{#if vaultBalance !== undefined}
 						<div class="text-sm text-gray-600">
-							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)}
+							Vault Balance: {formatUnits(vaultBalance, 18)}
 							{bridge.tokenName}
 						</div>
 					{/if}
 
-					{#if error}
+					{#if paused}
+						<Paused />
+					{:else if error}
 						<Alert color={errorUnconfirmed ? 'yellow' : 'red'} class="break-words">{error}</Alert>
 					{/if}
 

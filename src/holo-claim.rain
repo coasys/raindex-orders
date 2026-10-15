@@ -1,18 +1,22 @@
 ---
 
-/** 
+/**
  *  Our "coupon" (the SignedContext array) will be:
  *  [0] recipient address
- *  [1] amount
- *  [2] expiry timestamp in seconds
+ *  [1] amount, a decimal float: the wei as its coefficient and -18 as its
+ *      exponent, so 0xffffffee then the wei in the low 224 bits
+ *  [2] expiry timestamp in seconds (a float of exponent 0 is its integer)
  *  Plus some domain separators
  *  [3] order hash
  *  [4] order owner
- *  [5] orderbook address
+ *  [5] raindex (orderbook) address
  *  [6] token address
  *  [7] output vault id
  *  [8] nonce (to prevent replay attacks)
- */ 
+ *
+ *  Addresses, hashes and the nonce are compared bit for bit (binary-equal-to);
+ *  the amount and the expiry are compared as numbers.
+ */
 
 #orderbook-subparser !subparser on this network
 #valid-signer !the coupon signer (docs/enable-multisig.md)
@@ -21,21 +25,23 @@
 using-words-from orderbook-subparser
 
 /* do the checks */
-:ensure(equal-to(signer<0>() valid-signer) "Wrong signer"),
-:ensure(equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
+:ensure(binary-equal-to(signer<0>() valid-signer) "Wrong signer"),
+:ensure(binary-equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
 :ensure(less-than(block-timestamp() signed-context<0 2>()) "Order expired"),
-:ensure(equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
-:ensure(equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
-:ensure(equal-to(signed-context<0 5>() orderbook()) "Wrong orderbook"),
-:ensure(equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
-:ensure(equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
+:ensure(binary-equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
+:ensure(binary-equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
+:ensure(binary-equal-to(signed-context<0 5>() raindex()) "Wrong orderbook"),
+:ensure(binary-equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
+:ensure(binary-equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
 
 /* check the nonce has not been used before */
 :ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
 :set(hash(order-hash() signed-context<0 8>()) 1),
 
 output-amount: signed-context<0 1>(),
-io-ratio: 0;
+/* Raindex V6 takes an order only at a positive ratio: the claimer pays 1e-30
+   of the input token per HOT, which the ClaimInputToken never moves */
+io-ratio: 1e-30;
 
 #handle-io
-:ensure(equal-to(output-vault-balance-decrease() signed-context<0 1>()) "Wrong output amount");
+:ensure(equal-to(output-vault-decrease() signed-context<0 1>()) "Wrong output amount");
