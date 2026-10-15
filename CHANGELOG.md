@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/signer-service.md`: the API a Safe owner's signer service implements (Unyt builds them): requests, answers, refusal codes, the hash an owner signs with a worked example and reference code (`ui/scripts/safe-message.mjs`), and what the service checks on Holochain before it signs. Among those checks: the withdrawal is still parked when it signs; it keeps a durable record of the order hash it signed each withdrawal for and refuses another (`already_signed`), so a claim order rotation cannot pay one withdrawal twice; the expiry window is `EXPIRY_SECONDS` plus a 10-minute clock tolerance; and the HOT amount converts to wei exactly, with test vectors. The mock service (`ui/scripts/mock-signer-service.mjs`) keeps the record and the expiry window too.
 - `test/fork-rehearsal.sh` launches with one Safe, created by `deploy-mainnet.sh safe`, as admin and coupon signer, with the orchestrator collecting its owners' signatures from mock signer services (`ui/scripts/mock-signer-service.mjs`), then proves the separate shape: an admin Safe, a key signer and its rotation to a signer Safe, the website's coupon status against a real Safe on the fork before and after a claim, and the override deploy. `test/base-sepolia-safe-rehearsal.sh` proves the one-Safe TestNet deploy on a fork of Base Sepolia.
 
+### Changed
+
+- the claim expression (`src/holo-claim.rain`) marks a used nonce at the nonce alone, no longer at `hash(order-hash() nonce)`. Raindex keeps the store under the order's owner, the vault, so a nonce claimed on one claim order is used on every claim order the vault adds after a rotation: one burn pays once, on chain, whatever the signer becomes. The signer services' `already_signed` records and the threshold rule stand behind that. The website's coupon status reads the new key. A TestNet deployed before this runs the old expression until its claim order is rotated (`rotate-claim-signer.sh`), which also changes its deploy record.
+
 ## [0.6.0] - 2026-10-15
 
 ### Added
