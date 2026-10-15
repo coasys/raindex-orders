@@ -524,15 +524,31 @@ fn outcome(
     Ok(Some(revert))
 }
 
+/// The claim order's refusal of a coupon whose nonce was claimed before.
+const NONCE_USED: &str = "Nonce already used";
+
 /// Whether the simulated probe shows the claim order accepts its signer. Its
-/// first check is the signer, so any other outcome comes after it. Only a claim,
-/// or MinimumIO for a vault that cannot pay the one wei, counts.
+/// first check is the signer, so any other outcome comes after it. A claim, or
+/// MinimumIO for a vault that cannot pay the one wei, counts. So does "Nonce
+/// already used": Raindex checks the coupon's signature before the expression
+/// runs, and the nonce is the expression's last check (src/holo-claim.rain),
+/// after the signer and every other word, so the order took all of those. The
+/// probe pays the signer itself, so only the signer can have claimed it, once;
+/// its nonce is fixed, and refusing it would stop every later startup.
 fn accepts_signer(signer: Address, refused: Option<Bytes>) -> Result<()> {
     let Some(revert) = refused else {
         return Ok(());
     };
-    if Revert::abi_decode(&revert, true).is_ok_and(|r| r.reason == "Wrong signer") {
+    let reason = Revert::abi_decode(&revert, true).map(|r| r.reason);
+    if reason.as_deref().is_ok_and(|r| r == "Wrong signer") {
         bail!("the claim order ORDER_HASH does not accept coupons from CLAIM_SIGNER {signer}: it answered \"Wrong signer\"");
+    }
+    if reason.as_deref().is_ok_and(|r| r == NONCE_USED) {
+        tracing::info!(
+            event = "startup.probe",
+            "the claim order answered \"{NONCE_USED}\" to the probe, its last check: CLAIM_SIGNER {signer} claimed the probe once, and the order accepts its coupons"
+        );
+        return Ok(());
     }
     bail!(
         "the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {signer} with error 0x{}",
@@ -725,6 +741,8 @@ mod tests {
         admin: Address,
         /// What the claim signer answers as a Safe, when it is one.
         safe: Option<FakeSafe>,
+        /// The signer claimed the startup probe once, so its nonce is used.
+        probe_claimed: bool,
     }
 
     /// A Safe as the claim signer: its threshold, owners, and the domain
@@ -764,6 +782,7 @@ mod tests {
                 vault_balance: U256::from(10),
                 admin: OTHER,
                 safe: None,
+                probe_claimed: false,
             }
         }
 
@@ -865,7 +884,8 @@ mod tests {
         }
 
         /// takeOrders4 as RaindexV6 runs the claim order: the coupon's signature
-        /// first, then the expression's signer check, then the vault's balance.
+        /// first, then the expression's signer check, its nonce check last, then
+        /// the vault's balance.
         fn take_orders(&self, input: &[u8]) -> Answer {
             let config = IRaindexV6::takeOrders4Call::abi_decode(input, true)
                 .unwrap()
@@ -911,6 +931,14 @@ mod tests {
                 return reverted(
                     Revert {
                         reason: "Wrong signer".to_string(),
+                    }
+                    .abi_encode(),
+                );
+            }
+            if self.probe_claimed && coupon.context[8] == crate::signer::probe_nonce() {
+                return reverted(
+                    Revert {
+                        reason: NONCE_USED.to_string(),
                     }
                     .abi_encode(),
                 );
@@ -1658,6 +1686,51 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The signer once claimed the probe, which only it can: its fixed nonce is
+    /// used, and the claim order answers "Nonce already used", its last check.
+    /// The startup passes, for a key and for a Safe, whose M-1 probe is still
+    /// refused for its signatures first.
+    #[tokio::test]
+    async fn passes_a_claim_order_whose_probe_its_signer_claimed_once() {
+        for network in [Network::BaseSepolia, Network::Mainnet] {
+            let chain = Chain {
+                probe_claimed: true,
+                ..Chain::of(network)
+            };
+            check_against(network, chain, &order()).await.unwrap();
+        }
+        let (mut chain, order) = safe_setup(Network::BaseSepolia, 2);
+        chain.probe_claimed = true;
+        safe_check(Network::BaseSepolia, chain, order, held(&[0, 1]), 84_532)
+            .await
+            .unwrap();
+    }
+
+    /// The startup takes "Nonce already used" as the claim order accepting its
+    /// signer only because the nonce is the expression's last check, after the
+    /// signer and every other word of the coupon.
+    #[test]
+    fn the_nonce_is_the_claim_orders_last_check() {
+        let rain = include_str!("../../src/holo-claim.rain");
+        let calculate = rain
+            .split_once("\n#calculate-io\n")
+            .and_then(|(_, rest)| rest.split_once("\n#handle-io\n"))
+            .map(|(calculate, _)| calculate)
+            .expect("the claim expression's #calculate-io");
+        let ensures: Vec<&str> = calculate
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(":ensure("))
+            .collect();
+
+        assert_eq!(ensures.len(), 9, "{ensures:#?}");
+        assert!(ensures[0].ends_with("\"Wrong signer\"),"), "{ensures:#?}");
+        assert!(
+            ensures[8].ends_with(&format!("\"{NONCE_USED}\"),")),
+            "{ensures:#?}"
+        );
     }
 
     #[tokio::test]

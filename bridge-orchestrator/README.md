@@ -48,8 +48,9 @@ refuses to start, naming each variable at fault, when:
   chain
 - the claim order does not accept a coupon signed with that key, or by those
   owners for the Safe. `run` simulates `takeOrders4` with a one-wei coupon to
-  the signer, and starts only if the order pays it, or answers `MinimumIO`
-  because its vault is empty. For a Safe, the probe is signed by M owners, the
+  the signer, and starts only if the order pays it, answers `MinimumIO`
+  because its vault is empty, or answers `Nonce already used` because the
+  signer claimed the probe once (the nonce is the order's last check). For a Safe, the probe is signed by M owners, the
   signer services among them, the Safe's own `isValidSignature` must accept
   them, and the simulated claim with M-1 of them must fail with
   `InvalidSignature(0)`: another revert would not show the Safe refused them.
