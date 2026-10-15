@@ -4,13 +4,15 @@
 // the checks that need no Holochain node: the Safe, chain and owner; the claim
 // order's words against the deploy record; the nonce against the withdrawal ID;
 // the startup probe's fixed words; the expiry, within EXPIRY_SECONDS and
-// EXPIRY_TOLERANCE_SECONDS; and the hashes, which it computes itself from the
-// words.
+// EXPIRY_TOLERANCE_SECONDS; the hashes, which it computes itself from the words;
+// and the record of the order hash it signed each withdrawal for, which it keeps
+// in the file SIGNED_RECORD when that is set, and in memory otherwise.
 //
 //   OWNER_KEY=0x.. SAFE=0x.. CHAIN_ID=1 PORT=18601 ORDER_HASH=0x.. ORDER_OWNER=0x.. \
 //   ORDERBOOK_ADDRESS=0x.. TOKEN_ADDRESS=0x.. VAULT_ID=0x.. node scripts/mock-signer-service.mjs
 //
 // MODE=refuse answers every /sign with 409; MODE=wrong-key signs with another key.
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { isAddressEqual, keccak256, pad, stringToHex, toHex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
@@ -31,6 +33,20 @@ const signingKey = mode === 'wrong-key' ? generatePrivateKey() : ownerKey
 // tolerance for the two clocks.
 const expirySeconds = BigInt(process.env.EXPIRY_SECONDS ?? 7 * 24 * 60 * 60)
 const toleranceSeconds = BigInt(process.env.EXPIRY_TOLERANCE_SECONDS ?? 10 * 60)
+// docs/signer-service.md, "One order per withdrawal": withdrawal -> the order
+// hash this service signed it for, written before a signature leaves.
+const recordFile = process.env.SIGNED_RECORD
+const signed = new Map(
+	Object.entries(
+		recordFile && existsSync(recordFile) ? JSON.parse(readFileSync(recordFile, 'utf8')) : {}
+	)
+)
+function remember(withdrawal, orderHash) {
+	signed.set(withdrawal, orderHash)
+	if (!recordFile) return
+	writeFileSync(`${recordFile}.tmp`, JSON.stringify(Object.fromEntries(signed)))
+	renameSync(`${recordFile}.tmp`, recordFile)
+}
 const word = hex => pad(hex.toLowerCase(), { size: 32 })
 const record = [
 	word(env('ORDER_HASH')),
@@ -96,6 +112,15 @@ function check(body) {
 	const hash = safeMessageHash({ chainId, safe, digest })
 	if (body.couponDigest?.toLowerCase() !== digest || body.safeMessageHash?.toLowerCase() !== hash)
 		refuse('hash_mismatch', `the words hash to ${digest} and ${hash}`)
+	if (body.withdrawal !== null) {
+		const before = signed.get(body.withdrawal)
+		if (before !== undefined && before !== lower[3])
+			refuse(
+				'already_signed',
+				`${body.withdrawal} was signed for the order ${before}; an operator clears it once that order is removed and its coupon unredeemed`
+			)
+		remember(body.withdrawal, lower[3])
+	}
 	return hash
 }
 

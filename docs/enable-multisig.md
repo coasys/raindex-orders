@@ -81,7 +81,7 @@ For a bridge launched with a key, or a Safe that is not the admin, as the coupon
 5. Give the website the new `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN` from the new deploy record, then build and deploy it again. The build refuses values that do not hash to the order hash, but it cannot check the signer. Its coupon status asks the Safe's `isValidSignature` for each coupon that names it, in the same call that reads the coupon's nonce.
 6. Reissue the coupons that were not claimed. A coupon names its order's hash, so a coupon for the old order fails on the new one.
 
-The claim order marks a nonce used under its own order hash. A withdrawal claimed on an old order is not marked on the new one, so a new coupon for it pays it a second time. Reissue a coupon only once its order is removed, and only for a withdrawal none of whose coupons is redeemed. To read whether a coupon is redeemed, ask the store of the order it names, where a nonzero answer means redeemed:
+The claim order marks a nonce used under its own order hash. A withdrawal claimed on an old order is not marked on the new one, so a new coupon for it pays it a second time. Reissue a coupon only once its order is removed, and only for a withdrawal none of whose coupons is redeemed. With a Safe coupon signer, each signer service enforces this rule itself. It records the order hash it signed each withdrawal for, and refuses that withdrawal for any other order hash with `already_signed`. It signs again only after its operator has made both checks below and cleared the record ([signer-service.md](./signer-service.md#one-order-per-withdrawal)). To read whether a coupon is redeemed, ask the store of the order it names, where a nonzero answer means redeemed:
 
 ```sh
 namespace=$(cast keccak "$(cast abi-encode 'f(address,address)' "$VAULT" "$ORDERBOOK")")
@@ -89,7 +89,7 @@ key=$(cast keccak "$(cast abi-encode --packed 'f(uint256,uint256)' "$COUPON_ORDE
 cast call "$COUPON_ORDER_STORE" 'get(uint256,bytes32)(bytes32)' "$namespace" "$key" --rpc-url "$ETH_RPC_URL"
 ```
 
-`COUPON_ORDER_HASH` is the coupon's sixth field, `NONCE` its last, and `COUPON_ORDER_STORE` the `PUBLIC_CLAIM_STORE` of the deploy record that named that order. After more than one rotation, check every order a withdrawal has had a coupon for.
+`COUPON_ORDER_HASH` is the coupon's sixth field, `NONCE` its last, and `COUPON_ORDER_STORE` the `PUBLIC_CLAIM_STORE` of the deploy record that named that order. After more than one rotation, check every order a withdrawal has had a coupon for. To read whether the old order is removed, `cast call "$ORDERBOOK" 'orderExists(bytes32)(bool)' "$COUPON_ORDER_HASH" --rpc-url "$ETH_RPC_URL"` must answer `false`.
 
 ## Fireblocks as the coupon signer
 
@@ -97,6 +97,6 @@ A Fireblocks MPC wallet is a paid alternative to a Safe. It signs as one Ethereu
 
 ## What is not built yet
 
-**The signer services**, one per owner, which Unyt builds. Each receives a signing request from the orchestrator, reads the withdrawal from its own Holochain node, checks the burn, its amount and recipient, the coupon's expiry and nonce, and the claim order, and signs the coupon's SafeMessage hash with its own owner key only when all of it holds. [signer-service.md](./signer-service.md) is the API: requests, answers, refusal codes, the hash with a worked example, and the open questions.
+**The signer services**, one per owner, which Unyt builds. Each receives a signing request from the orchestrator and reads the withdrawal from its own Holochain node. It checks that the burn is still parked, its amount and recipient, the coupon's expiry and nonce, the claim order, and that it has not signed the withdrawal for another order. It signs the coupon's SafeMessage hash with its own owner key only when all of it holds. [signer-service.md](./signer-service.md) is the API: requests, answers, refusal codes, the hash with a worked example, and the open questions.
 
 The orchestrator's side is built: it collects the owners' signatures over that API, checks them, and has the Safe accept them. Until the services exist, an orchestrator holding M owner keys is one party, as a single key is, and on mainnet it starts so only with `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`.

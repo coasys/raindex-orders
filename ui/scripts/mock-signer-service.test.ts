@@ -14,6 +14,7 @@ const ORDERBOOK = '0x37fc0efec37d19f8a221aa4f8f7600c9ba2acd20'
 const TOKEN = '0x6c6ee5e31d828de241282b9606c8e98ea48526e2'
 const VAULT_ID = '0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'
 const ORDER_A = '0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9'
+const ORDER_B = keccak256(toHex('another claim order'))
 const DAY = 24 * 60 * 60
 
 /** A withdrawal action hash's 39 bytes, as the API sends them: `u` then base64url. */
@@ -92,6 +93,28 @@ async function sign(
 }
 
 describe('the mock signer service', () => {
+	it('refuses a withdrawal it signed for one claim order when asked for another, across a restart', async () => {
+		const record = join(mkdtempSync(join(tmpdir(), 'mock-signer-')), 'signed.json')
+		const port = 18_700 + Math.floor(Math.random() * 200)
+		const w = withdrawal(7)
+		const other = withdrawal(9)
+
+		let mock = await startMock(ORDER_A, record, port)
+		expect((await sign(port, w.id, w.nonce, ORDER_A)).status).toBe(200)
+		// The same withdrawal for the same order is signed again: its nonce lets one claim.
+		expect((await sign(port, w.id, w.nonce, ORDER_A)).status).toBe(200)
+		mock.kill()
+		await new Promise(resolve => mock.once('exit', resolve))
+
+		// The claim order is rotated: the service restarts with the new deploy record.
+		mock = await startMock(ORDER_B, record, port)
+		const again = await sign(port, w.id, w.nonce, ORDER_B)
+		expect(again.status).toBe(409)
+		expect(again.body.code).toBe('already_signed')
+		expect(again.body.reason).toContain(ORDER_A)
+		expect((await sign(port, other.id, other.nonce, ORDER_B)).status).toBe(200)
+	})
+
 	it('takes an expiry up to EXPIRY_SECONDS plus the tolerance ahead, and a little behind', async () => {
 		const record = join(mkdtempSync(join(tmpdir(), 'mock-signer-')), 'signed.json')
 		const port = 18_900 + Math.floor(Math.random() * 90)

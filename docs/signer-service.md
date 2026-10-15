@@ -66,7 +66,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | code | when |
 |---|---|
 | `unknown_withdrawal` | the service's node does not hold a spend with that action hash |
-| `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
+| `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), is no longer parked, or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
 | `amount_mismatch` | word 1 is not the word the service makes of the spend's amount |
 | `recipient_mismatch` | word 0 is not the spend's withdraw-to address |
 | `expiry_out_of_range` | word 2 is outside the window in [the expiry](#the-expiry) |
@@ -76,6 +76,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `wrong_owner` | `owner` is not the service's owner |
 | `probe_mismatch` | `withdrawal` is null and the words are not the startup probe's |
 | `hash_mismatch` | the service's own digest or SafeMessage hash differs from the one sent |
+| `already_signed` | the service signed this withdrawal for another order hash, and no operator has cleared that ([one order per withdrawal](#one-order-per-withdrawal)) |
 | `not_ready` | the service cannot check now, for example its node is not in sync (HTTP 503 works too) |
 
 Any other status (400 for a malformed body, 401 or 403 for authentication, 500, 503) counts as "did not sign", and the orchestrator logs the status. So does a redirect, which the orchestrator does not follow, and an answer of more than 64 KiB.
@@ -178,13 +179,14 @@ export async function signAsOwner(key, hash) {
 
 Each check uses the service's own sources: its own Holochain node, or one it trusts, and a copy of the deploy record it was given when it was set up, never the request.
 
-1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
+1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. **Parked means parked when the service signs**: not yet accepted on Holochain, by the RAVE that delivers its coupon or otherwise. A withdrawal that is accepted already has its coupon, and the service does not sign it again. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
 2. **The amount.** Word 1 is exactly the spend's amount in the HOT unit, converted as in [the amount](#the-amount) below. Not more, not another unit.
 3. **The recipient.** Word 0 is the `withdraw_to_address` in the spend's attached payload.
 4. **The expiry.** Word 2 is within the window in [the expiry](#the-expiry) below.
-5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and one claim order lets only one of them claim, so signing the same withdrawal again is safe. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
+5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and one claim order lets only one of them claim, so signing the same withdrawal again **for the same order** is safe. For another order it is not: check 8. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
 6. **The order.** Words 3 to 7 equal the service's copy of the deploy record, and `safe`, `chainId` and `owner` are what the service signs for.
 7. **The hashes.** The service computes `couponDigest` and `safeMessageHash` from the words it checked, and refuses with `hash_mismatch` if the request's differ. It signs its own `safeMessageHash`, and nothing else.
+8. **One order per withdrawal.** The service has not signed this withdrawal for another order hash, as [below](#one-order-per-withdrawal). Otherwise `already_signed`.
 
 If any check fails, the service refuses with its code and alerts a person. A refusal means the orchestrator and the service see the network differently: a bug, or an attack.
 
@@ -219,6 +221,20 @@ now - EXPIRY_TOLERANCE_SECONDS  <  word 2  <=  now + EXPIRY_SECONDS + EXPIRY_TOL
 
 So a clock up to 10 minutes apart does not park withdrawals, and no coupon lives more than 10 minutes past the agreed maximum. If the parties agree on a shorter maximum, the orchestrator's `EXPIRY_SECONDS` must change with it. Otherwise every coupon is refused with `expiry_out_of_range`. The mock services use the same defaults.
 
+### One order per withdrawal
+
+The claim order marks a nonce used under its own order hash. A withdrawal claimed on one claim order is not marked on another, so after a claim order rotation a second coupon for it would pay it again ([enable-multisig.md](./enable-multisig.md#move-the-coupon-signer-to-another-signer)). Check 1 stops this for withdrawals already accepted on Holochain. This rule stops it for a withdrawal still parked, which a faulty or compromised orchestrator can ask for again. The orchestrator is the one party the services exist to distrust.
+
+A service **must**:
+
+- Keep a durable record of each withdrawal it signed, with the order hash (word 3) it signed it for. It writes the record before it returns the signature. The record survives restarts and redeploys of the service.
+- Sign a withdrawal again for the same order hash. The nonce lets only one of its coupons claim.
+- Refuse a withdrawal recorded under another order hash with `409 already_signed`. An operator of that service may clear the withdrawal's record only after checking both of these:
+  - **Unredeemed.** The old order's store shows the withdrawal's nonce unredeemed under the old order hash. [enable-multisig.md](./enable-multisig.md#move-the-coupon-signer-to-another-signer) gives the `cast` command.
+  - **Removed.** The old order is removed: `orderExists(old order hash)` on the orderbook is false.
+
+The startup probe has no withdrawal, so the service keeps no record of it.
+
 ### The startup probe
 
 At startup the orchestrator sends one request with `"withdrawal": null`. Its words are fixed, so the service checks them without Holochain:
@@ -238,7 +254,7 @@ The orchestrator simulates a claim with M owner signatures of the probe, which m
 - **At startup**, for each owner it asks `GET /signer`, and refuses to start if a service answers for another owner, Safe or chain, or if an owner it names is not an owner of the Safe. A service that does not answer is logged and left out. Startup passes while the owners that can sign are at least M. Then it runs the probe.
 - **For each withdrawal**, it reads the Safe's threshold M and its owners from the chain, then asks every owner's service at once. Each has 20 seconds. It checks every answer: 65 bytes, a signature by that owner over the coupon's SafeMessage hash, and the owner still one of the Safe's. It takes the M lowest owner addresses among those that signed, sorts them, joins them, and asks the Safe's own `isValidSignature`, on chain, whether it accepts them. Only then does the coupon go out.
 - **With fewer than M signatures**, or a Safe that does not accept them, the withdrawal stays parked. It is logged once, with each owner's reason, and asked again on the next cycle, every `BRIDGE_CYCLE_INTERVAL_MS` (3 minutes by default). There is no retry within a cycle.
-- **The same withdrawal can be asked more than once**: after a failed cycle, or for a new coupon after a claim order rotation. A service signs it again if the checks pass. It may keep a record of what it signed.
+- **The same withdrawal can be asked more than once while it is parked**: after a cycle where fewer than M signed, or where the RAVE that delivers its coupon failed. A service signs it again for the same order hash if the checks pass. For another order hash it refuses with `already_signed` until an operator clears it ([one order per withdrawal](#one-order-per-withdrawal)).
 - **Logs** name a service by its host and port, never its URL path, which may hold a credential.
 
 ## Open questions
