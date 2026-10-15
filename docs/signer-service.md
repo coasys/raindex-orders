@@ -247,7 +247,7 @@ At startup the orchestrator sends one request with `"withdrawal": null`. Its wor
 | 3–7 | the deploy record's order, as for a withdrawal |
 | 8 | `0x7031e3d46970cee5696244e787b00837a2271c3769d176fc13934b96fe76265b`: keccak256 of `bridge-orchestrator startup probe` |
 
-The orchestrator simulates a claim with M owner signatures of the probe, which must succeed, and with M-1, which must fail. Nothing is sent to the chain. A signed probe is a real coupon, but it pays 1 wei of HOT to the Safe, once. A service that gets a request with no withdrawal whose words differ refuses with `probe_mismatch`.
+The orchestrator simulates a claim with M owner signatures of the probe, which must succeed, and with M-1, which must fail with Raindex's `InvalidSignature(0)`, the Safe refusing the signatures; any other revert stops the startup. Nothing is sent to the chain. A signed probe is a real coupon, but it pays 1 wei of HOT to the Safe, once. A service that gets a request with no withdrawal whose words differ refuses with `probe_mismatch`.
 
 ## What the orchestrator does
 

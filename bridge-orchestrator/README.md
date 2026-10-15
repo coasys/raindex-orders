@@ -51,7 +51,8 @@ refuses to start, naming each variable at fault, when:
   the signer, and starts only if the order pays it, or answers `MinimumIO`
   because its vault is empty. For a Safe, the probe is signed by M owners, the
   signer services among them, the Safe's own `isValidSignature` must accept
-  them, and the simulated claim with M-1 of them must fail.
+  them, and the simulated claim with M-1 of them must fail with
+  `InvalidSignature(0)`: another revert would not show the Safe refused them.
 - on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
   signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 - on `mainnet`, unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`: the Safe

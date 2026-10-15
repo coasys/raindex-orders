@@ -57,6 +57,11 @@ sol! {
 
     error MinimumIO(bytes32 minimumIO, bytes32 actualIO);
 
+    /// Raindex V6's refusal of signed context `i` whose signature its signer
+    /// does not accept (rainlang-interface's LibContext). The claim's coupon is
+    /// signed context 0.
+    error InvalidSignature(uint256 i);
+
     #[sol(rpc)]
     interface IHoloLockVault {
         function token() external view returns (address);
@@ -276,10 +281,19 @@ async fn read_and_compare(
     accepts_signer(order.signer, refused)?;
     if let Some(fewer) = fewer {
         let owners = fewer.signature.len() / 65;
-        if simulate(&provider, order, fewer, rpc_var).await?.is_none() {
+        let Some(revert) = simulate(&provider, order, fewer, rpc_var).await? else {
             bail!(
                 "the claim order ORDER_HASH took a coupon carrying {owners} owner signatures for CLAIM_SIGNER {}, fewer than its threshold",
                 order.signer
+            );
+        };
+        // Only the Safe refusing the signatures shows it takes no fewer than its
+        // threshold: any other revert would pass this probe for another reason.
+        if !InvalidSignature::abi_decode(&revert, true).is_ok_and(|e| e.i.is_zero()) {
+            bail!(
+                "the claim order ORDER_HASH refused a coupon carrying {owners} owner signatures for CLAIM_SIGNER {} with {}, not InvalidSignature(0): that does not show the Safe refuses fewer than its threshold",
+                order.signer,
+                revert_name(&revert)
             );
         }
         tracing::info!(
@@ -526,6 +540,15 @@ fn accepts_signer(signer: Address, refused: Option<Bytes>) -> Result<()> {
     )
 }
 
+/// A revert, for logs: its reason when it is a `require` string, else its
+/// error selector.
+fn revert_name(revert: &[u8]) -> String {
+    match Revert::abi_decode(revert, true) {
+        Ok(r) => format!("\"{}\"", r.reason.chars().take(100).collect::<String>()),
+        Err(_) => format!("error 0x{}", hex::encode(&revert[..revert.len().min(4)])),
+    }
+}
+
 /// An account with an EIP-7702 delegation. OrderBookV3 checked such a signer's
 /// coupons by their ECDSA signature; Raindex V6 (OpenZeppelin 5's SignatureChecker)
 /// asks any account with code, a delegation included, through EIP-1271 only, so a
@@ -632,9 +655,6 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
 
-    sol! {
-        error InvalidSignature(uint256 i);
-    }
     use serde_json::{json, Value};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
@@ -716,6 +736,10 @@ mod tests {
         domain: Option<B256>,
         /// Takes one owner's signature, whatever its threshold: a broken Safe.
         takes_one: bool,
+        /// What takeOrders4 reverts with when the Safe refuses the coupon's
+        /// signatures, in place of InvalidSignature(0): Raindex's checks
+        /// reordered, or another revert first.
+        refusal: Option<Vec<u8>>,
     }
 
     type Answer = std::result::Result<String, Value>;
@@ -754,6 +778,7 @@ mod tests {
                     owners: owners.iter().map(|key| key.address()).collect(),
                     domain: None,
                     takes_one: false,
+                    refusal: None,
                 }),
                 ..self
             }
@@ -855,7 +880,11 @@ mod tests {
             {
                 Some(safe) => {
                     if !safe.accepts(self.chain_id, coupon.signer, &digest, &coupon.signature) {
-                        return reverted(InvalidSignature { i: U256::ZERO }.abi_encode());
+                        return reverted(
+                            safe.refusal
+                                .clone()
+                                .unwrap_or_else(|| InvalidSignature { i: U256::ZERO }.abi_encode()),
+                        );
                     }
                 }
                 None => {
@@ -1273,6 +1302,40 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             format!("the claim order ORDER_HASH took a coupon carrying 1 owner signatures for CLAIM_SIGNER {SAFE}, fewer than its threshold")
+        );
+    }
+
+    /// The probe signed by M-1 owners must fail with InvalidSignature(0), the
+    /// Safe refusing its signatures: another revert does not show that.
+    #[tokio::test]
+    async fn refuses_a_safe_whose_m_minus_1_probe_fails_with_another_revert() {
+        let refusal = |revert: Vec<u8>| async move {
+            let (mut chain, order) = safe_setup(Network::BaseSepolia, 2);
+            chain.safe.as_mut().unwrap().refusal = Some(revert);
+            format!(
+                "{:#}",
+                safe_check(Network::BaseSepolia, chain, order, held(&[0, 1]), 84_532)
+                    .await
+                    .unwrap_err()
+            )
+        };
+        let refused = |why: &str| {
+            format!("the claim order ORDER_HASH refused a coupon carrying 1 owner signatures for CLAIM_SIGNER {SAFE} with {why}, not InvalidSignature(0): that does not show the Safe refuses fewer than its threshold")
+        };
+
+        assert_eq!(
+            refusal(
+                Revert {
+                    reason: "Order expired".to_string()
+                }
+                .abi_encode()
+            )
+            .await,
+            refused("\"Order expired\"")
+        );
+        assert_eq!(
+            refusal(InvalidSignature { i: U256::from(1) }.abi_encode()).await,
+            refused("error 0x52bf9848")
         );
     }
 
