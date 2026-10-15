@@ -257,7 +257,9 @@ orchestrate() {
 	(
 		cd "$dir"
 		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
-		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" "$@" \
+		# Mainnet refuses to start without screening and a denylist.
+		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" \
+			SCREENING=on SCREENING_DENYLIST=0x000000000000000000000000000000000000dEaD "$@" \
 			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
 			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/conductor-config.yaml" \
 			LAIR_PASSPHRASE_FILE="$dir/no-passphrase" "$ORCHESTRATOR" run 2>&1 || true

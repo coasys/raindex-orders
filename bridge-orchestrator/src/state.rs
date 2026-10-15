@@ -7,7 +7,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SCHEMA_VERSION: i64 = 3;
+mod screening;
+
+pub use screening::Hold;
+
+const SCHEMA_VERSION: i64 = 4;
 pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
 /// In the order [`row_to_work_item`] reads them.
 const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
@@ -16,6 +20,9 @@ const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, 
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
     Detected,
+    Screening,
+    Held,
+    Blocked,
     Queued,
     Claimed,
     InFlight,
@@ -27,6 +34,9 @@ impl std::fmt::Display for WorkState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let v = match self {
             WorkState::Detected => "detected",
+            WorkState::Screening => "screening",
+            WorkState::Held => "held",
+            WorkState::Blocked => "blocked",
             WorkState::Queued => "queued",
             WorkState::Claimed => "claimed",
             WorkState::InFlight => "in_flight",
@@ -43,6 +53,9 @@ impl std::str::FromStr for WorkState {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "detected" => Ok(Self::Detected),
+            "screening" => Ok(Self::Screening),
+            "held" => Ok(Self::Held),
+            "blocked" => Ok(Self::Blocked),
             "queued" => Ok(Self::Queued),
             "claimed" => Ok(Self::Claimed),
             "in_flight" => Ok(Self::InFlight),
@@ -375,6 +388,17 @@ impl StateStore {
         Ok(store)
     }
 
+    pub fn open_existing(path: &str) -> Result<Self> {
+        let exists = Path::new(path)
+            .try_exists()
+            .with_context(|| format!("DB_PATH {path} cannot be read"))?;
+        anyhow::ensure!(
+            exists,
+            "DB_PATH {path} does not exist: opening it would create an empty database"
+        );
+        Self::open(path)
+    }
+
     /// Open a fresh read-only sqlite connection to the same database
     /// file. Intended for callers that need to read aggregates without
     /// blocking the writer mutex — primarily the watchtower reporter.
@@ -464,6 +488,7 @@ impl StateStore {
             "CREATE INDEX IF NOT EXISTS idx_work_items_flow_state ON work_items(flow, state)",
             [],
         )?;
+        screening::create_tables(&conn)?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS checkpoints (
                 checkpoint_key TEXT PRIMARY KEY,
@@ -536,8 +561,9 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn enqueue_queued(
+    pub fn enqueue(
         &self,
+        state: WorkState,
         flow: &str,
         task_type: &str,
         item_id: &str,
@@ -547,13 +573,14 @@ impl StateStore {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 flow,
                 task_type,
                 item_id,
                 idempotency_key,
-                serde_json::to_string(payload_json)?
+                serde_json::to_string(payload_json)?,
+                state.to_string()
             ],
         )?;
         Ok(())
@@ -664,7 +691,10 @@ impl StateStore {
 
     pub fn clear_all(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let deleted = conn.execute("DELETE FROM work_items", [])?;
+        let deleted = conn.execute(
+            "DELETE FROM work_items WHERE state NOT IN ('screening', 'held', 'blocked')",
+            [],
+        )?;
         Ok(deleted)
     }
 
@@ -714,6 +744,28 @@ impl StateStore {
     pub fn aggregate_stats(&self) -> Result<BridgeAggregateStats> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         compute_aggregate_stats(&conn)
+    }
+
+    /// Rows of `flow` in `state`, oldest first.
+    pub fn list_work_items(
+        &self,
+        flow: &str,
+        state: WorkState,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
+             FROM work_items
+             WHERE flow = ?1 AND state = ?2
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![flow, state.to_string(), limit as i64],
+            row_to_work_item,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Rows of `flow` at `step` that are `queued` or `in_flight`, oldest first.
@@ -1096,25 +1148,22 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
 
 #[cfg(test)]
 impl StateStore {
-    pub fn list_work_items(
+    pub fn enqueue_queued(
         &self,
         flow: &str,
-        state: WorkState,
-        limit: usize,
-    ) -> Result<Vec<WorkItem>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {WORK_ITEM_COLUMNS}
-             FROM work_items
-             WHERE flow = ?1 AND state = ?2
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?3"
-        ))?;
-        let rows = stmt.query_map(
-            params![flow, state.to_string(), limit as i64],
-            row_to_work_item,
-        )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        task_type: &str,
+        item_id: &str,
+        idempotency_key: &str,
+        payload_json: &Value,
+    ) -> Result<()> {
+        self.enqueue(
+            WorkState::Queued,
+            flow,
+            task_type,
+            item_id,
+            idempotency_key,
+            payload_json,
+        )
     }
 
     pub fn claim_next(&self, preferred_flow: Option<&str>) -> Result<Option<WorkItem>> {
@@ -1645,13 +1694,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_deletes_everything() {
+    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked() {
         let path = test_db_path("clear-all");
         let store = StateStore::open(&path).unwrap();
 
         insert_work_item_with_state(&path, "lock:queued", WorkState::Queued);
         insert_work_item_with_state(&path, "lock:succeeded", WorkState::Succeeded);
         insert_work_item_with_state(&path, "lock:failed", WorkState::Failed);
+        insert_work_item_with_state(&path, "lock:screening", WorkState::Screening);
+        insert_work_item_with_state(&path, "lock:held", WorkState::Held);
+        insert_work_item_with_state(&path, "lock:blocked", WorkState::Blocked);
 
         let deleted = store.clear_all().unwrap();
         assert_eq!(deleted, 3);
@@ -1664,7 +1716,9 @@ mod tests {
                 limit: 20,
             })
             .unwrap();
-        assert!(rows.is_empty());
+        let mut kept: Vec<String> = rows.into_iter().map(|row| row.item_id).collect();
+        kept.sort();
+        assert_eq!(kept, ["lock:blocked", "lock:held", "lock:screening"]);
     }
 
     #[test]

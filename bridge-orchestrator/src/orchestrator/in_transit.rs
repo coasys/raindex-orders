@@ -1,18 +1,20 @@
 use super::{
     bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
-    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey,
+    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
+    WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
+use crate::screening::Screener;
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
-use anyhow::{Context, Result};
+use alloy::primitives::Address;
+use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
-use std::path::Path;
 use tracing::info;
 
 const PAID_BY_HAND: &str =
@@ -39,6 +41,9 @@ enum InTransit {
         spender: String,
         amount: UnitMap,
         withdraw_to_address: Option<String>,
+        /// Not cleared by screening, so not to be paid by hand.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        screening: Option<String>,
     },
 }
 
@@ -93,15 +98,11 @@ impl Found {
 }
 
 pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> Result<()> {
-    let exists = Path::new(&cfg.db_path)
-        .try_exists()
-        .with_context(|| format!("DB_PATH {} cannot be read", cfg.db_path))?;
-    anyhow::ensure!(
-        exists,
-        "DB_PATH {} does not exist: opening it would create an empty database, which lists nothing in transit",
-        cfg.db_path
-    );
-    let db = StateStore::open(&cfg.db_path)?;
+    let db = StateStore::open_existing(&cfg.db_path)?;
+    let screener = match &ethereum {
+        Some(chain) => crate::config::screener_from_env(chain.network)?,
+        None => None,
+    };
     if let Some(chain) = ethereum {
         let configured = format!("{:#x}", chain.lock_vault_address);
         let served = db.vault()?;
@@ -122,16 +123,24 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         told: Default::default(),
     };
     let found = orchestrator
-        .in_transit(&Conductor {
-            ham: &ham,
-            role_name: &orchestrator.cfg.role_name,
-        })
+        .in_transit(
+            &Conductor {
+                ham: &ham,
+                role_name: &orchestrator.cfg.role_name,
+            },
+            screener.as_deref(),
+        )
         .await?;
     found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
-    pub(super) async fn in_transit(&self, conductor: &impl ConductorReads) -> Result<Found> {
+    /// Holds a listed withdrawal, as S4 would.
+    pub(super) async fn in_transit(
+        &self,
+        conductor: &impl ConductorReads,
+        screener: Option<&dyn Screener>,
+    ) -> Result<Found> {
         let agent = &self.cfg.bridging_agent_pubkey;
         let global_definition = conductor.global_definition().await?;
         let context = Self::resolve_deposit_context(
@@ -202,18 +211,42 @@ impl BridgeOrchestrator {
                 lock_ids,
             });
         }
-        let withdrawals = bridging_links.iter().filter_map(|spend| {
+        let gate = WithdrawalGate::new(&self.db, screener);
+        let mut withdrawals = Vec::new();
+        for spend in &bridging_links {
             let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
-                return None;
+                continue;
             };
-            Some(InTransit::Withdrawal {
+            let id = spend.id.to_string();
+            let hot = spend
+                .amount
+                .get(&self.cfg.hot_unit_index.to_string())
+                .map(|amount| amount.to_string())
+                .unwrap_or_default();
+            let pays = match withdraw_to.map(str::parse::<Address>) {
+                Some(Ok(to)) => gate.pays(&id, to, &hot).await?,
+                Some(Err(_)) => false,
+                None => true,
+            };
+            let screening = if pays {
+                None
+            } else {
+                Some(
+                    self.db
+                        .withdrawal_hold(&id)?
+                        .map_or("unscreened".to_string(), |hold| hold.to_string()),
+                )
+            };
+            withdrawals.push(InTransit::Withdrawal {
                 agreement: context.bridging_agreement.to_string(),
-                spend: spend.id.to_string(),
+                spend: id,
                 spender: spend.creator.to_string(),
                 amount: spend.amount.clone(),
                 withdraw_to_address: withdraw_to.map(str::to_string),
-            })
-        });
+                screening,
+            });
+        }
+        self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
 
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();
