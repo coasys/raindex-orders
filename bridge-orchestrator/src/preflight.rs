@@ -336,10 +336,12 @@ where
 /// CLAIM_SIGNER, a Safe, must be one on `network`'s chain whose EIP-712 domain
 /// is the one its owners sign under, or its `isValidSignature` refuses every
 /// coupon. Each owner key held here must be one of its owners, and no more of
-/// them than its threshold; each signer service must answer for its owner, this
-/// Safe and this chain. A service that does not answer is logged, and the check
-/// passes while the owners that can sign are at least the threshold: a
-/// withdrawal stays parked while fewer sign.
+/// them than its threshold; each signer service must
+/// answer for its owner, this Safe and this chain. The services are asked at
+/// once, each within IDENTITY_TIMEOUT. A service that does not answer is
+/// logged and left out of the probe, and the check passes while the owners that
+/// can sign are at least the threshold: a withdrawal stays parked while fewer
+/// sign.
 ///
 /// On mainnet it also refuses, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes, a Safe
 /// this process alone could sign as: one of threshold 1, or one whose threshold
@@ -398,47 +400,59 @@ where
             "SAFE_OWNER_KEYS holds {keys} keys, and CLAIM_SIGNER {safe} is a Safe of threshold {threshold}: give the keys of that many of its owners"
         );
     }
-    let mut able = Vec::new();
     for owner in signer.owners() {
         let address = owner.address();
+        if !owners.contains(&address) {
+            bail!(
+                "{} {address}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}",
+                match owner {
+                    Owner::Key(_) => "SAFE_OWNER_KEYS holds the key of",
+                    Owner::Service(_) => "SAFE_OWNER_SERVICES names",
+                }
+            );
+        }
+    }
+    // Every service at once: one that does not answer costs one
+    // IDENTITY_TIMEOUT, not one for each service after it.
+    let identities = futures::future::join_all(signer.owners().iter().map(|owner| async move {
         match owner {
-            Owner::Key(_) => {
-                if !owners.contains(&address) {
+            Owner::Key(_) => None,
+            Owner::Service(service) => Some(service.identity().await),
+        }
+    }))
+    .await;
+    let mut able = Vec::new();
+    for (owner, identity) in signer.owners().iter().zip(identities) {
+        let address = owner.address();
+        let (Owner::Service(service), Some(identity)) = (owner, identity) else {
+            able.push(format!("{address}, a key held here"));
+            continue;
+        };
+        match identity {
+            Ok(identity) => {
+                if identity.owner != address
+                    || identity.safe != safe
+                    || identity.chain_id != chain_id
+                {
                     bail!(
-                        "SAFE_OWNER_KEYS holds the key of {address}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}"
+                        "the signer service at {} signs as {} for {} on chain {}, and SAFE_OWNER_SERVICES names it for {address}, an owner of CLAIM_SIGNER {safe} on chain {chain_id}",
+                        service.host(),
+                        identity.owner,
+                        identity.safe,
+                        identity.chain_id
                     );
                 }
-                able.push(format!("{address}, a key held here"));
+                able.push(format!("{address}, a signer service at {}", service.host()));
             }
-            Owner::Service(service) => {
-                if !owners.contains(&address) {
-                    bail!(
-                        "SAFE_OWNER_SERVICES names {address}, which is not an owner of CLAIM_SIGNER {safe}: its owners are {listed}"
-                    );
-                }
-                match service.identity().await {
-                    Ok(identity) => {
-                        if identity.owner != address
-                            || identity.safe != safe
-                            || identity.chain_id != chain_id
-                        {
-                            bail!(
-                                "the signer service at {} signs as {} for {} on chain {}, and SAFE_OWNER_SERVICES names it for {address}, an owner of CLAIM_SIGNER {safe} on chain {chain_id}",
-                                service.host(),
-                                identity.owner,
-                                identity.safe,
-                                identity.chain_id
-                            );
-                        }
-                        able.push(format!("{address}, a signer service at {}", service.host()));
-                    }
-                    Err(err) => tracing::warn!(
-                        event = "startup.signer_service_down",
-                        owner = %address,
-                        "the signer service for {address} at {} {err:#}: the other owners sign until it answers",
-                        service.host()
-                    ),
-                }
+            Err(err) => {
+                tracing::warn!(
+                    event = "startup.signer_service_down",
+                    owner = %address,
+                    "the signer service for {address} at {} {err:#}: the other owners sign until it answers",
+                    service.host()
+                );
+                // Not asked to sign the probe; the first cycle asks it again.
+                signer.leave_out(address, format!("it {err:#} at startup"));
             }
         }
     }
@@ -666,10 +680,14 @@ mod tests {
     use super::*;
     use crate::fake_rpc::{read_request, serve};
     use crate::signer::safe::tests::{fake_service, owner_service, service_owner};
-    use crate::signer::{amount_word, context_digest, safe_message_hash, OwnerService, SafeOwners};
+    use crate::signer::{
+        amount_word, context_digest, safe_message_hash, OwnerService, SafeOwners, SIGN_TIMEOUT,
+    };
     use alloy::primitives::{address, PrimitiveSignature, U256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use serde_json::{json, Value};
     use tokio::io::AsyncWriteExt;
@@ -1401,6 +1419,125 @@ mod tests {
             .collect();
         assert_eq!(paths, ["/holo/signer", "/holo/sign"]);
         assert_eq!(a.requests.lock().unwrap()[1].1["withdrawal"], Value::Null);
+    }
+
+    /// A signer service that takes each connection and never answers, and how
+    /// many requests it was sent.
+    async fn black_hole() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    read_request(&mut socket).await;
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    drop(socket);
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// A signer service for `key` that answers GET /signer, and takes POST
+    /// /sign without ever answering it.
+    async fn never_signs(key: PrivateKeySigner) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let address = key.address();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 64];
+                    let peeked = socket.peek(&mut head).await.unwrap();
+                    let identity = head[..peeked].starts_with(b"GET /signer ");
+                    read_request(&mut socket).await;
+                    if !identity {
+                        std::future::pending::<()>().await;
+                    }
+                    let reply = json!({"owner": address, "safe": SAFE, "chainId": 1}).to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        url
+    }
+
+    /// Lal's regression on PR #2: a service that takes the connection and never
+    /// answers costs the startup check one wait for GET /signer, and is not
+    /// asked to sign the probe, so the two others start a Safe of 2 of 3 well
+    /// within RPC_TIMEOUT. A closed port, as above, refuses at once and shows
+    /// none of this.
+    #[tokio::test]
+    async fn a_black_holed_signer_service_leaves_two_of_three_to_start() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+        let (down, requests) = black_hole().await;
+        let (a, b) = (
+            owner_service(owners()[0].clone()).await,
+            owner_service(owners()[1].clone()).await,
+        );
+        let asked = vec![
+            service_owner(&owners()[0], &a),
+            service_owner(&owners()[1], &b),
+            Owner::Service(
+                OwnerService::new(Network::Mainnet, owners()[2].address(), &down).unwrap(),
+            ),
+        ];
+
+        let started = std::time::Instant::now();
+        let result = safe_check(Network::Mainnet, chain, order, asked, 1).await;
+
+        assert!(
+            result.is_ok(),
+            "two answering owners meet the Safe's threshold of 2, after {:?}: {result:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the black-holed service is asked GET /signer, and not to sign the probe"
+        );
+        for service in [&a, &b] {
+            assert_eq!(service.requests.lock().unwrap().len(), 2);
+        }
+    }
+
+    /// The probe needs M signatures, and nothing more: a service that answers
+    /// GET /signer but never signs does not hold the startup check up for its
+    /// SIGN_TIMEOUT once the two others have signed.
+    #[tokio::test]
+    async fn the_startup_probe_ends_once_m_owners_have_signed() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+        let silent = never_signs(owners()[2].clone()).await;
+        let (a, b) = (
+            owner_service(owners()[0].clone()).await,
+            owner_service(owners()[1].clone()).await,
+        );
+        let asked = vec![
+            service_owner(&owners()[0], &a),
+            service_owner(&owners()[1], &b),
+            Owner::Service(
+                OwnerService::new(Network::Mainnet, owners()[2].address(), &silent).unwrap(),
+            ),
+        ];
+
+        let started = std::time::Instant::now();
+        safe_check(Network::Mainnet, chain, order, asked, 1)
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < SIGN_TIMEOUT,
+            "the probe waited {:?} for an owner it did not need",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

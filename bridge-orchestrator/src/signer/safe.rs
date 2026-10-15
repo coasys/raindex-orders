@@ -13,11 +13,13 @@ use alloy::sol;
 use alloy::sol_types::SolValue;
 use alloy::transports::http::{Client, Http};
 use anyhow::{anyhow, Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use holo_hash::ActionHashB64;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 sol! {
     /// What a Safe answers about itself, and the EIP-1271 check its
@@ -42,6 +44,11 @@ const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
 const MIN_OWNERS: usize = 2;
 const MAX_OWNERS: usize = 20;
+
+/// How long a signer service has to answer `GET /signer`. The answer reads no
+/// Holochain node, so a service that takes longer is down, and the startup
+/// check, which asks every service at once, waits this long at most for them.
+pub const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A Safe's EIP-712 domain separator, as Safe 1.3.0 and later compute it:
 /// `EIP712Domain(uint256 chainId,address verifyingContract)`.
@@ -157,7 +164,9 @@ pub struct OwnerSignature {
 ///
 /// An owner that did not answer within SIGN_TIMEOUT is not asked again for the
 /// rest of the cycle while the other owners are at least the threshold, so a
-/// silent service costs one timeout per cycle, not one per withdrawal.
+/// silent service costs one timeout per cycle, not one per withdrawal. The
+/// startup check leaves out, until the first cycle, an owner whose service did
+/// not answer `GET /signer`.
 pub struct SafeOwners {
     safe: Address,
     chain_id: u64,
@@ -167,8 +176,9 @@ pub struct SafeOwners {
     /// process alone can sign as the Safe, or holds owner keys of a Safe that is
     /// also the vault admin.
     one_party_allowed: bool,
-    /// The owners that did not answer within `sign_timeout` this cycle.
-    timed_out: Mutex<HashSet<Address>>,
+    /// The owners left out this cycle, each with why: it did not answer within
+    /// `sign_timeout`, or its service did not answer `GET /signer` at startup.
+    left_out: Mutex<HashMap<Address, String>>,
     /// How long each owner has to sign: SIGN_TIMEOUT, shorter in tests.
     sign_timeout: std::time::Duration,
 }
@@ -225,7 +235,7 @@ impl SafeOwners {
             owners,
             rpc_url,
             one_party_allowed: false,
-            timed_out: Mutex::default(),
+            left_out: Mutex::default(),
             sign_timeout: SIGN_TIMEOUT,
         })
     }
@@ -247,9 +257,15 @@ impl SafeOwners {
         }
     }
 
-    /// A new cycle: every owner is asked again, those that timed out included.
+    /// A new cycle: every owner is asked again, those left out included.
     pub fn new_cycle(&self) {
-        self.timed_out.lock().unwrap().clear();
+        self.left_out.lock().unwrap().clear();
+    }
+
+    /// Leaves `owner` out until the next cycle, as one that timed out, `why`
+    /// saying what it did not answer.
+    pub fn leave_out(&self, owner: Address, why: String) {
+        self.left_out.lock().unwrap().insert(owner, why);
     }
 
     /// Whether UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes is set.
@@ -335,9 +351,15 @@ impl SafeOwners {
 
     /// Asks every owner at once to sign `request`'s SafeMessage hash, each within
     /// SIGN_TIMEOUT, and checks each answer against the Safe's owners now. An
-    /// owner that timed out earlier this cycle is not asked while the others are
-    /// at least the Safe's threshold. Returns the Safe's state and, for each
-    /// owner, its checked signature or why not.
+    /// owner left out this cycle is not asked while the others are at least the
+    /// Safe's threshold. Returns the Safe's state and, for each owner, its
+    /// checked signature or why not, in the owners' order.
+    ///
+    /// The startup probe, a request with no withdrawal, ends as soon as the
+    /// threshold of owners have signed, leaving out the owners still to answer:
+    /// it needs M signatures, and a service that never answers would otherwise
+    /// hold the startup check up for its SIGN_TIMEOUT. A withdrawal waits for
+    /// every owner, so that each refusal is logged.
     pub async fn collect(
         &self,
         request: &SignRequest,
@@ -352,75 +374,95 @@ impl SafeOwners {
         let owner_request = &owner_request;
         let state_ref = &state;
         let skipped = {
-            let timed_out = self.timed_out.lock().unwrap();
+            let left_out = self.left_out.lock().unwrap();
             let others = self
                 .owners
                 .iter()
-                .filter(|o| !timed_out.contains(&o.address()))
+                .filter(|o| !left_out.contains_key(&o.address()))
                 .count();
             if others >= state.threshold {
-                timed_out.clone()
+                left_out.clone()
             } else {
-                HashSet::new()
+                HashMap::new()
             }
         };
         let skipped = &skipped;
-        let answers = futures::future::join_all(self.owners.iter().map(|owner| async move {
-            let address = owner.address();
-            if skipped.contains(&address) {
-                let err = anyhow!(
-                    "{} was not asked: it did not answer within {:?} earlier this cycle",
-                    owner.name(),
-                    self.sign_timeout
-                );
-                return (address, Err(err), None);
-            }
-            let (answer, timed_out) =
-                match tokio::time::timeout(self.sign_timeout, owner.sign(owner_request)).await {
-                    Ok(Ok(signature)) => (
-                        checked(
-                            self.safe,
-                            address,
-                            &signature,
-                            &owner_request.safe_message_hash,
-                            &state_ref.owners,
-                        )
-                        .with_context(|| owner.name()),
-                        false,
-                    ),
-                    Ok(Err(err)) => {
-                        let timed_out = err.downcast_ref::<TimedOut>().is_some();
-                        (Err(err.context(owner.name())), timed_out)
+        let mut pending =
+            self.owners
+                .iter()
+                .enumerate()
+                .map(|(i, owner)| async move {
+                    let address = owner.address();
+                    if let Some(why) = skipped.get(&address) {
+                        let err = anyhow!("{} was not asked: {why}", owner.name());
+                        return (i, address, Err(err), None);
                     }
-                    Err(_) => (
-                        Err(anyhow!(
-                            "{} did not sign within {:?}",
-                            owner.name(),
-                            self.sign_timeout
-                        )),
-                        true,
-                    ),
-                };
-            (address, answer, Some(timed_out))
-        }))
-        .await;
-        let mut timed_out = self.timed_out.lock().unwrap();
+                    let (answer, timed_out) =
+                        match tokio::time::timeout(self.sign_timeout, owner.sign(owner_request))
+                            .await
+                        {
+                            Ok(Ok(signature)) => (
+                                checked(
+                                    self.safe,
+                                    address,
+                                    &signature,
+                                    &owner_request.safe_message_hash,
+                                    &state_ref.owners,
+                                )
+                                .with_context(|| owner.name()),
+                                false,
+                            ),
+                            Ok(Err(err)) => {
+                                let timed_out = err.downcast_ref::<TimedOut>().is_some();
+                                (Err(err.context(owner.name())), timed_out)
+                            }
+                            Err(_) => (
+                                Err(anyhow!(
+                                    "{} did not sign within {:?}",
+                                    owner.name(),
+                                    self.sign_timeout
+                                )),
+                                true,
+                            ),
+                        };
+                    (i, address, answer, Some(timed_out))
+                })
+                .collect::<FuturesUnordered<_>>();
+        let enough = request.withdrawal.is_none().then_some(state.threshold);
+        let mut answers = Vec::with_capacity(self.owners.len());
+        let mut signed = 0;
+        while let Some(answer) = pending.next().await {
+            signed += usize::from(answer.2.is_ok());
+            answers.push(answer);
+            if enough.is_some_and(|m| signed >= m) {
+                break;
+            }
+        }
+        drop(pending);
+        answers.sort_by_key(|(i, ..)| *i);
+        let mut left_out = self.left_out.lock().unwrap();
         let answers = answers
             .into_iter()
-            .map(|(address, answer, asked)| {
+            .map(|(_, address, answer, asked)| {
                 match asked {
                     Some(true) => {
-                        timed_out.insert(address);
+                        left_out.insert(
+                            address,
+                            format!(
+                                "it did not answer within {:?} earlier this cycle",
+                                self.sign_timeout
+                            ),
+                        );
                     }
                     Some(false) => {
-                        timed_out.remove(&address);
+                        left_out.remove(&address);
                     }
                     None => {}
                 }
                 (address, answer)
             })
             .collect();
-        drop(timed_out);
+        drop(left_out);
         Ok((state, answers))
     }
 
@@ -628,8 +670,15 @@ impl OwnerService {
         }
     }
 
-    /// `GET /signer`: the owner, Safe and chain the service signs for.
+    /// `GET /signer`: the owner, Safe and chain the service signs for, within
+    /// IDENTITY_TIMEOUT.
     pub async fn identity(&self) -> Result<Identity> {
+        tokio::time::timeout(IDENTITY_TIMEOUT, self.ask_identity())
+            .await
+            .map_err(|_| anyhow!("did not answer GET /signer within {IDENTITY_TIMEOUT:?}"))?
+    }
+
+    async fn ask_identity(&self) -> Result<Identity> {
         let answer = self
             .client
             .get(format!("{}/signer", self.url))
