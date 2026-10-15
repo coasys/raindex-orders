@@ -476,24 +476,39 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, a Lock that 
 	})
 })
 
-describe('Claim', () => {
-	it('sends with no status request, paused or not', async () => {
-		const fetch = stubFetch(PAUSED)
-		const coupon = TESTNET_COUPONS[0]
-		const amount = numberToHex(deserializeSignedContext(coupon).context[1], { size: 32 })
-		const pays = encodeFunctionResult({
-			abi: orderbookAbi,
-			functionName: 'takeOrders4',
-			result: [amount, `0x${'0'.repeat(64)}`]
-		})
-		const injected = injectWallet(CHAIN['base-sepolia'], { eth_call: pays })
-		await mount('base-sepolia', './claim/+page.svelte')
+async function claim() {
+	const coupon = TESTNET_COUPONS[0]
+	const amount = numberToHex(deserializeSignedContext(coupon).context[1], { size: 32 })
+	const pays = encodeFunctionResult({
+		abi: orderbookAbi,
+		functionName: 'takeOrders4',
+		result: [amount, `0x${'0'.repeat(64)}`]
+	})
+	const injected = injectWallet(CHAIN['base-sepolia'], { eth_call: pays })
+	await mount('base-sepolia', './claim/+page.svelte')
+	type('#coupon', coupon)
+	await click('Claim')
+	return injected
+}
 
-		type('#coupon', coupon)
-		await click('Claim')
+describe('Claim', () => {
+	it('sends nothing, and shows the stop text, while paused', async () => {
+		stubFetch(PAUSED)
+
+		const injected = await claim()
+
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
+		expect(injected).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('claims once /api/status reads not paused', async () => {
+		const fetch = stubFetch(OPEN)
+
+		const injected = await claim()
 
 		await until(() => expect(written()).toEqual(['takeOrders4']))
 		expect(injected).toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
-		expect(fetch).not.toHaveBeenCalled()
+		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
 	})
 })
