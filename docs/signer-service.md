@@ -69,7 +69,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
 | `amount_mismatch` | word 1 is not the word the service makes of the spend's amount |
 | `recipient_mismatch` | word 0 is not the spend's withdraw-to address |
-| `expiry_out_of_range` | word 2 is in the past, or further ahead than the agreed maximum |
+| `expiry_out_of_range` | word 2 is outside the window in [the expiry](#the-expiry) |
 | `nonce_mismatch` | word 8 is not keccak256 of the withdrawal's 39 bytes |
 | `order_mismatch` | words 3 to 7 are not the service's own copy of the deploy record |
 | `wrong_safe_or_chain` | `safe` or `chainId` is not what the service signs for |
@@ -181,7 +181,7 @@ Each check uses the service's own sources: its own Holochain node, or one it tru
 1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
 2. **The amount.** Word 1 is exactly the spend's amount in the HOT unit, converted as in [the amount](#the-amount) below. Not more, not another unit.
 3. **The recipient.** Word 0 is the `withdraw_to_address` in the spend's attached payload.
-4. **The expiry.** Word 2 is in the future and no more than the agreed maximum ahead. The orchestrator's `EXPIRY_SECONDS` is 7 days by default.
+4. **The expiry.** Word 2 is within the window in [the expiry](#the-expiry) below.
 5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and one claim order lets only one of them claim, so signing the same withdrawal again is safe. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
 6. **The order.** Words 3 to 7 equal the service's copy of the deploy record, and `safe`, `chainId` and `owner` are what the service signs for.
 7. **The hashes.** The service computes `couponDigest` and `safeMessageHash` from the words it checked, and refuses with `hash_mismatch` if the request's differ. It signs its own `safeMessageHash`, and nothing else.
@@ -208,6 +208,16 @@ A spend with no HOT entry, or one that breaks these rules, is refused with `not_
 | `"0"`, `"0.0"`, `"-1"`, `"1e18"`, `".5"`, `"5."`, `"1.0000000000000000001"` | refused |
 
 The last vector has more digits than a ZFuel holds. It tests the conversion, not a spend that can exist.
+
+### The expiry
+
+The orchestrator sets word 2 to its clock's now plus `EXPIRY_SECONDS`, 604800 (7 days) by default. Each service is configured with the same `EXPIRY_SECONDS` and with a tolerance for the two clocks, `EXPIRY_TOLERANCE_SECONDS`, 600 (10 minutes) by default. With `now` from the service's own clock, it signs only when:
+
+```
+now - EXPIRY_TOLERANCE_SECONDS  <  word 2  <=  now + EXPIRY_SECONDS + EXPIRY_TOLERANCE_SECONDS
+```
+
+So a clock up to 10 minutes apart does not park withdrawals, and no coupon lives more than 10 minutes past the agreed maximum. If the parties agree on a shorter maximum, the orchestrator's `EXPIRY_SECONDS` must change with it. Otherwise every coupon is refused with `expiry_out_of_range`. The mock services use the same defaults.
 
 ### The startup probe
 
@@ -236,5 +246,5 @@ The orchestrator simulates a claim with M owner signatures of the probe, which m
 - **Authentication** between the orchestrator and the services. Options: mutual TLS, a bearer token in a header (the orchestrator sends none today; it supports only a token in the URL path, which it never logs), or a private network such as WireGuard. A service should not be on the open internet without one of these.
 - **Key custody** in each service: an HSM, a cloud KMS, or a Ledger. The service signs a 32-byte hash (or the typed data above), so any of them works.
 - **Who the owners are.** N about 3 at launch, maybe 5 later; M to be agreed. Owners change through an ordinary Safe owner change, which the owners sign in the Safe app. The claim order does not change. A coupon whose signatures came from a removed owner must be signed again.
-- **The expiry maximum** each service enforces, and **a cap per coupon or per day**, as a limit on what M compromised owners could take at once.
+- **The values of `EXPIRY_SECONDS` and `EXPIRY_TOLERANCE_SECONDS`**, if not the defaults in [the expiry](#the-expiry), and **a cap per coupon or per day**, as a limit on what M compromised owners could take at once.
 - **What happens while services are down.** Withdrawals stay parked while fewer than M sign; a limit on how long is policy.

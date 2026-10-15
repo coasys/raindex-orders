@@ -3,8 +3,9 @@
 // none of the Holochain checks a real service must do before it signs. It does
 // the checks that need no Holochain node: the Safe, chain and owner; the claim
 // order's words against the deploy record; the nonce against the withdrawal ID;
-// the startup probe's fixed words; the expiry; and the hashes, which it computes
-// itself from the words.
+// the startup probe's fixed words; the expiry, within EXPIRY_SECONDS and
+// EXPIRY_TOLERANCE_SECONDS; and the hashes, which it computes itself from the
+// words.
 //
 //   OWNER_KEY=0x.. SAFE=0x.. CHAIN_ID=1 PORT=18601 ORDER_HASH=0x.. ORDER_OWNER=0x.. \
 //   ORDERBOOK_ADDRESS=0x.. TOKEN_ADDRESS=0x.. VAULT_ID=0x.. node scripts/mock-signer-service.mjs
@@ -26,7 +27,10 @@ const safe = env('SAFE')
 const chainId = Number(env('CHAIN_ID'))
 const mode = process.env.MODE ?? 'sign'
 const signingKey = mode === 'wrong-key' ? generatePrivateKey() : ownerKey
-const maxExpirySeconds = BigInt(process.env.MAX_EXPIRY_SECONDS ?? 8 * 24 * 60 * 60)
+// docs/signer-service.md, "The expiry": the orchestrator's EXPIRY_SECONDS plus a
+// tolerance for the two clocks.
+const expirySeconds = BigInt(process.env.EXPIRY_SECONDS ?? 7 * 24 * 60 * 60)
+const toleranceSeconds = BigInt(process.env.EXPIRY_TOLERANCE_SECONDS ?? 10 * 60)
 const word = hex => pad(hex.toLowerCase(), { size: 32 })
 const record = [
 	word(env('ORDER_HASH')),
@@ -84,7 +88,7 @@ function check(body) {
 			refuse('nonce_mismatch', 'word 8 is not keccak256 of the withdrawal')
 		const expiry = BigInt(lower[2])
 		const now = BigInt(Math.floor(Date.now() / 1000))
-		if (expiry <= now || expiry > now + maxExpirySeconds)
+		if (expiry <= now - toleranceSeconds || expiry > now + expirySeconds + toleranceSeconds)
 			refuse('expiry_out_of_range', `expiry ${expiry}`)
 		console.log(`MOCK: no Holochain check of ${body.withdrawal}`)
 	}
