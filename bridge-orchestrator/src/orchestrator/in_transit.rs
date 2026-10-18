@@ -1,13 +1,12 @@
 use super::{
-    bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
-    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
-    WITHDRAWALS_SCREENED,
+    bridging_spend, connect_ham, deposit_proofs, hot_amount, normalize_tx_hash, own_deposit,
+    vault_key, withdrawal_terms, BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads,
+    LockKey, WithdrawalGate, WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
-use alloy::primitives::Address;
 use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
@@ -44,6 +43,10 @@ enum InTransit {
         /// Not cleared by screening, so not to be paid by hand.
         #[serde(skip_serializing_if = "Option::is_none")]
         screening: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stranded: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unpayable: Option<String>,
     },
 }
 
@@ -103,8 +106,8 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         Some(chain) => crate::config::screener_from_env(chain.network)?,
         None => None,
     };
-    if let Some(chain) = ethereum {
-        let configured = format!("{:#x}", chain.lock_vault_address);
+    let vault = ethereum.map(|chain| vault_key(chain.lock_vault_address));
+    if let Some(configured) = &vault {
         let served = db.vault()?;
         anyhow::ensure!(
             served.as_deref() == Some(configured.as_str()),
@@ -129,17 +132,19 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
                 role_name: &orchestrator.cfg.role_name,
             },
             screener.as_deref(),
+            vault.as_deref(),
         )
         .await?;
     found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
-    /// Holds a listed withdrawal, as S4 would.
+    /// Holds a listed withdrawal.
     pub(super) async fn in_transit(
         &self,
         conductor: &impl ConductorReads,
         screener: Option<&dyn Screener>,
+        vault: Option<&str>,
     ) -> Result<Found> {
         let agent = &self.cfg.bridging_agent_pubkey;
         let global_definition = conductor.global_definition().await?;
@@ -163,7 +168,10 @@ impl BridgeOrchestrator {
                 bridging_links
                     .iter()
                     .filter(|spend| {
-                        matches!(bridging_spend(spend, agent), Some(BridgingSpend::Deposit))
+                        matches!(
+                            bridging_spend(spend, agent, vault),
+                            Some(BridgingSpend::Deposit)
+                        )
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
@@ -214,17 +222,19 @@ impl BridgeOrchestrator {
         let gate = WithdrawalGate::new(&self.db, screener);
         let mut withdrawals = Vec::new();
         for spend in &bridging_links {
-            let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
-                continue;
+            let (withdraw_to, stranded) = match bridging_spend(spend, agent, vault) {
+                Some(BridgingSpend::Withdrawal(to)) => (to, None),
+                Some(BridgingSpend::OtherVault { to, why }) => (to, Some(why)),
+                _ => continue,
             };
             let id = spend.id.to_string();
-            let hot = spend
-                .amount
-                .get(&self.cfg.hot_unit_index.to_string())
-                .map(|amount| amount.to_string())
-                .unwrap_or_default();
-            let pays = match withdraw_to.map(str::parse::<Address>) {
-                Some(Ok(to)) => gate.pays(&id, to, &hot).await?,
+            let hot_unit_index = self.cfg.hot_unit_index;
+            let terms = withdraw_to.map(|to| withdrawal_terms(spend, to, hot_unit_index));
+            let pays = match &terms {
+                Some(Ok(terms)) => {
+                    let hot = hot_amount(spend, hot_unit_index);
+                    gate.pays(&id, terms.recipient(), &hot).await?
+                }
                 Some(Err(_)) => false,
                 None => true,
             };
@@ -244,6 +254,8 @@ impl BridgeOrchestrator {
                 amount: spend.amount.clone(),
                 withdraw_to_address: withdraw_to.map(str::to_string),
                 screening,
+                stranded,
+                unpayable: terms.and_then(Result::err).map(|e| format!("{e:#}")),
             });
         }
         self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());

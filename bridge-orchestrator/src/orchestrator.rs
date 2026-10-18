@@ -117,7 +117,7 @@ struct BridgingSelection {
 }
 
 async fn select_bridging_links(
-    signer: Option<&CouponSigner>,
+    ethereum: Option<(&CouponSigner, Address)>,
     gate: &WithdrawalGate<'_>,
     bridging_agent: &AgentPubKeyB64,
     bridging_links: &[Transaction],
@@ -134,28 +134,29 @@ async fn select_bridging_links(
         held: 0,
     };
     let mut withdrawal_capped = false;
+    let vault = ethereum.map(|(_, vault)| vault_key(vault));
 
     for tx in bridging_links {
-        let withdraw_to = match bridging_spend(tx, bridging_agent) {
+        let withdraw_to = match bridging_spend(tx, bridging_agent, vault.as_deref()) {
             None => continue,
             Some(BridgingSpend::Deposit) => {
                 selection.deposits.push(tx.clone());
                 continue;
             }
-            Some(BridgingSpend::Other(_) | BridgingSpend::Withdrawal(None)) => continue,
+            Some(
+                BridgingSpend::OtherRole(_)
+                | BridgingSpend::OtherVault { .. }
+                | BridgingSpend::Withdrawal(None),
+            ) => continue,
             Some(BridgingSpend::Withdrawal(Some(withdraw_to))) => withdraw_to,
         };
         selection.withdrawals_found += 1;
-        let Some(signer) = signer else {
+        let Some((signer, _)) = ethereum else {
             continue;
         };
 
-        let amount = tx
-            .amount
-            .get(&hot_unit_index.to_string())
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let terms = match Payout::new(withdraw_to, &amount) {
+        let amount = hot_amount(tx, hot_unit_index);
+        let terms = match withdrawal_terms(tx, withdraw_to, hot_unit_index) {
             Ok(terms) => terms,
             Err(e) => {
                 selection.unpayable.push((tx.clone(), e));
@@ -207,12 +208,14 @@ async fn select_bridging_links(
 enum BridgingSpend<'a> {
     Deposit,
     Withdrawal(Option<&'a str>),
-    Other(&'a str),
+    OtherVault { to: Option<&'a str>, why: String },
+    OtherRole(&'a str),
 }
 
 fn bridging_spend<'a>(
     tx: &'a Transaction,
     bridging_agent: &AgentPubKeyB64,
+    vault: Option<&str>,
 ) -> Option<BridgingSpend<'a>> {
     let TransactionDetails::ParkedSpend {
         attached_payload,
@@ -226,17 +229,57 @@ fn bridging_spend<'a>(
         if own_deposit(tx, bridging_agent) && ct_role_id == BRIDGING_AGENT_ROLE {
             BridgingSpend::Deposit
         } else if ct_role_id == WITHDRAWER_ROLE {
-            // The template pays a withdrawal from a `withdrawer` link alone, so a
-            // coupon for any other role would be claimable with no spend taken.
-            BridgingSpend::Withdrawal(
-                attached_payload
-                    .get("withdraw_to_address")
-                    .and_then(Value::as_str),
-            )
+            // The template debits the vault only for a `withdrawer` link naming it in
+            // exact lowercase, so a coupon for any other role or vault would be
+            // claimable with nothing debited from it.
+            let to = attached_payload
+                .get("withdraw_to_address")
+                .and_then(Value::as_str);
+            let named = attached_payload
+                .get("withdraw_contract_address")
+                .and_then(Value::as_str);
+            match vault {
+                Some(vault) if named != Some(vault) => BridgingSpend::OtherVault {
+                    to,
+                    why: other_vault_reason(named, vault),
+                },
+                _ => BridgingSpend::Withdrawal(to),
+            }
         } else {
-            BridgingSpend::Other(ct_role_id)
+            BridgingSpend::OtherRole(ct_role_id)
         },
     )
+}
+
+fn vault_key(vault: Address) -> String {
+    format!("{vault:#x}")
+}
+
+fn hot_amount(tx: &Transaction, hot_unit_index: u32) -> String {
+    tx.amount
+        .get(&hot_unit_index.to_string())
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+fn withdrawal_terms(tx: &Transaction, withdraw_to: &str, hot_unit_index: u32) -> Result<Payout> {
+    let hot_unit = hot_unit_index.to_string();
+    // The template pays the executor every unit in the spend, so a unit other
+    // than HOT can fail the one RAVE the whole batch shares.
+    if let Some((unit, _)) = tx.amount.iter().find(|(unit, _)| **unit != hot_unit) {
+        anyhow::bail!("the amount holds unit {unit}");
+    }
+    Payout::new(withdraw_to, &hot_amount(tx, hot_unit_index))
+}
+
+fn other_vault_reason(named: Option<&str>, vault: &str) -> String {
+    match named {
+        Some(named) if named.eq_ignore_ascii_case(vault) => format!(
+            "names withdraw_contract_address {named:?}, which is vault {vault} in a letter case the template does not pay"
+        ),
+        Some(named) => format!("names withdraw_contract_address {named:?}, not vault {vault}"),
+        None => "names no withdraw_contract_address".to_string(),
+    }
 }
 
 fn own_deposit(tx: &Transaction, bridging_agent: &AgentPubKeyB64) -> bool {
@@ -247,7 +290,7 @@ impl BridgeOrchestrator {
     pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
         if let Some(side) = &ethereum {
-            db.bind_vault(&format!("{:#x}", side.chain.lock_vault_address))?;
+            db.bind_vault(&vault_key(side.chain.lock_vault_address))?;
             let screening = screening_at_start(&db, side.screener.as_deref())?;
             info!(event = "startup.screening", "{screening}");
         }
@@ -336,17 +379,27 @@ impl BridgeOrchestrator {
         }
     }
 
+    fn vault(&self) -> Option<String> {
+        let side = self.ethereum.as_ref()?;
+        Some(vault_key(side.chain.lock_vault_address))
+    }
+
     fn log_skipped_links(&self, bridging_links: &[Transaction]) {
+        let vault = self.vault();
         let skipped: Vec<(&Transaction, Option<&str>, String)> = bridging_links
             .iter()
             .filter_map(|tx| {
-                let (role, why) = match bridging_spend(tx, &self.cfg.bridging_agent_pubkey) {
+                let spend = bridging_spend(tx, &self.cfg.bridging_agent_pubkey, vault.as_deref());
+                let (role, why) = match spend {
                     None => (None, "is no spend".to_string()),
                     Some(BridgingSpend::Withdrawal(None)) => (
                         Some(WITHDRAWER_ROLE),
                         format!("in role {WITHDRAWER_ROLE} names no withdraw_to_address"),
                     ),
-                    Some(BridgingSpend::Other(role)) => (
+                    Some(BridgingSpend::OtherVault { why, .. }) => {
+                        (Some(WITHDRAWER_ROLE), format!("in role {WITHDRAWER_ROLE} {why}"))
+                    }
+                    Some(BridgingSpend::OtherRole(role)) => (
                         Some(role),
                         format!("in role {role} is neither the bridging agent's deposit nor a withdrawal"),
                     ),
@@ -1130,7 +1183,9 @@ impl BridgeOrchestrator {
             unpayable,
             held: held_withdrawals,
         } = select_bridging_links(
-            self.ethereum.as_ref().map(|side| &side.signer),
+            self.ethereum
+                .as_ref()
+                .map(|side| (&side.signer, side.chain.lock_vault_address)),
             &gate,
             &self.cfg.bridging_agent_pubkey,
             &bridging_links,
@@ -1998,7 +2053,6 @@ impl BridgeOrchestrator {
 
     fn extract_lock_proof(&self, vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
         let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let contract_hex = format!("{vault:x}");
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
@@ -2006,7 +2060,7 @@ impl BridgeOrchestrator {
 
         let proof = json!({
             "method": "deposit",
-            "contract_address": format!("0x{}", contract_hex.to_lowercase()),
+            "contract_address": vault_key(vault),
             "amount": amount,
             "depositor_wallet_address": depositor,
             "lock_id": lock.lock_id,
@@ -6064,7 +6118,7 @@ mod tests {
         let copy = withdrawal_carrying(0xAD, proof("lock:copied:3", "0x8c"));
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             std::slice::from_ref(&copy),
@@ -6124,7 +6178,7 @@ mod tests {
         }
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &[forged],
@@ -6176,7 +6230,25 @@ mod tests {
         if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut audited.details {
             *ct_role_id = "auditor".to_string();
         }
-        let skipped = [audited, unaddressed_withdrawal(0xBB), non_spend(0xBC)];
+        let to = format!("{:#x}", Address::repeat_byte(0xBD));
+        let other_vault = with_payload(
+            parked_withdrawal_tx(0xBD),
+            json!({
+                "withdraw_contract_address": "0x2222222222222222222222222222222222222222",
+                "withdraw_to_address": to,
+            }),
+        );
+        let no_vault = with_payload(
+            parked_withdrawal_tx(0xBE),
+            json!({ "withdraw_to_address": to }),
+        );
+        let skipped = [
+            audited,
+            unaddressed_withdrawal(0xBB),
+            non_spend(0xBC),
+            other_vault,
+            no_vault,
+        ];
         let parked = [
             &[
                 parked_spend_tx(0xB9, &[proof("lock:own:6", "0x92")]),
@@ -6193,16 +6265,21 @@ mod tests {
             ids(&skipped)
         );
         for why in [
-            "in role auditor is neither the bridging agent's deposit nor a withdrawal",
-            "in role withdrawer names no withdraw_to_address",
-            "is no spend",
+            "in role auditor is neither the bridging agent's deposit nor a withdrawal".to_string(),
+            "in role withdrawer names no withdraw_to_address".to_string(),
+            "is no spend".to_string(),
+            format!("in role withdrawer names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {VAULT:#x}"),
+            "in role withdrawer names no withdraw_contract_address".to_string(),
         ] {
-            assert!(logged.contains(why), "{logged}");
+            assert!(logged.contains(&why), "{why}: {logged}");
         }
     }
 
     fn unaddressed_withdrawal(seed: u8) -> Transaction {
-        with_payload(parked_withdrawal_tx(seed), json!({}))
+        with_payload(
+            parked_withdrawal_tx(seed),
+            json!({ "withdraw_contract_address": format!("{VAULT:#x}") }),
+        )
     }
 
     fn with_payload(mut spend: Transaction, payload: Value) -> Transaction {
@@ -8550,8 +8627,10 @@ mod tests {
             ..
         } = &mut tx.details
         {
-            *attached_payload =
-                json!({ "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)) });
+            *attached_payload = json!({
+                "withdraw_contract_address": format!("{VAULT:#x}"),
+                "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
+            });
             *ct_role_id = WITHDRAWER_ROLE.to_string();
         }
         tx
@@ -8607,7 +8686,7 @@ mod tests {
         ];
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8632,7 +8711,7 @@ mod tests {
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &withdrawals,
@@ -8651,10 +8730,10 @@ mod tests {
     async fn a_withdrawal_is_paid_from_the_hot_unit_index() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let mut withdrawal = parked_withdrawal_tx(0x61);
-        withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
+        withdrawal.amount = UnitMap::from(vec![(3, "5")]);
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &[withdrawal.clone()],
@@ -8679,27 +8758,66 @@ mod tests {
     #[tokio::test]
     async fn a_withdrawal_no_coupon_can_pay_stays_parked_and_the_rest_go() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
-        let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
-            let mut tx = with_payload(
-                parked_withdrawal_tx(seed),
-                json!({ "withdraw_to_address": recipient }),
-            );
+        let to = "0x1111111111111111111111111111111111111111";
+        let vault = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
+        let spend = |seed, payload: Value, amount: &[(u32, &str)]| {
+            let mut tx = with_payload(parked_withdrawal_tx(seed), payload);
             tx.amount = UnitMap::from(amount.to_vec());
             tx
         };
-        let to = "0x1111111111111111111111111111111111111111";
-        let payable = paid_to(0x60, to, &[(1, "5")]);
+        let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
+            let payload =
+                json!({ "withdraw_contract_address": vault, "withdraw_to_address": recipient });
+            spend(seed, payload, amount)
+        };
+        let from_vault = |seed, named: &str| {
+            let payload = json!({ "withdraw_contract_address": named, "withdraw_to_address": to });
+            spend(seed, payload, &[(1, "5")])
+        };
+        let checksummed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        let payable = [
+            paid_to(0x60, to, &[(1, "5")]),
+            paid_to(0x6E, checksummed, &[(1, "5")]),
+            paid_to(0x6F, &checksummed.to_ascii_lowercase(), &[(1, "5")]),
+            paid_to(
+                0x70,
+                &format!("0x{}", checksummed[2..].to_ascii_uppercase()),
+                &[(1, "5")],
+            ),
+            paid_to(0x72, &checksummed[2..], &[(1, "5")]),
+        ];
         let deposit = parked_spend_tx(0x61, &[proof("lock:d", "0xd0")]);
         let unpayable = [
             paid_to(0x62, to, &[(2, "5")]),
             paid_to(0x63, to, &[(1, "0")]),
             paid_to(0x64, to, &[(1, "-5")]),
             paid_to(0x65, "0xdead", &[(1, "5")]),
+            paid_to(0x66, to, &[(1, "5"), (0, "-3")]),
+            paid_to(0x67, to, &[(1, "5"), (2, "5")]),
+            paid_to(0x68, to, &[(1, "5"), (0, "0")]),
+            paid_to(
+                0x71,
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD",
+                &[(1, "5")],
+            ),
         ];
-        let links = [&unpayable[..], &[payable.clone(), deposit.clone()]].concat();
+        let other_vaults = [
+            from_vault(0x69, "0x2222222222222222222222222222222222222222"),
+            from_vault(0x6A, "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
+            from_vault(0x6B, ""),
+            from_vault(0x6C, &format!(" {vault}")),
+            spend(0x6D, json!({ "withdraw_to_address": to }), &[(1, "5")]),
+        ];
+        let links = [
+            &unpayable[..],
+            &other_vaults,
+            &payable,
+            std::slice::from_ref(&deposit),
+        ]
+        .concat();
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, vault.parse().unwrap())),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8709,11 +8827,48 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
+        assert_eq!(ids(&selection.withdrawals), ids(&payable));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
-        assert_eq!(selection.coupons.len(), 1);
-        assert_eq!(selection.withdrawals_found, 5);
+        assert_eq!(selection.coupons.len(), payable.len());
+        assert_eq!(selection.withdrawals_found, unpayable.len() + payable.len());
         assert_eq!(unpayable_ids(&selection), ids(&unpayable));
+        let reasons: Vec<String> = selection
+            .unpayable
+            .iter()
+            .map(|(_, e)| e.to_string())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "the amount holds unit 2",
+                "the amount is zero",
+                "the amount \"-5\" is not a HOT amount",
+                "the recipient \"0xdead\" is not an address",
+                "the amount holds unit 0",
+                "the amount holds unit 2",
+                "the amount holds unit 0",
+                "the recipient \"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD\" fails its EIP-55 checksum",
+            ]
+        );
+        let why_parked: Vec<String> = other_vaults
+            .iter()
+            .map(
+                |tx| match bridging_spend(tx, &bridging_agent(), Some(vault)) {
+                    Some(BridgingSpend::OtherVault { why, .. }) => why,
+                    _ => panic!("{} is not refused for its vault", tx.id),
+                },
+            )
+            .collect();
+        assert_eq!(
+            why_parked,
+            [
+                format!("names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {vault}"),
+                format!("names withdraw_contract_address \"0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6\", which is vault {vault} in a letter case the template does not pay"),
+                format!("names withdraw_contract_address \"\", not vault {vault}"),
+                format!("names withdraw_contract_address \" {vault}\", not vault {vault}"),
+                "names no withdraw_contract_address".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -8728,7 +8883,7 @@ mod tests {
         .concat();
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
