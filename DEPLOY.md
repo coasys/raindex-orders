@@ -108,7 +108,107 @@ The steps run one by one too: `token`, `mint`, `safe`, `bridge`.
 
 The orchestrator then runs with `SAFE_OWNER_SERVICES`, the owners' signer services, or `SAFE_OWNER_KEYS`, owner keys it holds, in place of `SIGNER_PRIVATE_KEY` ([docs/signer-service.md](./docs/signer-service.md)). The website takes the record's values as for any new TestNet deploy, `PUBLIC_CLAIM_SIGNER` being the Safe.
 
-`test/base-sepolia-safe-rehearsal.sh` runs `all-safe` on an anvil fork of Base Sepolia (`FORK_URL`, `https://sepolia.base.org` unless set), finds the Safe again without sending, starts the orchestrator against the fork with the owners at mock signer services and with owner keys, and proves on the fork that two owner signatures claim, one or a stranger's do not, and the Safe's admin calls need two owners.
+`test/base-sepolia-safe-rehearsal.sh` runs `all-safe` on an anvil fork of Base Sepolia (`FORK_URL`, `https://sepolia.base.org` unless set), finds the Safe again without sending, starts the orchestrator against the fork with the owners at mock signer services and with owner keys, and with one and two of the services stopped, has `make-coupon` sign 2-of-3 coupons with owner keys from a file and at the services and claims them on the fork, and proves on the fork that two owner signatures claim, one or a stranger's do not, and the Safe's admin calls need two owners.
+
+### Try M-of-N on Base Sepolia by hand
+
+A second TestNet on the real Base Sepolia, whose 2-of-3 Safe is the vault admin and the coupon signer, next to the existing one. You start three mock signer services, watch the orchestrator's startup checks, lock on the website on your machine, and claim with a coupon two owners signed. Holochain is not needed. Nothing here touches the existing TestNet or the public website: it all happens in a worktree of its own, with its own `.env` and `ui/.env.development.local`. Never run `cf-deploy` from it; the public site stays on Unyt's vault.
+
+**1. A worktree of its own.**
+
+```bash
+git worktree add ../raindex-orders-mofn origin/safe-admin-and-signer
+cd ../raindex-orders-mofn
+forge soldeer install && npm ci && (cd ui && npm ci) && (cd bridge-orchestrator && cargo build)
+cp .env.example .env
+REPO=$PWD
+```
+
+The deploy writes `broadcast/*/84532/run-latest.json` here. Do not commit it.
+
+**2. Three owner keys.** Make new ones. Your MetaMask address cannot be an owner: on Base Sepolia it is an EIP-7702 account, which has code, and the `safe` step refuses an owner that is a contract.
+
+```bash
+mkdir -m 700 ~/mofn
+for i in 1 2 3; do cast wallet new --json | jq -r '.data[0] | .address, .private_key' > ~/mofn/owner$i; done
+chmod 600 ~/mofn/owner*
+OWNERS=$(for i in 1 2 3; do head -1 ~/mofn/owner$i; done | paste -sd,)
+{ sed -n 2p ~/mofn/owner1; sed -n 2p ~/mofn/owner2; } > ~/mofn/two-keys && chmod 600 ~/mofn/two-keys
+```
+
+Each `~/mofn/ownerN` holds the owner's address, then its key. `two-keys` holds the keys of owners 1 and 2.
+
+**3. Deploy.** The `deployer` keystore pays the gas, as for the existing TestNet:
+
+```bash
+SAFE_OWNERS=$OWNERS SAFE_THRESHOLD=2 ./deploy-base-sepolia.sh all-safe --account deployer | tee ~/mofn/deploy.log
+set -a; source .env; set +a
+```
+
+This deploys mock HOT, mints 1000 to the deployer, creates the Safe (`ADMIN_ADDRESS`), and deploys the vault and the claim order in one transaction, with the Safe as admin and coupon signer. `.env` now holds the deploy record.
+
+**4. The website's values**, from the record the deploy printed:
+
+```bash
+{ sed -n '/website:/,$p' ~/mofn/deploy.log | grep -oE 'PUBLIC_[A-Z_]+=[^ ]+'; echo BASE_SEPOLIA_RPC_URL=https://sepolia.base.org; } > ui/.env.development.local
+```
+
+**5. Three mock signer services**, one for each owner, with the record's values. They check the words of each coupon against the record, but nothing on Holochain:
+
+```bash
+for i in 1 2 3; do
+  OWNER_KEY=$(sed -n 2p ~/mofn/owner$i) SAFE=$ADMIN_ADDRESS CHAIN_ID=84532 PORT=1860$i \
+  ORDER_HASH=$ORDER_HASH ORDER_OWNER=$ORDER_OWNER ORDERBOOK_ADDRESS=$ORDERBOOK_ADDRESS \
+  TOKEN_ADDRESS=$TOKEN_ADDRESS VAULT_ID=$VAULT_ID SIGNED_RECORD=$HOME/mofn/signed$i.json \
+  node ui/scripts/mock-signer-service.mjs > ~/mofn/service$i.log 2>&1 & echo $! > ~/mofn/service$i.pid
+done
+SERVICES=$(for i in 1 2 3; do echo "$(head -1 ~/mofn/owner$i)=http://127.0.0.1:1860$i"; done | paste -sd,)
+```
+
+**6. The orchestrator's startup checks**, with no Holochain. It reads the Safe, asks each service who it signs for, and has the claim order take a probe coupon two owners signed and refuse it signed by one. Then it stops where it needs Holochain, which is expected here:
+
+```bash
+mkdir -p ~/mofn/orch
+printf 'keystore:\n  type: lair_server\n  connection_url: unix:///%s/no-lair?k=abc\ndb_sync_level: Full\n' ~/mofn/orch > ~/mofn/orch/conductor-config.yaml
+orchestrate() {
+  (cd ~/mofn/orch && env -i PATH="$PATH" NETWORK=base-sepolia BASE_SEPOLIA_RPC_URL=https://sepolia.base.org \
+    BASE_SEPOLIA_LOCK_VAULT_ADDRESS=$BASE_SEPOLIA_LOCK_VAULT_ADDRESS TOKEN_ADDRESS=$TOKEN_ADDRESS \
+    ORDER_HASH=$ORDER_HASH ORDER_OWNER=$ORDER_OWNER CLAIM_SIGNER=$CLAIM_SIGNER \
+    CLAIM_BYTECODE=$CLAIM_BYTECODE CLAIM_INPUT_TOKEN=$CLAIM_INPUT_TOKEN SAFE_OWNER_SERVICES=$SERVICES \
+    HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
+    DB_PATH=$HOME/mofn/orch/bridge.db CONDUCTOR_CONFIG=$HOME/mofn/orch/conductor-config.yaml \
+    LAIR_PASSPHRASE_FILE=$HOME/mofn/orch/none "$REPO/bridge-orchestrator/target/debug/bridge-orchestrator" run)
+}
+orchestrate
+```
+
+Look for `the claim order took the probe signed by 2 owners of CLAIM_SIGNER <the Safe>, and refused it signed by 1` and `startup checks passed`. Then stop service 3 and run it again: it names the service that is down (`the signer service for <owner 3> at 127.0.0.1:18603 ...: the other owners sign until it answers`) and still passes, with owners 1 and 2. Stop service 2 too: it refuses to start, `1 of the owners this orchestrator asks can sign now, and CLAIM_SIGNER <the Safe> is a Safe of threshold 2`.
+
+```bash
+kill $(cat ~/mofn/service3.pid); orchestrate      # one service down: passes
+kill $(cat ~/mofn/service2.pid); orchestrate      # two down: refuses
+kill $(cat ~/mofn/service1.pid)
+```
+
+Then start the three again with step 5's loop.
+
+**7. Lock and claim on the website on your machine.** Mock HOT mints to anyone, so give your MetaMask account some:
+
+```bash
+cast send $TOKEN_ADDRESS 'mint(address,uint256)' <your MetaMask address> 1000000000000000000000 --account deployer --rpc-url https://sepolia.base.org
+```
+
+In a second terminal, start the website: `cd ../raindex-orders-mofn/ui && npm run dev`, and open http://localhost:5173 with MetaMask on Base Sepolia. Lock some mock HOT on `/lock`. Then, back in the first terminal, make a coupon two owners sign, and open the claim link it prints:
+
+```bash
+cd ui
+npm run make-coupon -- --recipient <your MetaMask address> --amount 5 --owner-keys-file ~/mofn/two-keys
+SAFE_OWNER_SERVICES=$SERVICES npm run make-coupon -- --recipient <your MetaMask address> --amount 5
+```
+
+The first signs with the keys of owners 1 and 2, the second at the three services, which each sign a random withdrawal. `make-coupon` reads the Safe's threshold and owners from the chain, checks each signature, sorts them as the Safe wants, and has the Safe's `isValidSignature` accept them before it prints the link. It takes owner keys from a file or from `SAFE_OWNER_KEYS`, never from the command line, and refuses mainnet. One owner's key alone is refused: `1 of the Safe's owners signed, and its threshold is 2`. A claim pays out of what was locked.
+
+**8. Manage the Safe in the Safe app.** The Safe app supports Base Sepolia and this Safe (SafeL2 1.4.1). Its own private-key login is off on Base Sepolia, so use MetaMask. In MetaMask, import owner 1's key (Add account, then Import account, and paste `sed -n 2p ~/mofn/owner1`), and do the same for owner 2. The owner that executes pays the gas: `cast send $(head -1 ~/mofn/owner2) --value 0.005ether --account deployer --rpc-url https://sepolia.base.org`. Open `https://app.safe.global/home?safe=basesep:<ADMIN_ADDRESS>` and connect as owner 1: it shows the three owners and the threshold, 2 of 3. Any admin call needs two of them. For example, to set the vault's minimum lock to 2 mock HOT: New transaction, Transaction Builder, the vault as the address, Custom data on, value 0, and as data the output of `cast calldata 'setMinLockAmount(uint256)' 2000000000000000000`. Sign as owner 1, switch MetaMask to owner 2, confirm and execute. `cast call $BASE_SEPOLIA_LOCK_VAULT_ADDRESS 'minLockAmount()(uint256)' --rpc-url https://sepolia.base.org` then answers 2000000000000000000. Do not take the app's offer to update the Safe to 1.5.0: the deploy and the rotation take only Safe 1.4.1.
 
 ### Deployed Contract Addresses (Base Sepolia)
 
@@ -196,7 +296,7 @@ It starts anvil on `127.0.0.1:8545`, forking `FORK_URL` (`https://sepolia.base.o
    npm run make-coupon -- --recipient 0xYourMetaMaskAddress --amount 5
    ```
 
-   `make-coupon` signs as the test signer, whose key is public in `src/Constants.sol`, for the claim order in `ui/.env.development.local`. `--expiry <unix seconds>` and `--nonce <n>` override its defaults: a week from the chain's time, and a random nonce. It refuses mainnet (chain 1, or `PUBLIC_NETWORK=mainnet`), and any chain but Base Sepolia. A claim pays out of what has been locked, so lock at least the coupon's amount first.
+   `make-coupon` signs as the test signer, whose key is public in `src/Constants.sol`, for the claim order in `ui/.env.development.local` (or the env file `--env` names, a deploy record such as `.env` too). For a claim order whose signer is a Safe, the Safe's owners sign: owner keys from `--owner-keys-file` or `SAFE_OWNER_KEYS`, never the command line, or signer services in `SAFE_OWNER_SERVICES` ([Try M-of-N on Base Sepolia by hand](#try-m-of-n-on-base-sepolia-by-hand)). `--expiry <unix seconds>` and `--nonce <n>` override its defaults: a week from the chain's time, and a random nonce. It refuses mainnet (chain 1, `PUBLIC_NETWORK=mainnet`, or a mainnet record), and any chain but Base Sepolia. A claim pays out of what has been locked, so lock at least the coupon's amount first.
 4. `test/local-ui.sh stop` stops anvil. Each start deploys afresh, so run the script again after a stop, and clear MetaMask's activity for the account (Settings > Advanced > Clear activity tab data), whose nonces are then stale.
 
 ### Lock Flow (HOT -> Bridged HOT)
