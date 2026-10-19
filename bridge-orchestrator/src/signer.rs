@@ -267,6 +267,7 @@ impl CouponSigner {
     }
 
     /// The chain the coupons claim on, their word 9.
+    #[cfg(test)]
     pub fn chain_id(&self) -> u64 {
         self.chain_id
     }

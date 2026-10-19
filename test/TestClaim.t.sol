@@ -295,6 +295,20 @@ contract TestClaim is Test, SignContext {
         assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
     }
 
+    /// A coupon of nine words, signed before coupons named their chain, has no
+    /// word 9: the claim order's chain check reads past its end and the claim
+    /// fails, though the signer signed all nine.
+    function testANineWordCouponFails() public {
+        bytes32[] memory ten = coupon(40e18, inAWeek(), 12);
+        bytes32[] memory nine = new bytes32[](9);
+        for (uint256 i = 0; i < 9; i++) {
+            nine[i] = ten[i];
+        }
+
+        vm.expectRevert(stdError.indexOOBError);
+        claim(signed(nine), 40e18);
+    }
+
     function testAClaimForLessThanTheCouponFails() public {
         SignedContextV1 memory forty = signed(coupon(40e18, inAWeek(), 8));
 
