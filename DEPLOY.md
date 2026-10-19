@@ -117,7 +117,8 @@ A second TestNet on the real Base Sepolia, whose 2-of-3 Safe is the vault admin 
 **1. A worktree of its own.**
 
 ```bash
-git worktree add ../raindex-orders-mofn origin/safe-admin-and-signer
+git fetch origin
+git worktree add ../raindex-orders-mofn origin/pr2-chainid
 cd ../raindex-orders-mofn
 forge soldeer install && npm ci && (cd ui && npm ci) && (cd bridge-orchestrator && cargo build)
 cp .env.example .env
