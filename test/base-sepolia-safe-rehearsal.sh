@@ -6,7 +6,8 @@
 # deploy-base-sepolia.sh all-safe deploys mock HOT, creates the Safe through
 # Safe's factory, and deploys the vault and claim order in one transaction. Then
 # the orchestrator passes its startup checks against the fork with the Safe's
-# owners at mock signer services, and the one-Safe proofs run on the fork.
+# owners at mock signer services, ui/scripts/make-coupon.mjs makes 2-of-3 coupons
+# that claim on the fork, and the one-Safe proofs run on the fork.
 # FORK_URL is the Base Sepolia RPC anvil forks. Every transaction goes to an
 # anvil this script starts on 127.0.0.1, never to FORK_URL.
 set -euo pipefail
@@ -101,12 +102,14 @@ echo "found again, sending nothing: $safe"
 
 step "Starting mock signer services for the Safe's three owners (no Holochain checks)"
 service_port=$((PORT + 10))
+service_pids=()
 for i in 0 1 2; do
 	env -i PATH="$PATH" OWNER_KEY="${owner_keys[$i]}" SAFE="$safe" CHAIN_ID=84532 PORT=$((service_port + i)) \
 		ORDER_HASH="$ORDER_HASH" ORDER_OWNER="$ORDER_OWNER" ORDERBOOK_ADDRESS="$ORDERBOOK_ADDRESS" \
 		TOKEN_ADDRESS="$TOKEN_ADDRESS" VAULT_ID="$VAULT_ID" \
 		node ui/scripts/mock-signer-service.mjs >"$work/service-$i.log" 2>&1 &
 	pids+=("$!")
+	service_pids+=("$!")
 done
 for i in 0 1 2; do
 	for _ in $(seq 40); do
@@ -151,6 +154,134 @@ expect_startup "with the Safe's 3 owners at their signer services" \
 grep -qF "the claim order took the probe signed by 2 owners of CLAIM_SIGNER $safe, and refused it signed by 1" \
 	"$work/orchestrator.log" || fail "the orchestrator did not probe with 2 owner signatures and with 1"
 expect_startup "with the keys of 2 of the Safe's owners" SAFE_OWNER_KEYS="${owner_keys[1]},${owner_keys[2]}"
+
+step "make-coupon's Safe mode: 2 of 3 owners sign a coupon, which claims on the fork"
+# The website's values, as the deploy record prints them, in a file of the form
+# npm run dev reads (DEPLOY.md, "Try M-of-N on Base Sepolia by hand").
+{
+	sed -n '/website:/,$p' "$work/deploy.log" | grep -oE 'PUBLIC_[A-Z_]+=[^ ]+'
+	echo "BASE_SEPOLIA_RPC_URL=$fork"
+} >"$work/ui.env"
+[[ $(grep -c '^PUBLIC_' "$work/ui.env") == 10 ]] || fail "the deploy record has no 10 website lines"
+grep -qxF "PUBLIC_CLAIM_SIGNER=$safe" "$work/ui.env" || fail "the website's claim signer is not the Safe"
+agent=0x$(printf 'a%.0s' {1..64})
+cast send "$TOKEN_ADDRESS" 'approve(address,uint256)' "$BASE_SEPOLIA_LOCK_VAULT_ADDRESS" 100000000000000000000 \
+	--private-key "$deployer_key" --rpc-url "$fork" >/dev/null
+cast send "$BASE_SEPOLIA_LOCK_VAULT_ADDRESS" 'lock(uint256,bytes32)' 100000000000000000000 "$agent" \
+	--private-key "$deployer_key" --rpc-url "$fork" >/dev/null
+claimer_key=$(fresh_key)
+claimer=$(address_of "$claimer_key")
+cast rpc anvil_setBalance "$claimer" 0x8AC7230489E80000 --rpc-url "$fork" >/dev/null # 10 ETH
+make_coupon() { (cd ui && node scripts/make-coupon.mjs --recipient "$claimer" "$@"); }
+# Claims `coupon` as the website does: takeOrders4 for exactly its amount, sent by
+# the claimer, with the order the website's values describe.
+claim() {
+	(cd ui && env -i PATH="$PATH" COUPON="$1" KEY="$claimer_key" RPC="$fork" UI_ENV="$work/ui.env" node --input-type=module -e '
+		import { readFileSync } from "node:fs"
+		import { createWalletClient, createPublicClient, http, parseAbi, numberToHex } from "viem"
+		import { privateKeyToAccount } from "viem/accounts"
+		const env = Object.fromEntries(readFileSync(process.env.UI_ENV, "utf8").trim().split("\n").map(l => l.split("=")))
+		const [signer, signature, ...words] = process.env.COUPON.split(",")
+		const context = words.map(w => numberToHex(BigInt(w), { size: 32 }))
+		const vaultId = "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
+		const order = {
+			owner: env.PUBLIC_LOCK_VAULT_ADDRESS,
+			evaluable: { interpreter: env.PUBLIC_CLAIM_INTERPRETER, store: env.PUBLIC_CLAIM_STORE, bytecode: env.PUBLIC_CLAIM_BYTECODE },
+			validInputs: [{ token: env.PUBLIC_CLAIM_INPUT_TOKEN, vaultId }],
+			validOutputs: [{ token: env.PUBLIC_TOKEN_ADDRESS, vaultId }],
+			nonce: numberToHex(0n, { size: 32 })
+		}
+		const abi = parseAbi([
+			"struct IOV2 { address token; bytes32 vaultId; }",
+			"struct EvaluableV4 { address interpreter; address store; bytes bytecode; }",
+			"struct OrderV4 { address owner; EvaluableV4 evaluable; IOV2[] validInputs; IOV2[] validOutputs; bytes32 nonce; }",
+			"struct SignedContextV1 { address signer; bytes32[] context; bytes signature; }",
+			"struct TakeOrderConfigV4 { OrderV4 order; uint256 inputIOIndex; uint256 outputIOIndex; SignedContextV1[] signedContext; }",
+			"struct TakeOrdersConfigV5 { bytes32 minimumIO; bytes32 maximumIO; bytes32 maximumIORatio; bool IOIsInput; TakeOrderConfigV4[] orders; bytes data; }",
+			"function takeOrders4(TakeOrdersConfigV5 config) returns (bytes32, bytes32)"
+		])
+		const config = {
+			minimumIO: context[1], maximumIO: context[1],
+			maximumIORatio: "0xffffffe200000000000000000000000000000000000000000000000000000001",
+			IOIsInput: true,
+			orders: [{ order, inputIOIndex: 0n, outputIOIndex: 0n, signedContext: [{ signer, context, signature }] }],
+			data: "0x"
+		}
+		const account = privateKeyToAccount(process.env.KEY)
+		const chain = { id: 84532, name: "fork", nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [process.env.RPC] } } }
+		const pub = createPublicClient({ chain, transport: http() })
+		const wallet = createWalletClient({ account, chain, transport: http() })
+		const { request } = await pub.simulateContract({ account, address: env.PUBLIC_ORDERBOOK_ADDRESS, abi, functionName: "takeOrders4", args: [config] })
+		const receipt = await pub.waitForTransactionReceipt({ hash: await wallet.writeContract(request) })
+		if (receipt.status !== "success") throw new Error("the claim reverted")
+	')
+}
+hot_of() { cast call "$TOKEN_ADDRESS" 'balanceOf(address)(uint256)' "$1" --rpc-url "$fork" | cut -d' ' -f1; }
+coupon_of() { sed -n 's/^Coupon: //p' "$1"; }
+
+(umask 077 && printf '# two of the Safe'"'"'s owners\n%s\n%s\n' "${owner_keys[2]}" "${owner_keys[0]}" >"$work/owner-keys")
+make_coupon --env "$work/ui.env" --amount 5 --owner-keys-file "$work/owner-keys" >"$work/coupon-keys.log" ||
+	{ cat "$work/coupon-keys.log"; fail "make-coupon did not sign with 2 owner keys from a file"; }
+grep -qF "The Safe $safe on chain 84532: 2 of 3 owners sign" "$work/coupon-keys.log" || fail "make-coupon did not read the Safe"
+coupon=$(coupon_of "$work/coupon-keys.log")
+[[ ${coupon%%,*} == "$safe" && $(tr ',' '\n' <<<"$coupon" | wc -l) == 11 ]] ||
+	fail "the coupon does not name the Safe or has other than nine words"
+claim "$coupon" || fail "the coupon two owner keys signed did not claim"
+[[ $(hot_of "$claimer") == 5000000000000000000 ]] || fail "the claim did not pay 5 mock HOT"
+echo "a coupon signed with 2 owner keys from a file claimed 5 mock HOT"
+claim "$coupon" 2>"$work/again.err" && fail "the same coupon claimed twice"
+grep -qF "Nonce already used" "$work/again.err" || { cat "$work/again.err"; fail "the second claim failed for another reason"; }
+echo "and claims once"
+
+# The deploy record itself (.env), and the owners at their mock signer services.
+services_list="$(owner 0)=http://127.0.0.1:$service_port,$(owner 1)=http://127.0.0.1:$((service_port + 1)),$(owner 2)=http://127.0.0.1:$((service_port + 2))"
+SAFE_OWNER_SERVICES=$services_list make_coupon --env "$work/deploy.env" --amount 7 >"$work/coupon-services.log" ||
+	{ cat "$work/coupon-services.log"; fail "make-coupon did not sign at the signer services"; }
+grep -qF "Withdrawal ID: u" "$work/coupon-services.log" || fail "make-coupon named no withdrawal to the services"
+[[ $(grep -c ' (service 127.0.0.1:[0-9]*): signed$' "$work/coupon-services.log") == 3 ]] ||
+	{ cat "$work/coupon-services.log"; fail "not every signer service signed"; }
+claim "$(coupon_of "$work/coupon-services.log")" || fail "the coupon the signer services signed did not claim"
+[[ $(hot_of "$claimer") == 12000000000000000000 ]] || fail "the claim did not pay 7 more mock HOT"
+echo "a coupon from the deploy record, signed at the 3 signer services, claimed 7 mock HOT"
+
+SAFE_OWNER_KEYS=${owner_keys[1]} make_coupon --env "$work/ui.env" --amount 1 >"$work/coupon-one.log" 2>&1 &&
+	fail "make-coupon made a coupon with one owner's key"
+grep -qF "1 of the Safe's owners signed, and its threshold is 2" "$work/coupon-one.log" ||
+	{ cat "$work/coupon-one.log"; fail "make-coupon did not refuse one owner's key for its threshold"; }
+SAFE_OWNER_KEYS="${owner_keys[1]},$(fresh_key)" make_coupon --env "$work/ui.env" --amount 1 >"$work/coupon-stranger.log" 2>&1 &&
+	fail "make-coupon made a coupon with a stranger's key"
+grep -qF "is not an owner of the Safe $safe" "$work/coupon-stranger.log" || fail "make-coupon did not refuse a stranger's key"
+make_coupon --env "$work/ui.env" --amount 1 >"$work/coupon-none.log" 2>&1 && fail "make-coupon signed for the Safe with no owner"
+grep -qF "not the test signer" "$work/coupon-none.log" || fail "make-coupon did not ask for the Safe's owners"
+make_coupon --env "$work/ui.env" --amount 1 --owner-keys "${owner_keys[0]}" >"$work/coupon-argv.log" 2>&1 &&
+	fail "make-coupon took an owner key on the command line"
+grep -qF "never on the command line" "$work/coupon-argv.log" || fail "make-coupon did not refuse a key on the command line"
+echo "refused: one owner's key, a stranger's, no owner, and a key on the command line"
+mainnet_port=$((PORT + 20))
+anvil --host 127.0.0.1 --port "$mainnet_port" --chain-id 1 --silent &
+pids+=("$!")
+for _ in $(seq 40); do cast chain-id --rpc-url "http://127.0.0.1:$mainnet_port" >/dev/null 2>&1 && break; sleep 0.25; done
+make_coupon --env "$work/ui.env" --amount 1 --owner-keys-file "$work/owner-keys" --rpc "http://127.0.0.1:$mainnet_port" \
+	>"$work/coupon-mainnet.log" 2>&1 && fail "make-coupon signed for chain 1"
+grep -qF "is Ethereum mainnet: make-coupon never signs for mainnet" "$work/coupon-mainnet.log" ||
+	{ cat "$work/coupon-mainnet.log"; fail "make-coupon did not refuse chain 1"; }
+echo "refused: an RPC for chain 1"
+
+step "The orchestrator with the Safe's signer services down, as DEPLOY.md's M-of-N steps try it"
+kill "${service_pids[2]}"
+wait "${service_pids[2]}" 2>/dev/null || true
+expect_startup "with 1 of the 3 signer services down" SAFE_OWNER_SERVICES="$services_list"
+grep -qF "the signer service for $(owner 2) at 127.0.0.1:$((service_port + 2))" "$work/orchestrator.log" ||
+	{ cat "$work/orchestrator.log"; fail "the orchestrator did not name the service that is down"; }
+grep -qF "the claim order took the probe signed by 2 owners of CLAIM_SIGNER $safe, and refused it signed by 1" \
+	"$work/orchestrator.log" || fail "the orchestrator did not probe with 2 owner signatures and with 1"
+kill "${service_pids[1]}"
+wait "${service_pids[1]}" 2>/dev/null || true
+orchestrate SAFE_OWNER_SERVICES="$services_list" >"$work/orchestrator.log"
+grep -qF "startup checks passed" "$work/orchestrator.log" && fail "the orchestrator started with 2 of the 3 signer services down"
+grep -qF "1 of the owners this orchestrator asks can sign now, and CLAIM_SIGNER $safe is a Safe of threshold 2" \
+	"$work/orchestrator.log" || { cat "$work/orchestrator.log"; fail "the orchestrator did not refuse for want of owners"; }
+echo "refused to start with 2 of the 3 signer services down"
 
 step "Proving the TestNet on the fork: one Safe is the vault admin and the coupon signer"
 REHEARSAL=true REHEARSAL_RPC_URL=$fork REHEARSAL_TOKEN=$TOKEN_ADDRESS \
