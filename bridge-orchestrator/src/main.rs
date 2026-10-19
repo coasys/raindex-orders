@@ -47,10 +47,12 @@ enum Command {
     },
     /// Clear orchestrator work items from SQLite.
     Clear {
-        /// Delete only rows that are not in progress (succeeded, failed).
+        /// Delete only rows that are not in progress (succeeded, failed), except
+        /// a failed withdrawal row.
         #[arg(long, conflicts_with = "all", required_unless_present = "all")]
         non_in_progress: bool,
-        /// Delete every row from work_items but those in screening, held or blocked.
+        /// Delete every row from work_items but those in screening, held or
+        /// blocked, and failed withdrawal rows.
         #[arg(
             long,
             conflicts_with = "non_in_progress",
@@ -59,15 +61,17 @@ enum Command {
         all: bool,
         /// Only with `--non-in-progress`: delete terminal rows whose
         /// `updated_at` is older than this many seconds. Applied to
-        /// both `succeeded` and `failed` rows.
+        /// both `succeeded` and `failed` rows, but never a failed withdrawal
+        /// row.
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
     },
-    /// List each transfer the bridging agent's network still holds, for a migration's close.
+    /// List each transfer the bridging agent's network still holds, and each withdrawal the
+    /// orchestrator is still taking off the credit limit, for a migration's close.
     /// Run it with the orchestrator stopped.
     InTransit {
         /// After listing, mark failed each pending row in transit or carried by a listed link, all
-        /// or none, to be paid by hand on the new network. Exits 0 once they are marked.
+        /// or none, to be settled by hand. Exits 0 once they are marked.
         #[arg(long)]
         mark_failed: bool,
     },

@@ -11,10 +11,11 @@ mod screening;
 
 pub use screening::Hold;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
+pub const WITHDRAWAL_FLOW: &str = "withdrawal";
 /// In the order [`row_to_work_item`] reads them.
-const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
+const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id, receipt_hash";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -66,14 +67,10 @@ impl std::str::FromStr for WorkState {
     }
 }
 
-/// Pipeline progress for a lock row. Independent of `WorkState` (which tracks
-/// orchestrator ownership); `step` tracks which zome calls in the four-stage
-/// bridge pipeline have been proven to have landed on-chain.
-///
-/// Advancement is always driven by chain truth — a row is only moved to a
-/// later step once we either observed the returned `ActionHash` from the
-/// relevant zome call, or the reconciler at the top of a cycle confirmed the
-/// expected side-effect against a fresh `get_parked_links_by_ea` probe.
+/// The pipeline step a row has reached. A lock walks from `New` to
+/// `BrRaveExecuted`, a withdrawal from `Sent` through `Collected` to
+/// `ClRaveExecuted`. A row moves on only on the call's reply or on what the
+/// chain shows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStep {
@@ -82,15 +79,24 @@ pub enum WorkStep {
     /// S1 landed; `cl_link_hash` references the live parked link on the
     /// credit-limit EA.
     ClLinkCreated,
-    /// S2 landed; the CL `execute_rave` has consumed the parked link.
+    /// S2 landed; the CL `execute_rave` has consumed the parked link. Ends a
+    /// withdrawal row, which is `succeeded` with it.
     ClRaveExecuted,
     /// S3 landed; `br_spend_hash` references the live parked spend on the
     /// bridging EA.
     BrSpendCreated,
     /// S4 landed; the bridging `execute_rave` has consumed the parked spend.
-    /// Terminal for the pipeline — the row is simultaneously marked
-    /// `state='succeeded'`.
+    /// Ends a lock row, which is `succeeded` with it.
     BrRaveExecuted,
+    /// Recorded before S4's `execute_rave` is called with the withdrawal, so a
+    /// lost reply still leaves a row. No RAVE is seen yet to take its spend.
+    Sent,
+    /// S4 took the withdrawal; `br_rave_hash` is its RAVE, which the bridging
+    /// agent has yet to receipt.
+    Paid,
+    /// S5 landed; `receipt_hash` is the bridging agent's receipt of that RAVE.
+    /// Eligible for S1.
+    Collected,
 }
 
 impl std::fmt::Display for WorkStep {
@@ -101,6 +107,9 @@ impl std::fmt::Display for WorkStep {
             WorkStep::ClRaveExecuted => "cl_rave_executed",
             WorkStep::BrSpendCreated => "br_spend_created",
             WorkStep::BrRaveExecuted => "br_rave_executed",
+            WorkStep::Sent => "sent",
+            WorkStep::Paid => "paid",
+            WorkStep::Collected => "collected",
         };
         write!(f, "{}", v)
     }
@@ -116,6 +125,9 @@ impl std::str::FromStr for WorkStep {
             "cl_rave_executed" => Ok(Self::ClRaveExecuted),
             "br_spend_created" => Ok(Self::BrSpendCreated),
             "br_rave_executed" => Ok(Self::BrRaveExecuted),
+            "sent" => Ok(Self::Sent),
+            "paid" => Ok(Self::Paid),
+            "collected" => Ok(Self::Collected),
             _ => Err(format!("Unknown step: {}", s)),
         }
     }
@@ -148,6 +160,17 @@ pub struct WorkItem {
     pub cl_ea_id: Option<String>,
     /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
     pub br_ea_id: Option<String>,
+    pub receipt_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalPayload {
+    pub spend: String,
+    /// The bridging agreement the spend is parked on.
+    pub agreement: String,
+    /// The HOT its coupon pays, as `Payout::new` accepted it.
+    pub amount: String,
+    pub withdrawer: String,
 }
 
 impl WorkItem {
@@ -160,6 +183,10 @@ impl WorkItem {
             _ => return None,
         };
         Some((link.as_deref()?, agreement.as_deref()))
+    }
+
+    pub fn withdrawal(&self) -> Result<WithdrawalPayload> {
+        Ok(WithdrawalPayload::deserialize(&self.payload_json)?)
     }
 }
 
@@ -682,8 +709,11 @@ impl StateStore {
     pub fn clear_non_in_progress(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
-            "DELETE FROM work_items
-             WHERE state IN ('succeeded', 'failed')",
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state IN ('succeeded', 'failed') AND NOT {}",
+                failed_withdrawals()
+            ),
             [],
         )?;
         Ok(deleted)
@@ -692,21 +722,16 @@ impl StateStore {
     pub fn clear_all(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
-            "DELETE FROM work_items WHERE state NOT IN ('screening', 'held', 'blocked')",
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state NOT IN ('screening', 'held', 'blocked') AND NOT {}",
+                failed_withdrawals()
+            ),
             [],
         )?;
         Ok(deleted)
     }
 
-    /// Delete terminal (`succeeded` / `failed`) `work_items` rows
-    /// whose `updated_at` is older than the supplied per-state age
-    /// windows. Called both by the background retention task and by
-    /// the CLI `Clear --older-than-s` path, so the SQL + mutex-hold
-    /// behavior lives exactly once.
-    ///
-    /// Uses two independent DELETEs — one per state — so a caller
-    /// can set very different windows for succeeded vs failed rows
-    /// without the SQL having to understand the policy.
     pub fn prune_terminal_older_than(
         &self,
         succeeded_max_age_s: u64,
@@ -720,9 +745,12 @@ impl StateStore {
             params![succeeded_max_age_s as i64],
         )?;
         let failed_deleted = conn.execute(
-            "DELETE FROM work_items
-             WHERE state = 'failed'
-               AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state = 'failed' AND NOT {}
+                   AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
+                failed_withdrawals()
+            ),
             params![failed_max_age_s as i64],
         )?;
         Ok(PruneStats {
@@ -799,12 +827,18 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Item IDs of the rows whose state or step `list_flow` reads as another.
-    pub fn unreadable_rows(&self, flow: &str) -> Result<Vec<String>> {
+    pub fn list_all(&self) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT item_id, state, step FROM work_items WHERE flow = ?1")?;
-        let rows = stmt.query_map(params![flow], |row| {
+        let mut stmt = conn.prepare(&format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items"))?;
+        let rows = stmt.query_map([], row_to_work_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Item IDs of the rows whose state or step `list_all` reads as another.
+    pub fn unreadable_rows(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare("SELECT item_id, state, step FROM work_items")?;
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -854,24 +888,20 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='cl_rave_executed'`. `cl_rave_hash` is optional
-    /// — we record it when we observed the RAVE's returned ActionHash
-    /// directly, and leave it NULL when the reconciler inferred the advance
-    /// from the parked link no longer being live.
     pub fn advance_to_cl_rave_executed(&self, id: i64, cl_rave_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "UPDATE work_items
              SET step='cl_rave_executed',
                  cl_rave_hash=?2,
-                 state='queued',
+                 state=CASE flow WHEN ?3 THEN 'succeeded' ELSE 'queued' END,
                  attempts=0,
                  error_class=NULL,
                  last_error=NULL,
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
-            params![id, cl_rave_hash],
+            params![id, cl_rave_hash, WITHDRAWAL_FLOW],
         )?;
         Ok(())
     }
@@ -915,9 +945,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='br_rave_executed'` and simultaneously mark it
-    /// `state='succeeded'` — the bridging RAVE is the terminal stage of the
-    /// lock pipeline.
     pub fn advance_to_br_rave_executed(&self, id: i64, br_rave_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -936,6 +963,74 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn send_withdrawal(&self, withdrawal: &WithdrawalPayload) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO work_items
+                (flow, task_type, item_id, idempotency_key, payload_json, state, step)
+             VALUES (?1, 'reduce_credit_limit', ?2, ?2, ?3, 'queued', 'sent')",
+            params![
+                WITHDRAWAL_FLOW,
+                withdrawal_item_id(&withdrawal.spend),
+                serde_json::to_string(withdrawal)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn withdrawal(&self, spend: &str) -> Result<Option<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE idempotency_key = ?1"),
+            params![withdrawal_item_id(spend)],
+            row_to_work_item,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn advance_to_paid(&self, id: i64, rave: &str) -> Result<bool> {
+        self.advance_withdrawal(id, WorkStep::Sent, WorkStep::Paid, "br_rave_hash", rave)
+    }
+
+    pub fn advance_to_collected(&self, id: i64, receipt: &str) -> Result<bool> {
+        self.advance_withdrawal(
+            id,
+            WorkStep::Paid,
+            WorkStep::Collected,
+            "receipt_hash",
+            receipt,
+        )
+    }
+
+    /// Whether the row moved: one not pending at `from` stays as it is.
+    fn advance_withdrawal(
+        &self,
+        id: i64,
+        from: WorkStep,
+        to: WorkStep,
+        column: &str,
+        hash: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let moved = conn.execute(
+            &format!(
+                "UPDATE work_items
+                 SET step=?3,
+                     {column}=?4,
+                     state='queued',
+                     attempts=0,
+                     error_class=NULL,
+                     last_error=NULL,
+                     next_retry_at=NULL,
+                     updated_at=strftime('%s', 'now')
+                 WHERE id=?1 AND step=?2 AND state IN ('queued', 'in_flight')"
+            ),
+            params![id, from.to_string(), to.to_string(), hash],
+        )?;
+        Ok(moved == 1)
+    }
+
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         fail_permanently(&conn, id, error, None)?;
@@ -944,10 +1039,10 @@ impl StateStore {
 
     /// All or none, each row as it was read: one whose state or step another
     /// writer changed since, or deleted, fails the whole mark.
-    pub fn mark_all_failed_permanent(&self, rows: &[&WorkItem], error: &str) -> Result<()> {
+    pub fn mark_all_failed_permanent(&self, rows: &[(&WorkItem, String)]) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
-        for row in rows {
+        for (row, error) in rows {
             anyhow::ensure!(
                 fail_permanently(&tx, row.id, error, Some((&row.state, &row.step)))? == 1,
                 "row {} is no longer {} at {}, or no longer in the database, so no row is marked",
@@ -960,40 +1055,59 @@ impl StateStore {
         Ok(())
     }
 
-    /// Promote any `queued` rows that have already exhausted their retry
-    /// budget to `failed` with `error_class='permanent'`. Intended to be
-    /// called at the top of each cycle so a broken lock cannot loop
-    /// forever in a long-running session.
-    pub fn fail_exhausted_queued(&self, flow: &str) -> Result<usize> {
+    pub fn fail_exhausted_queued(&self, flow: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let updated = conn.execute(
+        let mut stmt = conn.prepare(
             "UPDATE work_items
              SET state='failed',
                  error_class='permanent',
                  last_error = coalesce(last_error || '; ', '') || 'Exceeded max attempts in-cycle',
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
-             WHERE flow=?1 AND state='queued' AND attempts >= max_attempts",
-            params![flow],
+             WHERE flow=?1 AND state='queued' AND attempts >= max_attempts
+             RETURNING item_id",
+        )?;
+        let failed = stmt.query_map(params![flow], |row| row.get(0))?;
+        failed.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn reset_in_flight_to_queued(&self, error: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight'"),
+            params![error],
         )?;
         Ok(updated)
     }
 
-    pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let updated = conn.execute(
-            "UPDATE work_items
-             SET state='queued',
-                 attempts=attempts+1,
-                 error_class='transient',
-                 last_error=?2,
-                 last_attempt_at=strftime('%s', 'now'),
-                 updated_at=strftime('%s', 'now')
-             WHERE state='in_flight' AND flow=?1",
-            params![flow, error],
-        )?;
-        Ok(updated)
+    pub fn requeue_in_flight(&self, ids: &[i64], error: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND id=?2"),
+                params![error, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
+}
+
+/// While a failed withdrawal row exists, S4 gives its spend no coupon, so no delete takes one.
+fn failed_withdrawals() -> String {
+    format!("(state = 'failed' AND flow = '{WITHDRAWAL_FLOW}')")
+}
+
+const REQUEUED: &str = "state='queued',
+     attempts=attempts+1,
+     error_class='transient',
+     last_error=?1,
+     last_attempt_at=strftime('%s', 'now'),
+     updated_at=strftime('%s', 'now')";
+
+fn withdrawal_item_id(spend: &str) -> String {
+    format!("{WITHDRAWAL_FLOW}:{spend}")
 }
 
 fn forget_unconfirmed_locks(conn: &Connection) -> Result<()> {
@@ -1104,6 +1218,7 @@ impl StateStore {
             ("br_rave_hash", "TEXT"),
             ("cl_ea_id", "TEXT"),
             ("br_ea_id", "TEXT"),
+            ("receipt_hash", "TEXT"),
         ] {
             if !cols.iter().any(|c| c == column) {
                 conn.execute(
@@ -1143,6 +1258,7 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         br_rave_hash: row.get(19)?,
         cl_ea_id: row.get(20)?,
         br_ea_id: row.get(21)?,
+        receipt_hash: row.get(22)?,
     })
 }
 
@@ -1277,6 +1393,20 @@ mod tests {
         .unwrap();
     }
 
+    fn failed_withdrawal(store: &StateStore, spend: &str) -> String {
+        store
+            .send_withdrawal(&WithdrawalPayload {
+                spend: spend.to_string(),
+                agreement: "uhCkkAgreement".to_string(),
+                amount: "5".to_string(),
+                withdrawer: "uhCAkWithdrawer".to_string(),
+            })
+            .unwrap();
+        let id = store.withdrawal(spend).unwrap().unwrap().id;
+        store.mark_failed_permanent(id, "resolve by hand").unwrap();
+        spend.to_string()
+    }
+
     fn insert_work_item_with_attempts(
         path: &str,
         item_id: &str,
@@ -1354,7 +1484,7 @@ mod tests {
                 .unwrap();
             assert_eq!(queued.len(), 1);
             assert_eq!(queued[0].attempts, 7, "a stop is not an attempt");
-            assert_eq!(store.fail_exhausted_queued("lock").unwrap(), 0);
+            assert!(store.fail_exhausted_queued("lock").unwrap().is_empty());
             store.mark_in_flight(queued[0].id).unwrap();
         }
         let store = StateStore::open(&path).unwrap();
@@ -1382,7 +1512,7 @@ mod tests {
         store.mark_in_flight(item.id).unwrap();
 
         let affected = store
-            .reset_in_flight_to_queued("lock", "simulated cycle error")
+            .reset_in_flight_to_queued("simulated cycle error")
             .unwrap();
         assert_eq!(affected, 1, "one in_flight row should have been reset");
 
@@ -1399,6 +1529,41 @@ mod tests {
             Some("simulated cycle error"),
             "last_error should carry the cycle error context"
         );
+    }
+
+    #[test]
+    fn requeue_in_flight_requeues_only_the_named_rows_still_in_flight() {
+        let store = StateStore::open(test_db_path("requeue-in-flight")).unwrap();
+        let ids: Vec<i64> = ["1", "2", "3"]
+            .iter()
+            .map(|lock| {
+                let item_id = format!("lock:{lock}");
+                store
+                    .enqueue_queued(
+                        "lock",
+                        "create_parked_link",
+                        &item_id,
+                        &format!("{item_id}:create_parked_link"),
+                        &serde_json::json!({ "lock_id": lock }),
+                    )
+                    .unwrap();
+                let item = store.claim_next(Some("lock")).unwrap().unwrap();
+                store.mark_in_flight(item.id).unwrap();
+                item.id
+            })
+            .collect();
+        store.mark_failed_permanent(ids[1], "in transit").unwrap();
+
+        store.requeue_in_flight(&ids[..2], "refused").unwrap();
+
+        let rows = store.list_flow("lock").unwrap();
+        let seen = |item_id: &str| {
+            let row = rows.iter().find(|row| row.item_id == item_id).unwrap();
+            (row.state.clone(), row.attempts, row.last_error.as_deref())
+        };
+        assert_eq!(seen("lock:1"), (WorkState::Queued, 2, Some("refused")));
+        assert_eq!(seen("lock:2"), (WorkState::Failed, 1, Some("in transit")));
+        assert_eq!(seen("lock:3"), (WorkState::InFlight, 1, None));
     }
 
     #[test]
@@ -1468,8 +1633,13 @@ mod tests {
         insert_work_item_with_attempts(&path, "lock:equal-over", WorkState::Queued, 9, 8);
         insert_work_item_with_attempts(&path, "lock:under", WorkState::Queued, 3, 8);
 
-        let promoted = store.fail_exhausted_queued("lock").unwrap();
-        assert_eq!(promoted, 2, "both at-cap and over-cap rows should promote");
+        let mut promoted = store.fail_exhausted_queued("lock").unwrap();
+        promoted.sort();
+        assert_eq!(
+            promoted,
+            ["lock:equal-over", "lock:over"],
+            "both at-cap and over-cap rows should promote"
+        );
 
         let failed = store
             .list_work_items("lock", WorkState::Failed, 10)
@@ -1507,8 +1677,8 @@ mod tests {
         insert_work_item_with_attempts(&path, "lock:failed", WorkState::Failed, 8, 8);
 
         let promoted = store.fail_exhausted_queued("lock").unwrap();
-        assert_eq!(
-            promoted, 0,
+        assert!(
+            promoted.is_empty(),
             "only queued rows are in scope; other states must not be touched"
         );
 
@@ -1672,9 +1842,11 @@ mod tests {
         insert_work_item_with_state(&path, "lock:inflight", WorkState::InFlight);
         insert_work_item_with_state(&path, "lock:succeeded", WorkState::Succeeded);
         insert_work_item_with_state(&path, "lock:failed", WorkState::Failed);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailed");
 
         let deleted = store.clear_non_in_progress().unwrap();
         assert_eq!(deleted, 2);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
@@ -1694,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked() {
+    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked_and_failed_withdrawals() {
         let path = test_db_path("clear-all");
         let store = StateStore::open(&path).unwrap();
 
@@ -1704,9 +1876,11 @@ mod tests {
         insert_work_item_with_state(&path, "lock:screening", WorkState::Screening);
         insert_work_item_with_state(&path, "lock:held", WorkState::Held);
         insert_work_item_with_state(&path, "lock:blocked", WorkState::Blocked);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailed");
 
         let deleted = store.clear_all().unwrap();
         assert_eq!(deleted, 3);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
@@ -1723,11 +1897,6 @@ mod tests {
 
     #[test]
     fn prune_terminal_older_than_respects_per_state_windows_and_leaves_non_terminals_alone() {
-        // Covers the three invariants the retention task relies on:
-        //   1. `queued`/`in_flight` rows are never touched, regardless of age.
-        //   2. Young terminal rows survive (within the configured window).
-        //   3. Stale terminal rows get deleted, and the per-state counts
-        //      returned in `PruneStats` match the actual deletes.
         let path = test_db_path("prune-terminal");
         let store = StateStore::open(&path).unwrap();
 
@@ -1737,21 +1906,17 @@ mod tests {
         insert_work_item_with_state(&path, "prune:succ-old", WorkState::Succeeded);
         insert_work_item_with_state(&path, "prune:fail-young", WorkState::Failed);
         insert_work_item_with_state(&path, "prune:fail-old", WorkState::Failed);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailedOld");
 
-        // Backdate the "old" rows by rewriting `updated_at`. 1M seconds
-        // (~11.6 days) puts them well beyond both 7d (succeeded) and
-        // the 30d failed window used in the test call below.
+        // About 11.6 days: past the 7 day succeeded window, inside the 30 day
+        // failed one.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE work_items SET updated_at = CAST(strftime('%s','now') AS INTEGER) - 1000000
-             WHERE item_id IN ('prune:succ-old', 'prune:fail-old')",
+             WHERE item_id IN ('prune:succ-old', 'prune:fail-old') OR flow = 'withdrawal'",
             [],
         )
         .unwrap();
-        // Intentionally backdate `prune:fail-old` *less* than the
-        // failed window (30d = 2_592_000s). 1_000_000s is well under
-        // that, so the failed-old row should survive the first call
-        // and only get deleted when we tighten the failed window.
         drop(conn);
 
         let first = store
@@ -1761,13 +1926,12 @@ mod tests {
         assert_eq!(first.failed_deleted, 0);
         assert_eq!(first.total(), 1);
 
-        // Tighten the failed window to half a day; now the backdated
-        // failed row (~11.6d old) is eligible and should drop.
         let second = store
             .prune_terminal_older_than(7 * 24 * 60 * 60, 43_200)
             .unwrap();
         assert_eq!(second.succeeded_deleted, 0);
         assert_eq!(second.failed_deleted, 1);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
@@ -2162,6 +2326,95 @@ mod tests {
         assert!(row.cl_rave_hash.is_none());
         assert!(row.br_spend_hash.is_none());
         assert!(row.br_rave_hash.is_none());
+        assert!(row.receipt_hash.is_none());
+    }
+
+    #[test]
+    fn a_withdrawal_row_is_recorded_once_and_moves_only_from_the_step_it_waits_at() {
+        let store = StateStore::open(test_db_path("withdrawal-row")).unwrap();
+        let withdrawal = WithdrawalPayload {
+            spend: "uhCkkSPEND".to_string(),
+            agreement: BR_EA.to_string(),
+            amount: "5".to_string(),
+            withdrawer: "w".to_string(),
+        };
+        assert!(store.withdrawal("uhCkkSPEND").unwrap().is_none());
+        store.send_withdrawal(&withdrawal).unwrap();
+        let rows = store.list_flow(WITHDRAWAL_FLOW).unwrap();
+        let [row] = &rows[..] else {
+            panic!("one row for one spend: {rows:?}");
+        };
+        assert_eq!(
+            (
+                row.item_id.as_str(),
+                &row.state,
+                &row.step,
+                row.br_spend_hash.as_deref(),
+                row.withdrawal().unwrap(),
+            ),
+            (
+                "withdrawal:uhCkkSPEND",
+                &WorkState::Queued,
+                &WorkStep::Sent,
+                None,
+                withdrawal.clone(),
+            )
+        );
+        let id = row.id;
+        let at = || store.withdrawal("uhCkkSPEND").unwrap().unwrap();
+
+        assert!(!store.advance_to_collected(id, "uhCkkEARLY").unwrap());
+        assert_eq!(
+            at().step,
+            WorkStep::Sent,
+            "a row is collected only once paid"
+        );
+        assert!(store.advance_to_paid(id, "uhCkkRAVE").unwrap());
+        assert!(!store.advance_to_paid(id, "uhCkkLATER").unwrap());
+        store.send_withdrawal(&withdrawal).unwrap();
+        let row = at();
+        assert_eq!(
+            (row.id, row.step),
+            (id, WorkStep::Paid),
+            "a spend sent again keeps its row"
+        );
+        assert!(store.advance_to_collected(id, "uhCkkRECEIPT").unwrap());
+        let row = at();
+        assert_eq!(
+            (
+                row.step,
+                row.br_rave_hash.as_deref(),
+                row.receipt_hash.as_deref()
+            ),
+            (WorkStep::Collected, Some("uhCkkRAVE"), Some("uhCkkRECEIPT"))
+        );
+
+        store
+            .advance_to_cl_link_created(id, "uhCkkLINK", CL_EA)
+            .unwrap();
+        store
+            .advance_to_cl_rave_executed(id, Some("uhCkkCL"))
+            .unwrap();
+        let row = at();
+        assert_eq!(
+            (row.state, row.step, row.receipt_hash.as_deref()),
+            (
+                WorkState::Succeeded,
+                WorkStep::ClRaveExecuted,
+                Some("uhCkkRECEIPT")
+            ),
+            "the credit limit's RAVE ends a withdrawal row"
+        );
+
+        let spend = failed_withdrawal(&store, "uhCkkFAILED");
+        let failed = || store.withdrawal(&spend).unwrap().unwrap();
+        assert!(!store.advance_to_paid(failed().id, "uhCkkRAVE").unwrap());
+        let row = failed();
+        assert_eq!(
+            (row.state, row.step),
+            (WorkState::Failed, WorkStep::Sent),
+            "a failed row waits for a person"
+        );
     }
 
     #[test]

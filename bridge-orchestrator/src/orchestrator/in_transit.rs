@@ -5,7 +5,7 @@ use super::{
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
-use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
+use crate::state::{StateStore, WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
 use crate::watchtower_reporter::ReporterState;
 use anyhow::Result;
 use holo_hash::ActionHash;
@@ -16,8 +16,30 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use tracing::info;
 
-const PAID_BY_HAND: &str =
-    "in transit at the old network's close; it is paid by hand on the new network";
+const IN_TRANSIT: &str = "in transit at the old network's close";
+const TAKEN_WITH_ITS_RAVE: &str = "its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done";
+
+fn settled_by_hand(row: &WorkItem) -> String {
+    let left = if row.flow != WITHDRAWAL_FLOW {
+        "it is paid by hand on the new network"
+    } else {
+        match row.step {
+            WorkStep::Sent => {
+                return format!("{IN_TRANSIT}; if a RAVE took its spend, {TAKEN_WITH_ITS_RAVE}")
+            }
+            WorkStep::Paid => TAKEN_WITH_ITS_RAVE,
+            WorkStep::Collected => "its HOT is taken off the credit limit by hand",
+            WorkStep::ClLinkCreated
+            | WorkStep::New
+            | WorkStep::ClRaveExecuted
+            | WorkStep::BrSpendCreated
+            | WorkStep::BrRaveExecuted => {
+                "if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand"
+            }
+        }
+    };
+    format!("{IN_TRANSIT}; {left}")
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -87,12 +109,16 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let rows: Vec<&WorkItem> = self.rows.values().collect();
-        db.mark_all_failed_permanent(&rows, PAID_BY_HAND)?;
-        let items: Vec<&str> = rows.iter().map(|row| row.item_id.as_str()).collect();
+        let rows: Vec<(&WorkItem, String)> = self
+            .rows
+            .values()
+            .map(|row| (row, settled_by_hand(row)))
+            .collect();
+        db.mark_all_failed_permanent(&rows)?;
+        let items: Vec<&str> = rows.iter().map(|(row, _)| row.item_id.as_str()).collect();
         info!(
             event = "bridge.in_transit.marked_failed",
-            "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network: {}",
+            "[bridge/in-transit] marked {} row(s) failed, to be settled by hand: {}",
             items.len(),
             items.join(", ")
         );
@@ -175,22 +201,22 @@ impl BridgeOrchestrator {
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
-        let unreadable = self.db.unreadable_rows("lock")?;
+        let unreadable = self.db.unreadable_rows()?;
         anyhow::ensure!(
             unreadable.is_empty(),
             "rows whose state or step cannot be read: {}",
             unreadable.join(", ")
         );
-        let pending: Vec<(WorkItem, Option<LockKey>)> = self
-            .db
-            .list_flow("lock")?
-            .into_iter()
-            .filter(|row| !matches!(row.state, WorkState::Succeeded | WorkState::Failed))
-            .map(|row| {
-                let lock = self.lock_key(&row);
-                (row, lock)
-            })
-            .collect();
+        let mut pending: Vec<(WorkItem, Option<LockKey>)> = Vec::new();
+        for row in self.db.list_all()? {
+            if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
+                continue;
+            }
+            let lock = (row.flow != WITHDRAWAL_FLOW)
+                .then(|| self.lock_key(&row))
+                .flatten();
+            pending.push((row, lock));
+        }
 
         let mut links = Vec::new();
         let mut carried = HashSet::new();
@@ -265,7 +291,8 @@ impl BridgeOrchestrator {
         let mut unmarked = Vec::new();
         let mut unmatchable = Vec::new();
         for (row, lock) in pending {
-            let in_transit = matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
+            let in_transit = row.flow == WITHDRAWAL_FLOW
+                || matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
                 || matches!(row.state, WorkState::InFlight | WorkState::Claimed);
             if in_transit {
                 listed.push(InTransit::Row {

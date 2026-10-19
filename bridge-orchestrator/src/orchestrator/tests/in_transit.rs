@@ -373,21 +373,27 @@ async fn another_agents_link_and_a_spend_in_another_role_are_not_in_transit() {
 async fn a_row_whose_state_or_step_cannot_be_read_fails_the_check() {
     for (column, garbled) in [("state", "Queued"), ("step", "cl_link_create")] {
         let orch = test_orchestrator("in-transit-garbled");
-        let id = enqueue_lock(&orch, "lock:garbled:1", "0xdd");
-        rusqlite::Connection::open(&orch.cfg.db_path)
-            .unwrap()
-            .execute(
+        let lock = enqueue_lock(&orch, "lock:garbled:1", "0xdd");
+        let spend = parked_withdrawal_tx(0xDE);
+        sent(&orch, &spend);
+        let withdrawal = withdrawal_row(&orch, &spend);
+        let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
+        for id in [lock, withdrawal.id] {
+            db.execute(
                 &format!("UPDATE work_items SET {column} = ?2 WHERE id = ?1"),
                 rusqlite::params![id, garbled],
             )
             .unwrap();
+        }
         let before = snapshot(&orch);
 
         for mark_failed in [false, true] {
             let e = check(&orch, &bridging_conductor(), mark_failed)
                 .await
                 .expect_err("a row it cannot read");
-            assert!(format!("{e:#}").contains("lock:garbled:1"), "{e:#}");
+            for item in ["lock:garbled:1", &withdrawal.item_id] {
+                assert!(format!("{e:#}").contains(item), "{e:#}");
+            }
         }
         assert_eq!(snapshot(&orch), before);
     }
@@ -892,5 +898,96 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
             .count(),
         1,
         "{logged}"
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() {
+    let orch = test_orchestrator("in-transit-withdrawal-rows");
+    let spends = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55].map(parked_withdrawal_tx);
+    for spend in &spends {
+        sent(&orch, spend);
+    }
+    let [sent_, paid, collected, linked, succeeded, failed] =
+        spends.each_ref().map(|spend| withdrawal_row(&orch, spend));
+    let rave = action_hash(0x40).to_string();
+    for row in [&paid, &collected] {
+        orch.db.advance_to_paid(row.id, &rave).unwrap();
+    }
+    orch.db
+        .advance_to_collected(collected.id, &action_hash(0x41).to_string())
+        .unwrap();
+    let link = parked_tx(
+        0x42,
+        &[json!({ "method": "withdraw", "spend": spends[3].id.to_string() })],
+    );
+    for row in [&linked, &succeeded] {
+        orch.db
+            .advance_to_cl_link_created(row.id, &link.id.to_string(), &ea(CL_EA))
+            .unwrap();
+    }
+    orch.db
+        .advance_to_cl_rave_executed(succeeded.id, None)
+        .unwrap();
+    orch.db
+        .mark_failed_permanent(failed.id, "resolved by a person")
+        .unwrap();
+    let lock = enqueue_lock(&orch, "lock:beside-withdrawals:1", "0xe0");
+    set_state(&orch, lock, "in_flight");
+    let conductor = bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&link));
+    let listed = |row: &WorkItem, step: &str, link: Option<&Transaction>| {
+        json!({
+            "kind": "row",
+            "item_id": row.item_id,
+            "lock_id": null,
+            "state": "queued",
+            "step": step,
+            "link": link.map(|link| link.id.to_string()),
+        })
+    };
+    let expected = [
+        listed(&sent_, "sent", None),
+        listed(&paid, "paid", None),
+        listed(&collected, "collected", None),
+        listed(&linked, "cl_link_created", Some(&link)),
+        listed_link(CL_EA, &link, &[]),
+        listed_row_in("in_flight", "lock:beside-withdrawals:1", "new", None),
+    ];
+
+    let checked = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked
+        .exit
+        .expect_err("their HOT is not off the credit limit");
+
+    let checked = check(&orch, &conductor, true).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked.exit.unwrap();
+    let by_step = [
+        "in transit at the old network's close; if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
+        "in transit at the old network's close; its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
+        "in transit at the old network's close; its HOT is taken off the credit limit by hand",
+        "in transit at the old network's close; if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",
+    ];
+    for (spend, last_error) in spends[..4].iter().zip(by_step) {
+        let row = withdrawal_row(&orch, spend);
+        assert_eq!(
+            (row.state, row.last_error.as_deref()),
+            (WorkState::Failed, Some(last_error)),
+            "{}",
+            row.item_id
+        );
+    }
+    assert_eq!(
+        failed_row(&orch, lock).last_error.as_deref(),
+        Some(PAID_BY_HAND)
+    );
+    assert_eq!(
+        withdrawal_row(&orch, &spends[4]).state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        withdrawal_row(&orch, &spends[5]).last_error.as_deref(),
+        Some("resolved by a person")
     );
 }
