@@ -76,7 +76,7 @@ pub struct ClaimOrder {
     pub input_token: Address,
 }
 
-/// A coupon's signer, its nine context words and the signature over them.
+/// A coupon's signer, its ten context words and the signature over them.
 #[derive(Debug, Clone)]
 pub struct SignedCoupon {
     pub signer: Address,
@@ -84,7 +84,7 @@ pub struct SignedCoupon {
     pub signature: Vec<u8>,
 }
 
-/// What the signer is asked to sign: the coupon's nine words and their digest,
+/// What the signer is asked to sign: the coupon's ten words and their digest,
 /// and the withdrawal it pays, which a Safe owner's signer service checks on
 /// Holochain before it signs. The startup probe pays no withdrawal.
 #[derive(Debug, Clone)]
@@ -133,6 +133,9 @@ impl CouponKey for PrivateKeySigner {
 pub struct CouponSigner {
     key: Box<dyn CouponKey>,
     order: ClaimOrder,
+    /// The chain the coupons claim on, their word 9: the claim order refuses a
+    /// coupon for any other chain.
+    chain_id: u64,
     expiry_seconds: NonZeroU64,
 }
 
@@ -252,6 +255,7 @@ impl CouponSigner {
             (Some(order), Some(expiry_seconds), Some(key)) if faults.is_empty() => Ok(Self {
                 key,
                 order,
+                chain_id: network.chain_id(),
                 expiry_seconds,
             }),
             _ => anyhow::bail!("{}", faults.join("; ")),
@@ -260,6 +264,11 @@ impl CouponSigner {
 
     pub fn order(&self) -> &ClaimOrder {
         &self.order
+    }
+
+    /// The chain the coupons claim on, their word 9.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     pub fn address(&self) -> Address {
@@ -332,6 +341,7 @@ impl CouponSigner {
             pad_address(order.token),
             order.vault_id,
             nonce,
+            chain_word(self.chain_id),
         ];
         let request = SignRequest {
             digest: context_digest(&context),
@@ -505,12 +515,19 @@ impl CouponSigner {
         Self::for_order(key, ClaimOrder::vector())
     }
 
+    /// A signer for `order` on chain 1, the test vector's.
     pub fn for_order(key: impl CouponKey + 'static, order: ClaimOrder) -> Self {
         Self {
             key: Box::new(key),
             order,
+            chain_id: 1,
             expiry_seconds: DEFAULT_EXPIRY_SECONDS,
         }
+    }
+
+    /// This signer's coupons for chain `chain_id`.
+    pub fn on_chain(self, chain_id: u64) -> Self {
+        Self { chain_id, ..self }
     }
 }
 
@@ -553,6 +570,12 @@ fn parsed<T: FromStr>(
 /// nonce and at most one of them can be claimed.
 fn withdrawal_nonce(withdrawal: &ActionHash) -> B256 {
     keccak256(withdrawal.get_raw_39())
+}
+
+/// Word 9 of a coupon: the chain ID as an integer, which is a float of
+/// exponent 0, as the claim expression's `chain-id()` pushes it.
+pub(crate) fn chain_word(chain_id: u64) -> B256 {
+    B256::from(U256::from(chain_id))
 }
 
 fn pad_address(addr: Address) -> B256 {
@@ -614,7 +637,7 @@ mod tests {
     /// Context field 8, after the signer and signature.
     fn nonce(coupon: &str) -> &str {
         let fields: Vec<&str> = coupon.split(',').collect();
-        assert_eq!(fields.len(), 11, "coupon is signer,signature,c0..c8");
+        assert_eq!(fields.len(), 12, "coupon is signer,signature,c0..c9");
         fields[10]
     }
 
@@ -726,13 +749,13 @@ mod tests {
             .collect();
         assert_eq!(
             context_digest(&words),
-            "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
+            "0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60"
                 .parse::<B256>()
                 .unwrap()
         );
     }
 
-    const GOLDEN_COUPON: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc,0x452449c0ce920f0e30878832f19e55a7ad3c173dfb7074cef53cc1cc1db54cd43df1a26a92e096b59ba413f28cd2c0c1f4aa6276b56ea14eb612c07fcd76eb191b,97433442488726861213578988847752201310395502865,115792088752037155414859468704681636286916632540171964433728779348048145154048,1750604800,42941365433660945573526868378572896801276519612010928011051331832534249141753,1300945060633283894583661816534861012306758682838,319615586448914156470689800627502155326116515104,619044111217614189527117770386815914092009957090,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631";
+    const GOLDEN_COUPON: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc,0xa8611a5da9de9de13c5ec0fb267521eae2967b57e0b0b260f6380268e85fe5b03ada25c3de627f4083708275505a21e0c0e4ebd79944cff6ec674f2403d3a5dd1c,97433442488726861213578988847752201310395502865,115792088752037155414859468704681636286916632540171964433728779348048145154048,1750604800,42941365433660945573526868378572896801276519612010928011051331832534249141753,1300945060633283894583661816534861012306758682838,319615586448914156470689800627502155326116515104,619044111217614189527117770386815914092009957090,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631,1";
 
     struct ContractSigner;
 
@@ -835,7 +858,44 @@ mod tests {
 
         assert_eq!(signer.order(), &ClaimOrder::vector());
         assert_eq!(signer.key.address(), TEST_SIGNER);
+        assert_eq!(signer.chain_id(), 84_532);
         assert_eq!(signer.expiry_seconds, DEFAULT_EXPIRY_SECONDS);
+    }
+
+    /// Word 9 is the chain of the signer's NETWORK, an integer, in every coupon
+    /// and in the startup probe: the claim order checks it against chain-id().
+    #[tokio::test]
+    async fn every_coupon_names_the_chain_of_its_network() {
+        for (network, chain_id, settings) in [
+            (Network::BaseSepolia, 84_532u64, settings_with(&[])),
+            (
+                Network::Mainnet,
+                1,
+                settings_with(&[
+                    ("SIGNER_PRIVATE_KEY", Some(MAINNET_KEY)),
+                    (
+                        "CLAIM_SIGNER",
+                        Some("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+                    ),
+                ]),
+            ),
+        ] {
+            let signer = CouponSigner::from_settings(network, settings).unwrap();
+            let word = format!("{:#x}", U256::from(chain_id));
+
+            let coupon = coupon(&signer, &ActionHash::from_raw_32(vec![7; 32]), NOW).await;
+            let probe = signer.probe_coupon().await.unwrap();
+
+            assert_eq!(
+                coupon.split(',').nth(11),
+                Some(chain_id.to_string().as_str())
+            );
+            assert_eq!(probe.context.len(), 10);
+            assert_eq!(
+                format!("{:#x}", U256::from_be_bytes(probe.context[9].0)),
+                word
+            );
+        }
     }
 
     const MAINNET_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";

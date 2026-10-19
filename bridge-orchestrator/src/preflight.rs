@@ -913,8 +913,8 @@ mod tests {
         }
 
         /// takeOrders4 as RaindexV6 runs the claim order: the coupon's signature
-        /// first, then the expression's signer check, its nonce check last, then
-        /// the vault's balance.
+        /// first, then the expression's signer check, its chain ID check, its
+        /// nonce check last, then the vault's balance.
         fn take_orders(&self, input: &[u8]) -> Answer {
             let config = IRaindexV6::takeOrders4Call::abi_decode(input, true)
                 .unwrap()
@@ -960,6 +960,15 @@ mod tests {
                 return reverted(
                     Revert {
                         reason: "Wrong signer".to_string(),
+                    }
+                    .abi_encode(),
+                );
+            }
+            assert_eq!(coupon.context.len(), 10, "a coupon is ten words");
+            if coupon.context[9] != crate::signer::chain_word(self.chain_id) {
+                return reverted(
+                    Revert {
+                        reason: "Wrong chain id".to_string(),
                     }
                     .abi_encode(),
                 );
@@ -1073,7 +1082,12 @@ mod tests {
     }
 
     async fn check_against(network: Network, chain: Chain, order: &ClaimOrder) -> Result<()> {
-        check_with(network, chain, &signer_for(order.clone())).await
+        check_with(
+            network,
+            chain,
+            &signer_for(order.clone()).on_chain(network.chain_id()),
+        )
+        .await
     }
 
     async fn check_with(network: Network, chain: Chain, signer: &CouponSigner) -> Result<()> {
@@ -1142,7 +1156,7 @@ mod tests {
             network,
             &url,
             VAULT,
-            &CouponSigner::for_order(owners, order),
+            &CouponSigner::for_order(owners, order).on_chain(network.chain_id()),
         )
         .await
     }
@@ -1927,7 +1941,7 @@ mod tests {
 
     /// The startup takes "Nonce already used" as the claim order accepting its
     /// signer only because the nonce is the expression's last check, after the
-    /// signer and every other word of the coupon.
+    /// signer and every other word of the coupon, the chain ID among them.
     #[test]
     fn the_nonce_is_the_claim_orders_last_check() {
         let rain = include_str!("../../src/holo-claim.rain");
@@ -1942,11 +1956,37 @@ mod tests {
             .filter(|line| line.starts_with(":ensure("))
             .collect();
 
-        assert_eq!(ensures.len(), 9, "{ensures:#?}");
+        assert_eq!(ensures.len(), 10, "{ensures:#?}");
         assert!(ensures[0].ends_with("\"Wrong signer\"),"), "{ensures:#?}");
         assert!(
-            ensures[8].ends_with(&format!("\"{NONCE_USED}\"),")),
+            ensures[..9]
+                .iter()
+                .any(|e| e.contains("signed-context<0 9>() chain-id()")),
             "{ensures:#?}"
+        );
+        assert!(
+            ensures[9].ends_with(&format!("\"{NONCE_USED}\"),")),
+            "{ensures:#?}"
+        );
+    }
+
+    /// The probe names the signer's chain, as the claim order checks: a signer
+    /// whose coupons named another chain would be refused at startup.
+    #[tokio::test]
+    async fn refuses_a_signer_whose_coupons_name_another_chain() {
+        let wrong = signer_for(order()).on_chain(Network::BaseSepolia.chain_id());
+
+        assert_eq!(
+            format!(
+                "{:#}",
+                check_with(Network::Mainnet, Chain::of(Network::Mainnet), &wrong)
+                    .await
+                    .expect_err("the check passed")
+            ),
+            format!(
+                "the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {} with error 0x08c379a0",
+                key().address()
+            )
         );
     }
 
@@ -2071,11 +2111,12 @@ mod tests {
             "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
             "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
             "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
         ]
         .iter()
         .map(|word| word.parse().unwrap())
         .collect();
-        let signature = hex::decode("f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b").unwrap();
+        let signature = hex::decode("2539526bd71f08ca5ee37e55a6ce55588b0c8cc32dbe2725be220cdebf664fd16040155f78f326e5688350772d23dc2be231e2f57c189b05f3dc6449e8a55fe11b").unwrap();
         let coupon = SignedCoupon {
             signer,
             context: words,
@@ -2089,7 +2130,7 @@ mod tests {
 
         assert_eq!(
             keccak256(&calldata),
-            "0x9c90a13c518aa17629ca92bb5947f54e0fcfb1c0ef65376c17d8ea02e7763522"
+            "0xaa93b41d8e3562cc4ef3ce7d59ca511855a66fbbf546dc68908d56b907f093c9"
                 .parse::<B256>()
                 .unwrap()
         );

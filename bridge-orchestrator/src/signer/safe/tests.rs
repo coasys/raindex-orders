@@ -36,13 +36,13 @@ pub(crate) fn owner(i: usize) -> Address {
 /// the coupon vector's digest.
 #[test]
 fn the_safe_message_hash_is_what_the_fallback_handler_computes() {
-    let digest: B256 = "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
+    let digest: B256 = "0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60"
         .parse()
         .unwrap();
 
     assert_eq!(
         safe_message_hash(1, SAFE, &digest),
-        "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+        "0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe"
             .parse::<B256>()
             .unwrap()
     );
@@ -351,7 +351,7 @@ fn the_owners_asked_are_two_to_twenty_and_none_twice() {
 }
 
 /// The service is sent the Safe, the chain, its owner, the withdrawal, the
-/// nine words, their digest and their SafeMessage hash, and the coupon carries
+/// ten words, their digest and their SafeMessage hash, and the coupon carries
 /// the owners' signatures that come back.
 #[tokio::test]
 async fn a_signer_service_is_sent_the_coupon_and_answers_its_owners_signature() {
@@ -969,12 +969,18 @@ async fn the_worked_example_in_the_signer_service_doc() {
         "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
         "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
         "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
     ];
     let context: Vec<B256> = words.iter().map(|w| w.parse().unwrap()).collect();
     assert_eq!(
         context[8],
         keccak256(withdrawal().get_raw_39()),
         "the nonce is keccak256 of the withdrawal's 39 bytes"
+    );
+    assert_eq!(
+        context[9],
+        crate::signer::chain_word(1),
+        "word 9 is the chain, mainnet"
     );
     assert_eq!(
         context[1],
@@ -1016,20 +1022,21 @@ async fn the_worked_example_in_the_signer_service_doc() {
                 "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
                 "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
                 "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
-                "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77"
+                "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
               ],
-              "couponDigest": "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f",
-              "safeMessageHash": "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+              "couponDigest": "0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60",
+              "safeMessageHash": "0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe"
             }"#
         )
         .unwrap()
     );
-    let hash: B256 = "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+    let hash: B256 = "0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe"
         .parse()
         .unwrap();
     assert_eq!(
         format!("0x{}", hex::encode(typed_data_signature(&hash, &owner_key(0)))),
-        "0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c"
+        "0x2400e7ddd4b737971e696dbfc5f5f9f6516d15980925ee2e38cb2b6a7be87dfb0fe177ede6ba7a45519c44841019e1f2357988698c43808dbe48cd8d53e170bc1b"
     );
 }
 
@@ -1156,7 +1163,7 @@ async fn recording_service(key: PrivateKeySigner) -> FakeService {
 /// The request for `withdrawal()` under the claim order whose hash is 32
 /// bytes of `order`.
 fn request_for_order(order: u8) -> SignRequest {
-    let mut context: Vec<B256> = (0u8..9).map(B256::with_last_byte).collect();
+    let mut context: Vec<B256> = (0u8..10).map(B256::with_last_byte).collect();
     context[3] = B256::repeat_byte(order);
     SignRequest {
         digest: context_digest(&context),
