@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
 	amountWord,
+	claimsOn,
 	deserializeSignedContext,
 	floatToWei,
 	parseCoupon,
@@ -39,6 +40,27 @@ describe('parseCoupon', () => {
 		expect(coupon.outputVaultId).toBe(
 			'0x0ede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'
 		)
+	})
+
+	it('reads word 9 as the chain the coupon claims on, and a nine-word coupon as naming none', () => {
+		const words = ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+		const coupon = (context: string[]) =>
+			parseCoupon(
+				deserializeSignedContext(
+					['0x8E72b7568738da52ca3DCd9b24E178127A4E7d37', '0x00', ...context].join(',')
+				)
+			)
+
+		const baseSepolia = coupon([...words, '84532'])
+		expect(baseSepolia.chainId).toBe(84532)
+		expect(claimsOn(baseSepolia, 84532)).toBe(true)
+		expect(claimsOn(baseSepolia, 1)).toBe(false)
+		expect(coupon([...words, (2n ** 64n).toString()]).chainId).toBe(-1)
+		const nine = coupon(words)
+		expect(nine.chainId).toBeNull()
+		expect(claimsOn(nine, 1)).toBe(true)
+		expect(() => coupon([...words, '1', '1'])).toThrow('Not a coupon: it has 11 words, not 10')
+		expect(() => coupon(words.slice(1))).toThrow('Not a coupon: it has 8 words, not 10')
 	})
 
 	it.each([

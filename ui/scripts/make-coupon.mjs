@@ -117,7 +117,15 @@ if (expiry <= timestamp) fail(`--expiry ${expiry} has passed: the chain's time i
 const nonce = args.nonce ? BigInt(args.nonce) : BigInt(`0x${randomBytes(8).toString('hex')}`)
 
 const recipient = getAddress(args.recipient)
-const coupon = await signCoupon({ key: TEST_SIGNER_KEY, order, recipient, wei, expiry, nonce })
+const coupon = await signCoupon({
+	key: TEST_SIGNER_KEY,
+	order,
+	recipient,
+	wei,
+	expiry,
+	nonce,
+	chainId
+})
 console.log(
 	`Coupon for ${formatUnits(wei, 18)} mock HOT to ${recipient}, expiring ${new Date(Number(expiry) * 1000).toISOString()}, nonce ${nonce}`
 )

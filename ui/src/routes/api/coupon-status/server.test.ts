@@ -26,6 +26,8 @@ const CLAIM_NAMESPACE = BigInt(
 	)
 )
 const storeKey = (nonce: bigint) => nonce
+/** TEST_SIGNER_KEY in src/Constants.sol: the test signer's key, which is public. */
+const TEST_SIGNER_KEY: Hex = '0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd'
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 
 const [A, B, C] = TESTNET_COUPONS
@@ -38,14 +40,14 @@ const EXPIRY_C = 1_776_472_922
 const BLOCK = 10_883_600n
 const BEFORE_ALL = 1_776_400_000
 
-/** The fields of a coupon: signer, signature, then context 0 to 8. */
+/** The fields of a coupon: signer, signature, then context 0 to 9. */
 const fieldsOf = (coupon: string) => coupon.split(',')
 const withFields = (coupon: string, changes: Record<number, string>) => {
 	const fields = fieldsOf(coupon)
 	for (const [i, value] of Object.entries(changes)) fields[Number(i)] = value
 	return fields.join(',')
 }
-/** `coupon` with context field `i` (0 to 8) set to `value`. */
+/** `coupon` with context field `i` (0 to 9) set to `value`. */
 const withContext = (coupon: string, i: number, value: string) =>
 	withFields(coupon, { [i + 2]: value })
 
@@ -64,7 +66,7 @@ function padded(coupon: string, chars: number): string {
 /** `coupon` signed instead by `key`, naming `signer` (default: the claim signer it names). */
 async function resigned(coupon: string, key: Hex, signer = fieldsOf(coupon)[0]) {
 	const context = fieldsOf(coupon).slice(2).map(BigInt)
-	const hash = keccak256(encodePacked(Array<'uint256'>(9).fill('uint256'), context))
+	const hash = keccak256(encodePacked(Array<'uint256'>(context.length).fill('uint256'), context))
 	const signature = await privateKeyToAccount(key).signMessage({ message: { raw: hash } })
 	return withFields(coupon, { 0: signer, 1: signature })
 }
@@ -222,7 +224,7 @@ describe('POST /api/coupon-status', () => {
 
 	it('reads a coupon as long as one can be, every context field 78 digits', async () => {
 		const rpc = fakeRpc(baseSepolia())
-		const longest = padded(A, 886)
+		const longest = padded(A, 965)
 		expect(
 			fieldsOf(longest)
 				.slice(2)
@@ -294,6 +296,26 @@ describe('POST /api/coupon-status', () => {
 		expect((await post({ coupons: [A] })).body.results[0].status).toBe('redeemed')
 	})
 
+	it('answers invalid for a coupon signed for another chain, though its signature holds', async () => {
+		const rpc = fakeRpc(baseSepolia())
+		const mainnet = await resigned(withContext(A, 9, '1'), TEST_SIGNER_KEY)
+
+		const { body } = await post({ coupons: [mainnet] })
+
+		expect(body.results).toEqual([invalid])
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('reads a coupon of nine words, signed before coupons named their chain', async () => {
+		const rpc = fakeRpc(baseSepolia())
+		const nine = await resigned(fieldsOf(A).slice(0, 11).join(','), TEST_SIGNER_KEY)
+
+		const { body } = await post({ coupons: [nine] })
+
+		expect(body.results).toEqual([{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A }])
+		expect(rpc.storeReads).toEqual([[KEY_A]])
+	})
+
 	it.each([
 		['too few fields', fieldsOf(A).slice(0, 10).join(',')],
 		['too many fields', `${A},1`],
@@ -302,12 +324,13 @@ describe('POST /api/coupon-status', () => {
 		['an empty context field', withContext(A, 8, '')],
 		['a context field above uint256', withContext(A, 8, (maxUint256 + 1n).toString())],
 		['a context field of 79 digits', withContext(A, 8, '1775867941'.padStart(79, '0'))],
-		['a coupon longer than any genuine one', `0${padded(A, 886)}`],
+		['a coupon longer than any genuine one', `0${padded(A, 965)}`],
 		['a coupon with a 60 KB context field', withContext(A, 1, '1'.repeat(60 * 1024))],
 		['an expiry past what a JSON number holds exactly', withContext(A, 2, '9007199254740992')],
 		['another order hash', withContext(A, 3, '1')],
 		['another order owner', withContext(A, 4, '1')],
-		['another orderbook', withContext(A, 5, '1')]
+		['another orderbook', withContext(A, 5, '1')],
+		['another chain', withContext(A, 9, '1')]
 	])('answers invalid for %s, and makes no RPC call', async (_, malformed) => {
 		const rpc = fakeRpc(baseSepolia())
 

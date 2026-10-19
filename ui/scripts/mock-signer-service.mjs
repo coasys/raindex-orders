@@ -2,7 +2,8 @@
 // docs/signer-service.md. It is a MOCK: it holds a test key in memory and does
 // none of the Holochain checks a real service must do before it signs. It does
 // the checks that need no Holochain node: the Safe, chain and owner; the claim
-// order's words against the deploy record; the nonce against the withdrawal ID;
+// order's words against the deploy record; word 9 against its chain; the nonce
+// against the withdrawal ID;
 // the startup probe's fixed words; the expiry, within EXPIRY_SECONDS and
 // EXPIRY_TOLERANCE_SECONDS; the hashes, which it computes itself from the words;
 // and the record of the order hash it signed each withdrawal for, which it keeps
@@ -55,6 +56,7 @@ const record = [
 	word(env('TOKEN_ADDRESS')),
 	word(env('VAULT_ID'))
 ]
+const CHAIN_WORD = word(toHex(chainId))
 const PROBE_NONCE = keccak256(stringToHex('bridge-orchestrator startup probe'))
 const ONE_WEI = word('0xffffffee00000000000000000000000000000000000000000000000000000001')
 const MAX_EXPIRY = word(toHex((1n << 223n) - 1n))
@@ -79,15 +81,17 @@ function check(body) {
 	const words = body.context
 	if (
 		!Array.isArray(words) ||
-		words.length !== 9 ||
+		words.length !== 10 ||
 		!words.every(w => /^0x[0-9a-fA-F]{64}$/.test(w))
 	)
-		throw new Refusal(400, 'bad_request', 'context is nine 32-byte hex words')
+		throw new Refusal(400, 'bad_request', 'context is ten 32-byte hex words')
 	const lower = words.map(w => w.toLowerCase())
 	for (let i = 0; i < 5; i++) {
 		if (lower[3 + i] !== record[i])
 			refuse('order_mismatch', `word ${3 + i} is not the deploy record's`)
 	}
+	if (lower[9] !== CHAIN_WORD)
+		refuse('chain_mismatch', `word 9 is not chain ${chainId}, which this service signs for`)
 	if (body.withdrawal === null) {
 		if (
 			lower[0] !== word(safe) ||

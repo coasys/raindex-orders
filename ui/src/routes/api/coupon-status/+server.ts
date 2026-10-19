@@ -234,14 +234,15 @@ async function readText(request: Request): Promise<string | null> {
 }
 
 /**
- * A coupon is `signer,signature,c0..c8` (bridge-orchestrator/src/signer.rs). Null
- * unless it parses, names the claim order and its signer, and carries a signature the
- * orderbook would accept the form of. A key's signature is checked by
+ * A coupon is `signer,signature,c0..c9` (bridge-orchestrator/src/signer.rs), c9 being
+ * the chain it claims on, or `c0..c8` when signed before coupons named their chain.
+ * Null unless it parses, names the claim order, its signer and, with ten words, this
+ * build's chain, and carries a signature the orderbook would accept the form of. A key's signature is checked by
  * signedByClaimSigner, a contract signer's on chain by readChain.
  */
 function parseCoupon(text: string): Coupon | null {
 	const [signer, signature, ...fields] = text.split(',')
-	if (fields.length !== 9) return null
+	if (fields.length !== 9 && fields.length !== 10) return null
 	if (!isAddress(signer, { strict: false }) || !isAddressEqual(signer, CLAIM_ORDER.signer)) {
 		return null
 	}
@@ -251,14 +252,15 @@ function parseCoupon(text: string): Coupon | null {
 
 	const context = fields.map(BigInt)
 	if (context.some(value => value > maxUint256)) return null
-	const [, , expiry, couponOrderHash, owner, couponOrderbook, , , nonce] = context
+	const [, , expiry, couponOrderHash, owner, couponOrderbook, , , nonce, chain] = context
+	if (chain !== undefined && chain !== BigInt(bridge.chain.id)) return null
 	if (couponOrderHash !== orderHash) return null
 	if (owner !== BigInt(CLAIM_ORDER.owner)) return null
 	if (couponOrderbook !== BigInt(orderbook)) return null
 	// The response states expiry as a JSON number of seconds.
 	if (expiry > BigInt(Number.MAX_SAFE_INTEGER)) return null
 
-	const hash = keccak256(encodePacked(Array<'uint256'>(9).fill('uint256'), context))
+	const hash = keccak256(encodePacked(Array<'uint256'>(context.length).fill('uint256'), context))
 	return {
 		id: couponId(signer, signature as Hex, context),
 		signature: signature as Hex,
@@ -308,7 +310,7 @@ function couponId(signer: string, signature: Hex, context: bigint[]): Hex {
 
 /**
  * Whether the coupon's signature recovers to the claim order's signer, over the
- * EIP-191 message the orderbook checks: keccak256 of the nine context words.
+ * EIP-191 message the orderbook checks: keccak256 of the coupon's context words.
  */
 async function signedByClaimSigner({ hash, signature }: Coupon): Promise<boolean> {
 	try {

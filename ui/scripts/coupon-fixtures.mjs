@@ -15,6 +15,8 @@ const ORDER = {
 	token: 0x6c6ee5e31d828de241282b9606c8e98ea48526e2n,
 	vaultId: HOLO_VAULT_ID
 }
+/** The TestNet's chain, Base Sepolia: each coupon's word 9. */
+const BASE_SEPOLIA = 84532
 const RECIPIENT_A = 0x1aa2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4n
 const RECIPIENT_B = 0xa6e4a7b19c5ef3a2d18f32d47e5c8b9a0f1e2d3cn
 const OLD = [
@@ -43,7 +45,15 @@ const coupons = []
 for (const [recipient, hot, expiry, wei = hot * 10n ** 18n] of OLD) {
 	const nonce = BigInt(expiry - 604800)
 	coupons.push(
-		await signCoupon({ key: TEST_SIGNER_KEY, order: ORDER, recipient, wei, expiry, nonce })
+		await signCoupon({
+			key: TEST_SIGNER_KEY,
+			order: ORDER,
+			recipient,
+			wei,
+			expiry,
+			nonce,
+			chainId: BASE_SEPOLIA
+		})
 	)
 }
 const out = `// Twenty coupons for the TestNet claim order of src/lib/testing/builds.ts, signed by

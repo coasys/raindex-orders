@@ -9,6 +9,7 @@
 	import Paused from '$lib/components/Paused.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
 	import {
+		claimsOn,
 		deserializeSignedContext,
 		floatToWei,
 		parseCoupon,
@@ -108,6 +109,7 @@
 	}
 
 	$: coupon = signedContext ? parseCoupon(signedContext) : undefined
+	$: otherChain = coupon && !claimsOn(coupon, bridge.chain.id) ? coupon.chainId : null
 
 	let isLoading = false
 	let error = ''
@@ -119,6 +121,7 @@
 	const handleClaim = async () => {
 		if (!signedContext) return
 		if (!orderConfig) return
+		if (otherChain !== null) return
 
 		error = ''
 		errorUnconfirmed = false
@@ -217,6 +220,11 @@
 					<div class="flex items-center justify-center py-8">
 						<Spinner size="16" />
 					</div>
+				{:else if otherChain !== null}
+					<Alert color="red">
+						This coupon is for chain {otherChain}, not {bridge.networkName} (chain {bridge.chain
+							.id}). It cannot be claimed here.
+					</Alert>
 				{:else if coupon && orderConfig && orderExists}
 					<div class="space-y-2 rounded-lg bg-gray-50 p-4">
 						<h3 class="mb-2 font-semibold">Coupon Details</h3>

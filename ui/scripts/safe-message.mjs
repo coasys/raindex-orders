@@ -5,9 +5,10 @@
 import { encodePacked, hashTypedData, keccak256 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 
-/** The digest Raindex checks a coupon's signature over: the EIP-191 hash of keccak256 of the nine packed words. */
+/** The digest Raindex checks a coupon's signature over: the EIP-191 hash of keccak256 of the ten packed words. */
 export function couponDigest(words) {
-	const packed = keccak256(encodePacked(Array(9).fill('bytes32'), words))
+	if (words.length !== 10) throw new Error(`a coupon is ten words, not ${words.length}`)
+	const packed = keccak256(encodePacked(Array(10).fill('bytes32'), words))
 	return keccak256(
 		encodePacked(['string', 'bytes32'], ['\x19Ethereum Signed Message:\n32', packed])
 	)

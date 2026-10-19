@@ -17,6 +17,12 @@ export type CouponConfig = {
 	orderOwner: Address
 	nonce: bigint
 	expiryTimestamp: number
+	/**
+	 * The chain the coupon claims on, word 9, which the claim order checks. Null for a
+	 * coupon of nine words, signed before coupons named their chain: it claims only on
+	 * a claim order that does not check it.
+	 */
+	chainId: number | null
 }
 
 export type SignedContextV1Struct = {
@@ -77,7 +83,13 @@ export function amountWord(wei: bigint): Hex {
 	return numberToHex((exponent << COEFFICIENT_BITS) | wei, { size: 32 })
 }
 
+/** A coupon's words: ten, or nine for a coupon signed before coupons named their chain. */
+const COUPON_WORDS = [9, 10]
+
 export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig => {
+	if (!COUPON_WORDS.includes(signedContext.context.length)) {
+		throw new Error(`Not a coupon: it has ${signedContext.context.length} words, not 10`)
+	}
 	const [
 		recipient,
 		amount,
@@ -87,7 +99,8 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 		orderbookAddress,
 		claimTokenAddress,
 		outputVaultId,
-		nonce
+		nonce,
+		chainId
 	] = signedContext.context
 
 	const address = (word: bigint) => numberToHex(word, { size: 20 })
@@ -101,9 +114,17 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 		orderbookAddress: address(orderbookAddress),
 		claimTokenAddress: address(claimTokenAddress),
 		outputVaultId: numberToHex(outputVaultId, { size: 32 }),
-		nonce
+		nonce,
+		chainId: chainId === undefined ? null : chainNumber(chainId)
 	}
 }
+
+/** A chain ID word as a number; one no chain has (past 2^53) reads as -1, which matches none. */
+const chainNumber = (word: bigint) => (word <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(word) : -1)
+
+/** Whether `coupon` can claim on chain `chainId`: it names that chain, or no chain at all. */
+export const claimsOn = (coupon: CouponConfig, chainId: number) =>
+	coupon.chainId === null || coupon.chainId === chainId
 
 export const serializeSignedContext = (signedContext: SignedContextV1Struct): string => {
 	// we can't use JSON.stringify because the context is an array of BigInts

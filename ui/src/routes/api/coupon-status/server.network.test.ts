@@ -43,12 +43,16 @@ function context(build: Build, nonce: bigint): bigint[] {
 		BigInt(build.PUBLIC_ORDERBOOK_ADDRESS),
 		BigInt(build.PUBLIC_TOKEN_ADDRESS),
 		VAULT_ID,
-		nonce
+		nonce,
+		BigInt(chainIdOf(build))
 	]
 }
 
+/** The chain a build's coupons claim on, their word 9. */
+const chainIdOf = (build: Build) => (build.PUBLIC_NETWORK === 'mainnet' ? 1 : 84532)
+
 const contextHash = (words: bigint[]) =>
-	keccak256(encodePacked(Array<'uint256'>(9).fill('uint256'), words))
+	keccak256(encodePacked(Array<'uint256'>(words.length).fill('uint256'), words))
 
 const coupon = (signer: string, signature: Hex, words: bigint[]) =>
 	[signer, signature, ...words.map(String)].join(',')

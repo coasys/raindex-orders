@@ -79,6 +79,8 @@ function refusalMessage(reason: string, coupon: CouponConfig) {
 		case 'Wrong output token':
 		case 'Wrong output vault id':
 			return `This coupon does not match this bridge, so it cannot be claimed here. ${REISSUE}`
+		case 'Wrong chain id':
+			return `This coupon is for another chain than ${bridge.networkName}, so it cannot be claimed here. ${REISSUE}`
 		case 'Wrong output amount':
 		case 'MinimumIO':
 			return 'The bridge cannot pay this claim right now, and your coupon was not used. Try again later, and contact Unyt support if it keeps failing.'

@@ -61,7 +61,8 @@ async function sign(
 	id: string,
 	nonce: string,
 	orderHash: string,
-	expiresIn = 7 * DAY
+	expiresIn = 7 * DAY,
+	chainWord = pad('0x01')
 ) {
 	const expiry = BigInt(Math.floor(Date.now() / 1000) + expiresIn)
 	const words = [
@@ -73,7 +74,8 @@ async function sign(
 		pad(ORDERBOOK),
 		pad(TOKEN),
 		VAULT_ID,
-		nonce
+		nonce,
+		chainWord
 	]
 	const digest = couponDigest(words)
 	const answer = await fetch(`http://127.0.0.1:${port}/sign`, {
@@ -113,6 +115,18 @@ describe('the mock signer service', () => {
 		expect(again.body.code).toBe('already_signed')
 		expect(again.body.reason).toContain(ORDER_A)
 		expect((await sign(port, other.id, other.nonce, ORDER_B)).status).toBe(200)
+	})
+
+	it('refuses a coupon whose word 9 is another chain than the one it signs for', async () => {
+		const record = join(mkdtempSync(join(tmpdir(), 'mock-signer-')), 'signed.json')
+		const port = 18_990 + Math.floor(Math.random() * 9)
+		await startMock(ORDER_A, record, port)
+		const w = withdrawal(5)
+
+		const baseSepolia = await sign(port, w.id, w.nonce, ORDER_A, 7 * DAY, pad(toHex(84532)))
+		expect(baseSepolia.status).toBe(409)
+		expect(baseSepolia.body.code).toBe('chain_mismatch')
+		expect((await sign(port, w.id, w.nonce, ORDER_A)).status).toBe(200)
 	})
 
 	it('takes an expiry up to EXPIRY_SECONDS plus the tolerance ahead, and a little behind', async () => {
