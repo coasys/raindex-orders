@@ -32,13 +32,13 @@ One request per coupon. Body, `Content-Type: application/json`:
 | `chainId` | number | 1 for Ethereum mainnet, 84532 for Base Sepolia |
 | `owner` | string | The owner the service is asked to sign as: `0x` and 40 hex digits |
 | `withdrawal` | string or null | The withdrawal spend's Holochain action hash, in holo_hash's base64 form (`u` then base64url of its 39 bytes). `null` for the startup probe, below |
-| `context` | array of 9 strings | The coupon's nine words, each `0x` and 64 hex digits, in the order below |
-| `couponDigest` | string | The digest of the nine words, for comparison only |
+| `context` | array of 10 strings | The coupon's ten words, each `0x` and 64 hex digits, in the order below |
+| `couponDigest` | string | The digest of the ten words, for comparison only |
 | `safeMessageHash` | string | The hash the owner signs, for comparison only |
 
 Addresses arrive in lowercase. Compare them without regard to case.
 
-The nine words, each 32 bytes:
+The ten words, each 32 bytes:
 
 | # | word | encoding |
 |---|---|---|
@@ -51,6 +51,7 @@ The nine words, each 32 bytes:
 | 6 | token | HOT, `TOKEN_ADDRESS`, left-padded |
 | 7 | vault ID | `VAULT_ID` |
 | 8 | nonce | keccak256 of the withdrawal action hash's 39 raw bytes |
+| 9 | chain ID | the chain the coupon claims on, as a plain integer, left-padded: 1 for Ethereum mainnet (`0x00…01`), 84532 for Base Sepolia (`0x00…014a34`). The claim order refuses a coupon whose word 9 is not the chain it runs on |
 
 Answers:
 
@@ -72,6 +73,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `expiry_out_of_range` | word 2 is outside the window in [the expiry](#the-expiry) |
 | `nonce_mismatch` | word 8 is not keccak256 of the withdrawal's 39 bytes |
 | `order_mismatch` | words 3 to 7 are not the service's own copy of the deploy record |
+| `chain_mismatch` | word 9 is not the chain ID the service signs for |
 | `wrong_safe_or_chain` | `safe` or `chainId` is not what the service signs for |
 | `wrong_owner` | `owner` is not the service's owner |
 | `probe_mismatch` | `withdrawal` is null and the words are not the startup probe's |
@@ -84,7 +86,7 @@ Any other status (400 for a malformed body, 401 or 403 for authentication, 500, 
 ## The hash an owner signs
 
 1. **The coupon digest**, which Raindex V6 checks the coupon against:
-   `couponDigest = keccak256("\x19Ethereum Signed Message:\n32" ‖ keccak256(word0 ‖ word1 ‖ … ‖ word8))`
+   `couponDigest = keccak256("\x19Ethereum Signed Message:\n32" ‖ keccak256(word0 ‖ word1 ‖ … ‖ word9))`
 2. **The Safe's domain separator**, as Safe 1.3.0 and later compute it:
    `domainSeparator = keccak256(abi.encode(keccak256("EIP712Domain(uint256 chainId,address verifyingContract)"), chainId, safe))`
 3. **The SafeMessage hash**, which the owner signs:
@@ -122,10 +124,11 @@ The coupon test vector, for a Safe of threshold 2 at `0x3838Fc4E0cba211c3D6D2025
     "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
     "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
     "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
-    "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77"
+    "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77",
+    "0x0000000000000000000000000000000000000000000000000000000000000001"
   ],
-  "couponDigest": "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f",
-  "safeMessageHash": "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+  "couponDigest": "0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60",
+  "safeMessageHash": "0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe"
 }
 ```
 
@@ -133,17 +136,17 @@ The values along the way:
 
 | value | |
 |---|---|
-| keccak256 of the nine words | `0x5b266d4fcc790d20bf2123cb623bd5e6abb68c7847759953c81f6ebf882074d5` |
-| `couponDigest` | `0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f` |
+| keccak256 of the ten words | `0x0ac233176e8632bb38ec9cfe568ec7f6f1f60bdd99b2b27843b78bf5d2954a70` |
+| `couponDigest` | `0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60` |
 | `domainSeparator` | `0x153d4789a76b589663cd7eaf7cecb28f92d106099b7323da9c72d5befb893f94` |
 | `keccak256("SafeMessage(bytes message)")` | `0x60b3cbf8b4a223d68d641b3b6ddf9a298e7f33710cf3d3a9d1146b5a6150fbca` |
-| struct hash | `0x10a3d89fcf93588ce921a0a1b767cf85d222a5d0a083df757b9ba54469431bd5` |
-| `safeMessageHash` | `0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34` |
+| struct hash | `0x052264522319a088369b93b36b377d11d46c253188dfc029e6448ccb8114545f` |
+| `safeMessageHash` | `0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe` |
 
 The owner's key is public (anvil's account 1, `0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`), so its signature is a test vector too:
 
 ```
-0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c
+0x2400e7ddd4b737971e696dbfc5f5f9f6516d15980925ee2e38cb2b6a7be87dfb0fe177ede6ba7a45519c44841019e1f2357988698c43808dbe48cd8d53e170bc1b
 ```
 
 This example's expiry is in 2025, so a real service refuses it with `expiry_out_of_range`. These values agree in `bridge-orchestrator/src/signer/safe/tests.rs` (Rust), `ui/scripts/safe-message.test.ts` (viem), `test/TestSafeCouponSignature.t.sol` (Solidity, against Safe 1.4.1 on a mainnet fork), and `cast`.
@@ -157,7 +160,7 @@ import { encodePacked, hashTypedData, keccak256 } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 
 export function couponDigest(words) {
-	const packed = keccak256(encodePacked(Array(9).fill('bytes32'), words))
+	const packed = keccak256(encodePacked(Array(10).fill('bytes32'), words))
 	return keccak256(encodePacked(['string', 'bytes32'], ['\x19Ethereum Signed Message:\n32', packed]))
 }
 
@@ -184,7 +187,7 @@ Each check uses the service's own sources: its own Holochain node, or one it tru
 3. **The recipient.** Word 0 is the `withdraw_to_address` in the spend's attached payload.
 4. **The expiry.** Word 2 is within the window in [the expiry](#the-expiry) below.
 5. **The nonce.** Word 8 is keccak256 of the action hash's 39 raw bytes. Every coupon for one withdrawal carries this nonce, and the claim order marks it used under the vault, so only one of them ever claims, on any claim order the vault adds ([one order per withdrawal](#one-order-per-withdrawal)). Signing the same withdrawal again is safe for the same order; for another order, check 8 refuses it, the services' own line behind the chain's. A coupon whose nonce is not the withdrawal's would let one burn be claimed twice.
-6. **The order.** Words 3 to 7 equal the service's copy of the deploy record, and `safe`, `chainId` and `owner` are what the service signs for.
+6. **The order and the chain.** Words 3 to 7 equal the service's copy of the deploy record, word 9 is the chain ID the service signs for, and `safe`, `chainId` and `owner` are what the service signs for. Otherwise `order_mismatch`, `chain_mismatch` or `wrong_safe_or_chain`. The claim order checks word 9 too: Raindex V6 and the vault can have the same addresses on two chains, and without it a coupon signed by a key would claim on both. The Safe's domain already binds the owners' signatures to one chain; word 9 puts the chain in the coupon itself, so a key and a Safe alike sign for one chain.
 7. **The hashes.** The service computes `couponDigest` and `safeMessageHash` from the words it checked, and refuses with `hash_mismatch` if the request's differ. It signs its own `safeMessageHash`, and nothing else.
 8. **One order per withdrawal.** The service has not signed this withdrawal for another order hash, as [below](#one-order-per-withdrawal). Otherwise `already_signed`.
 
@@ -250,6 +253,7 @@ At startup the orchestrator sends one request with `"withdrawal": null`. Its wor
 | 2 | `0x000000007fffffffffffffffffffffffffffffffffffffffffffffffffffffff`: the latest expiry a float holds |
 | 3–7 | the deploy record's order, as for a withdrawal |
 | 8 | `0x7031e3d46970cee5696244e787b00837a2271c3769d176fc13934b96fe76265b`: keccak256 of `bridge-orchestrator startup probe` |
+| 9 | the chain ID, as for a withdrawal |
 
 The orchestrator simulates a claim with M owner signatures of the probe, which must succeed, and with M-1, which must fail with Raindex's `InvalidSignature(0)`, the Safe refusing the signatures; any other revert stops the startup. Nothing is sent to the chain. A signed probe is a real coupon, but it pays 1 wei of HOT to the Safe, once. If the Safe's owners ever claim it, its fixed nonce is used and the claim order answers `Nonce already used`. The orchestrator takes that answer as the order accepting the Safe: the nonce is the claim expression's last check, after the signer and every other word, and Raindex checks the signatures before the expression runs. A service that gets a request with no withdrawal whose words differ refuses with `probe_mismatch`.
 

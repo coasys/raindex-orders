@@ -282,7 +282,7 @@ Responsibilities:
 - Polls the orderbook for new Lock events and drives the Holochain bridge
 - Processes withdrawal requests from Holochain and generates signed claim coupons (see `CouponSigner::coupon` in `src/signer.rs`)
 - Emits batched bridging RAVE transactions with explicit links and a coupons map
-- Produces the same URL-safe coupon format consumed by the UI: `signer,signature,ctx0,ctx1,...,ctx8`
+- Produces the same URL-safe coupon format consumed by the UI: `signer,signature,ctx0,ctx1,...,ctx9`
 
 ### UI (`ui/`)
 
@@ -320,7 +320,7 @@ An app sends about one request every 3 minutes, plus one each time Interaction D
 
 ## Coupon Format
 
-The signed coupon contains 9 context words, each a bytes32 the orchestrator writes as a decimal number:
+The signed coupon contains 10 context words, each a bytes32 the orchestrator writes as a decimal number:
 | Index | Field | Description |
 |-------|-------|-------------|
 | 0 | recipient | Ethereum address to receive tokens, as a word |
@@ -332,8 +332,9 @@ The signed coupon contains 9 context words, each a bytes32 the orchestrator writ
 | 6 | outputToken | Token address (HOT) |
 | 7 | outputVaultId | Vault ID |
 | 8 | nonce | keccak256 of the 39 raw bytes of the withdrawal's Holochain transaction ID (prevents replay) |
+| 9 | chainId | The chain the coupon claims on, an integer: 1 on Ethereum mainnet, 84532 on Base Sepolia. Raindex V6 and the vault can have the same addresses on two chains, so the claim order refuses a coupon whose chain is not its own (`Wrong chain id`) |
 
-The expression compares words 0 and 3 to 8 bit for bit, and words 1 and 2 as numbers. Each signer signs the EIP-191 hash of the packed words. `test/TestCouponSignature.t.sol` pins a test vector (fixed inputs, their nine words, the signature anvil's third account gives, the order hash and the claim's `takeOrders4` calldata) that `bridge-orchestrator/src/signer.rs`, `bridge-orchestrator/src/preflight.rs` and `ui/src/lib/coupon.test.ts`, `network.test.ts` and `claim.test.ts` reproduce.
+The expression compares words 0 and 3 to 9 bit for bit, and words 1 and 2 as numbers; `chain-id()` pushes the chain as an integer, as word 9 holds it. Each signer signs the EIP-191 hash of the packed words. `test/TestCouponSignature.t.sol` pins a test vector (fixed inputs, their ten words, the signature anvil's third account gives, the order hash and the claim's `takeOrders4` calldata) that `bridge-orchestrator/src/signer.rs`, `bridge-orchestrator/src/preflight.rs` and `ui/src/lib/coupon.test.ts`, `network.test.ts` and `claim.test.ts` reproduce.
 
 ## Troubleshooting
 
@@ -345,6 +346,9 @@ The UI reads order status directly from the blockchain via RPC. If you see this 
 
 ### Transaction fails with "Wrong signer"
 The claim order does not accept the coupon's signer, as for a coupon signed before `rotate-claim-signer.sh` moved the order to a new signer. The orchestrator signs only with a key the order accepts: it refuses to start otherwise.
+
+### "Wrong chain id"
+The coupon names another chain than the one the claim order runs on: a coupon for Ethereum mainnet on Base Sepolia, or the reverse. The website refuses such a coupon before it sends anything. A coupon of nine words was signed before coupons named their chain: it claims on a claim order deployed before then, such as the TestNet's, and fails on a newer one, which reads a word 9 the coupon does not have.
 
 ### "Nonce already used"
 What it means depends on when the coupon was signed. Coupons signed before the per-withdrawal nonce carry the unix second they were signed in, a ten-digit nonce.

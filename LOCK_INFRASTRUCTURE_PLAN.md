@@ -250,10 +250,12 @@ using-words-from orderbook-subparser
 :ensure(binary-equal-to(signed-context<0 5>() raindex()) "Wrong orderbook"),
 :ensure(binary-equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
 :ensure(binary-equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
+:ensure(binary-equal-to(signed-context<0 9>() chain-id()) "Wrong chain id"),
 
-/* Prevent replay attacks via nonce */
-:ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
-:set(hash(order-hash() signed-context<0 8>()) 1),
+/* Prevent replay attacks via nonce, kept under the vault: one burn pays once on
+   every claim order the vault adds */
+:ensure(is-zero(get(signed-context<0 8>())) "Nonce already used"),
+:set(signed-context<0 8>() 1),
 
 /* Output claim amount, a decimal float. V6 takes no order at ratio 0: the claimer
    pays 1e-30 of the ClaimInputToken per HOT, which never moves */
@@ -278,6 +280,7 @@ The expression is composed by `compose-rainlang.mjs` with the subparser and sign
 | 6 | outputToken | Token address |
 | 7 | outputVaultId | Vault ID |
 | 8 | nonce | Unique nonce (prevents replay) |
+| 9 | chainId | The chain the coupon claims on, an integer: the order refuses a coupon for another chain |
 
 ### 3. Bridge Orchestrator (`bridge-orchestrator/`)
 
@@ -291,7 +294,7 @@ cargo run -- run
 **Responsibilities**:
 - Polls Ethereum RPC for Lock events and hands them off to the Holochain side
 - Scans bridging entries on Holochain and emits unified bridging RAVE transactions
-- Generates signed withdrawal coupons (`CouponSigner::coupon` in `src/signer.rs`) in the URL-safe `signer,signature,ctx0..ctx8` format consumed by the UI claim page
+- Generates signed withdrawal coupons (`CouponSigner::coupon` in `src/signer.rs`) in the URL-safe `signer,signature,ctx0..ctx9` format consumed by the UI claim page
 - Tracks state required to batch coupons up to a configurable size cap
 
 **Configuration** (via `.env`):

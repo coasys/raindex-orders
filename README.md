@@ -126,7 +126,7 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 2. The bridge orchestrator signs a coupon with the coupon signer ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon
-5. Rainlang expression validates coupon (signer, expiry, nonce)
+5. Rainlang expression validates coupon (signer, expiry, order, chain, nonce)
 6. HOT transferred from vault to user's wallet. The claimer pays the order's input token at the order's ratio of 1e-30 per HOT, which the ClaimInputToken never moves
 
 ## Development
