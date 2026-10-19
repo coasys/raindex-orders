@@ -94,7 +94,7 @@ abstract contract ForkRehearsal is Test, SignContext {
         vault.lock(amount, AGENT);
     }
 
-    /// The nine context words the orchestrator signs for a withdrawal of `amount`
+    /// The ten context words the orchestrator signs for a withdrawal of `amount`
     /// to `claimer`. The nonce is the keccak of a 39-byte action hash, as the
     /// orchestrator's is, though its last 4 bytes are not a real DHT location.
     function context(uint256 amount, uint256 expiry, uint256 withdrawal) internal view returns (bytes32[] memory) {
@@ -115,7 +115,8 @@ abstract contract ForkRehearsal is Test, SignContext {
             address(RAINDEX),
             address(hot),
             HOLO_VAULT_ID,
-            keccak256(abi.encodePacked(hex"842924", bytes32(withdrawal), bytes4(0)))
+            keccak256(abi.encodePacked(hex"842924", bytes32(withdrawal), bytes4(0))),
+            block.chainid
         );
     }
 

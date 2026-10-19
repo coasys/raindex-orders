@@ -129,7 +129,8 @@ contract TestClaim is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            bytes32(nonce)
+            bytes32(nonce),
+            block.chainid
         );
     }
 
@@ -226,7 +227,8 @@ contract TestClaim is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            bytes32(uint256(7))
+            bytes32(uint256(7)),
+            block.chainid
         );
         vm.expectRevert(bytes("Nonce already used"));
         claimOn(next, signContext(nextKey, sameNonce), 40e18);
@@ -240,7 +242,8 @@ contract TestClaim is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            bytes32(uint256(8))
+            bytes32(uint256(8)),
+            block.chainid
         );
         claimOn(next, signContext(nextKey, freshNonce), 40e18);
         assertEq(MAINNET_HOT.balanceOf(claimer), 80e18);
@@ -262,6 +265,34 @@ contract TestClaim is Test, SignContext {
 
         vm.expectRevert(bytes("Wrong recipient"));
         claim(other, 40e18);
+    }
+
+    /// Word 9 is the chain the coupon was signed for: a coupon naming another
+    /// chain is refused, though every other word is this order's.
+    function testACouponForAnotherChainFails() public {
+        bytes32[] memory words = coupon(40e18, inAWeek(), 10);
+        words[9] = bytes32(uint256(84532));
+        SignedContextV1 memory baseSepolia = signed(words);
+
+        vm.expectRevert(bytes("Wrong chain id"));
+        claim(baseSepolia, 40e18);
+    }
+
+    /// The same order can exist on two chains (Rain's contracts share their
+    /// addresses, and so can a vault deployed at the same deployer nonce): a key's
+    /// coupon signed for this chain fails on another chain's copy of the order,
+    /// and still claims here.
+    function testACouponSignedForThisChainFailsOnAnother() public {
+        SignedContextV1 memory mainnet = signed(coupon(40e18, inAWeek(), 11));
+        uint256 here = block.chainid;
+
+        vm.chainId(84532);
+        vm.expectRevert(bytes("Wrong chain id"));
+        claim(mainnet, 40e18);
+
+        vm.chainId(here);
+        claim(mainnet, 40e18);
+        assertEq(MAINNET_HOT.balanceOf(claimer), 40e18);
     }
 
     function testAClaimForLessThanTheCouponFails() public {

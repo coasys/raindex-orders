@@ -268,7 +268,8 @@ contract TestHoloBridgeDeployerWithSafe is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            keccak256("withdrawal")
+            keccak256("withdrawal"),
+            block.chainid
         );
         SignedContextV1[] memory signed = new SignedContextV1[](1);
         signed[0] = signContext(signerKey, words);

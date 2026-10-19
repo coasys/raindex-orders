@@ -24,7 +24,7 @@ import {
 import {LibCoupon} from "./lib/LibCoupon.sol";
 import {SignContext} from "./lib/SignContext.sol";
 
-/// The coupon test vector: fixed inputs, and the nine words and the signature
+/// The coupon test vector: fixed inputs, and the ten words and the signature
 /// they must give in every language. bridge-orchestrator/src/signer.rs
 /// (`a_key_signs_the_coupon_the_claim_order_checks`) and ui/src/lib/coupon.test.ts
 /// hold the same values, so the three agree on the encoding src/holo-claim.rain
@@ -45,7 +45,8 @@ contract TestCouponSignature is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            bytes32(uint256(8496889498503184870230947373316602526857109467185425766089433217409414560631))
+            bytes32(uint256(8496889498503184870230947373316602526857109467185425766089433217409414560631)),
+            1
         );
     }
 
@@ -63,7 +64,7 @@ contract TestCouponSignature is Test, SignContext {
     function testTheWordsOfTheVector() external pure {
         bytes32[] memory words = vector();
 
-        assertEq(words.length, 9);
+        assertEq(words.length, 10);
         assertEq(words[0], bytes32(0x0000000000000000000000001111111111111111111111111111111111111111));
         assertEq(words[1], bytes32(0xffffffee000000000000000000000000000000000000000014d1120d7b160000));
         assertEq(words[2], bytes32(uint256(1750604800)));
@@ -73,7 +74,8 @@ contract TestCouponSignature is Test, SignContext {
         assertEq(words[6], bytes32(0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2));
         assertEq(words[7], bytes32(0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b));
         assertEq(words[8], bytes32(0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77));
-        assertEq(LibCoupon.digest(words), 0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f);
+        assertEq(words[9], bytes32(uint256(1)));
+        assertEq(LibCoupon.digest(words), 0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60);
     }
 
     function testSignContextSignsTheCouponTheOrchestratorSigns() external pure {
@@ -82,7 +84,7 @@ contract TestCouponSignature is Test, SignContext {
         assertEq(coupon.signer, 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC);
         assertEq(
             coupon.signature,
-            hex"452449c0ce920f0e30878832f19e55a7ad3c173dfb7074cef53cc1cc1db54cd43df1a26a92e096b59ba413f28cd2c0c1f4aa6276b56ea14eb612c07fcd76eb191b"
+            hex"a8611a5da9de9de13c5ec0fb267521eae2967b57e0b0b260f6380268e85fe5b03ada25c3de627f4083708275505a21e0c0e4ebd79944cff6ec674f2403d3a5dd1c"
         );
     }
 }
@@ -134,7 +136,8 @@ contract TestClaimCalldataVector is Test, SignContext {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            bytes32(uint256(8496889498503184870230947373316602526857109467185425766089433217409414560631))
+            bytes32(uint256(8496889498503184870230947373316602526857109467185425766089433217409414560631)),
+            1
         );
         SignedContextV1[] memory signed = new SignedContextV1[](1);
         signed[0] = signContext(0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a, words);
@@ -148,8 +151,8 @@ contract TestClaimCalldataVector is Test, SignContext {
 
         assertEq(
             signed[0].signature,
-            hex"f3a686a6e1eccbfba52fbcde8a66bd2eca7bfd5b88bb326cb5486f6c4596e5bf7abe61d43b8e825201362259d527971715ee2d362460c97006ca29cb1355515a1b"
+            hex"2539526bd71f08ca5ee37e55a6ce55588b0c8cc32dbe2725be220cdebf664fd16040155f78f326e5688350772d23dc2be231e2f57c189b05f3dc6449e8a55fe11b"
         );
-        assertEq(keccak256(calldata_), 0x9c90a13c518aa17629ca92bb5947f54e0fcfb1c0ef65376c17d8ea02e7763522);
+        assertEq(keccak256(calldata_), 0xaa93b41d8e3562cc4ef3ce7d59ca511855a66fbbf546dc68908d56b907f093c9);
     }
 }

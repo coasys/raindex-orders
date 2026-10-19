@@ -107,7 +107,8 @@ contract TestClaimBaseSepolia is Test, SignContext {
             address(RAINDEX),
             address(token),
             HOLO_VAULT_ID,
-            bytes32(nonce)
+            bytes32(nonce),
+            block.chainid
         );
     }
 
@@ -179,6 +180,17 @@ contract TestClaimBaseSepolia is Test, SignContext {
         SignedContextV1 memory again = coupon(40e18, block.timestamp + 7 days + 1, 3);
 
         claimFails(again, 40e18, "Nonce already used");
+    }
+
+    /// chain-id() on Base Sepolia is 84532, the coupon's word 9: a coupon for
+    /// Ethereum mainnet is refused here.
+    function testACouponForMainnetFailsOnBaseSepolia() public {
+        lock(100e18);
+        bytes32[] memory mainnet = words(40e18, block.timestamp + 7 days, 4);
+        assertEq(mainnet[9], bytes32(uint256(84532)));
+        mainnet[9] = bytes32(uint256(1));
+
+        claimFails(signContext(signerKey, mainnet), 40e18, "Wrong chain id");
     }
 
     function testTheAdminRemovesTheClaimOrder() public {

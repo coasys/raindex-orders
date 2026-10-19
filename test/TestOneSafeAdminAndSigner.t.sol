@@ -172,7 +172,8 @@ contract TestOneSafeAdminAndSigner is Test {
             address(RAINDEX),
             address(MAINNET_HOT),
             HOLO_VAULT_ID,
-            keccak256(abi.encode("withdrawal", withdrawal))
+            keccak256(abi.encode("withdrawal", withdrawal)),
+            block.chainid
         );
     }
 

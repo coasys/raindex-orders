@@ -4,7 +4,7 @@ pragma solidity =0.8.25;
 import {MessageHashUtils} from "openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Float, LibDecimalFloat} from "rain-math-float-0.2.1/src/lib/LibDecimalFloat.sol";
 
-/// The nine words of a claim coupon, as src/holo-claim.rain reads them and as
+/// The ten words of a claim coupon, as src/holo-claim.rain reads them and as
 /// bridge-orchestrator/src/signer.rs and ui/src/lib/coupon.ts write them.
 library LibCoupon {
     /// Word 1: the amount of HOT as the decimal float Raindex V6 pays out. Its
@@ -24,9 +24,10 @@ library LibCoupon {
         address raindex,
         address token,
         bytes32 vaultId,
-        bytes32 nonce
+        bytes32 nonce,
+        uint256 chainId
     ) internal pure returns (bytes32[] memory coupon) {
-        coupon = new bytes32[](9);
+        coupon = new bytes32[](10);
         coupon[0] = bytes32(uint256(uint160(recipient)));
         coupon[1] = amountWord(amountInWei);
         // A float with exponent 0 is its integer, which is what block-timestamp() is.
@@ -37,6 +38,8 @@ library LibCoupon {
         coupon[6] = bytes32(uint256(uint160(token)));
         coupon[7] = vaultId;
         coupon[8] = nonce;
+        // An integer, as chain-id() pushes it: a float of exponent 0.
+        coupon[9] = bytes32(chainId);
     }
 
     /// What each signer signs: the EIP-191 hash of the packed words, as

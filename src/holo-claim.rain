@@ -13,9 +13,11 @@
  *  [6] token address
  *  [7] output vault id
  *  [8] nonce (to prevent replay attacks)
+ *  [9] chain id, an integer (a float of exponent 0 is its integer, as
+ *      chain-id() is), so a coupon claims only on the chain it was signed for
  *
- *  Addresses, hashes and the nonce are compared bit for bit (binary-equal-to);
- *  the amount and the expiry are compared as numbers.
+ *  Addresses, hashes, the nonce and the chain id are compared bit for bit
+ *  (binary-equal-to); the amount and the expiry are compared as numbers.
  */
 
 #orderbook-subparser !subparser on this network
@@ -33,8 +35,10 @@ using-words-from orderbook-subparser
 :ensure(binary-equal-to(signed-context<0 5>() raindex()) "Wrong orderbook"),
 :ensure(binary-equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
 :ensure(binary-equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
+:ensure(binary-equal-to(signed-context<0 9>() chain-id()) "Wrong chain id"),
 
-/* check the nonce has not been used before. The key is the nonce alone: Raindex
+/* check the nonce has not been used before, last: the orchestrator's startup
+   probe reads "Nonce already used" as every other check passing. The key is the nonce alone: Raindex
    keeps the store under the order's owner, the vault, not under the order, so
    a nonce claimed on one claim order stays used on every claim order the vault
    adds after a rotation. One burn pays once, whatever the signer becomes. */

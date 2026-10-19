@@ -11,7 +11,7 @@ contract TestSafeCouponSignature is Test {
     bytes4 private constant EIP1271_MAGIC_VALUE = 0x1626ba7e;
 
     /// The coupon test vector's digest: test/TestCouponSignature.t.sol.
-    bytes32 internal constant DIGEST = 0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f;
+    bytes32 internal constant DIGEST = 0x4cb8e1ac1a5194e298140ad5c708b227eec55df3ffd4c983641a9d81c544aa60;
 
     /// Anvil's accounts 1, 2 and 3 as the owners of a Safe of threshold 2.
     uint256[] internal ownerKeys = [
@@ -35,7 +35,7 @@ contract TestSafeCouponSignature is Test {
     function testTheSafeMessageHashIsComputedAsTheFallbackHandlerComputesIt() public view {
         assertEq(address(safe), 0x3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22);
         bytes32 onChain = SAFE_FALLBACK_HANDLER.getMessageHashForSafe(address(safe), abi.encode(DIGEST));
-        assertEq(onChain, 0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34);
+        assertEq(onChain, 0xa2725acb9f918ab1eb2e6657d2d7ebecec2a152c93c3101f123385804bd5bffe);
         assertEq(LibSafe.messageHash(1, address(safe), DIGEST), onChain);
     }
 
