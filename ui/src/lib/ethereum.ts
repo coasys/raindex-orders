@@ -361,6 +361,7 @@ export async function writeContract(params: {
 	args?: readonly unknown[]
 	value?: bigint
 	from?: string
+	gas?: bigint
 }): Promise<string> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
@@ -385,7 +386,8 @@ export async function writeContract(params: {
 				chainId: numberToHex(bridge.chain.id),
 				to: params.address,
 				data,
-				value: params.value ? '0x' + params.value.toString(16) : '0x0'
+				value: params.value ? '0x' + params.value.toString(16) : '0x0',
+				...(params.gas ? { gas: numberToHex(params.gas) } : {})
 			}
 		]
 	})) as string

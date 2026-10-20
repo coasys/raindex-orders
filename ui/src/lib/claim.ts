@@ -220,14 +220,10 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders4', args })
 	const check = () => refusalOf(eth, account, data, coupon.withdrawAmount)
 
-	trace.step = 'checking the coupon'
-	const refusal = await check().catch(err => {
-		throw new ClaimError(CLAIM_UNCHECKED, { cause: err })
-	})
-	if (refusal) {
-		trace.revert = refusal.revert
-		throw new ClaimError(refusalMessage(refusal.revert.reason, coupon), { cause: refusal.cause })
-	}
+	// TEST ONLY (branch mofn-onchain-test, never merge): no check before sending, so a
+	// coupon the claim order refuses is mined and reverts on chain.
+	trace.step = 'checking the coupon (skipped)'
+	void CLAIM_UNCHECKED
 
 	trace.step = 'asking the wallet to send'
 	transactionStore.awaitWalletConfirmation()
@@ -236,7 +232,8 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 		abi: orderbookAbi,
 		functionName: 'takeOrders4',
 		args,
-		from: account
+		from: account,
+		gas: 1_000_000n
 	}).catch(err => {
 		const { message, revert } = sendFailure(err, coupon)
 		trace.revert = revert
