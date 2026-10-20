@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - the claim expression (`src/holo-claim.rain`) marks a used nonce at the nonce alone, no longer at `hash(order-hash() nonce)`. Raindex keeps the store under the order's owner, the vault, so a nonce claimed on one claim order is used on every claim order the vault adds after a rotation: one burn pays once, on chain, whatever the signer becomes. The signer services' `already_signed` records and the threshold rule stand behind that. The website's coupon status reads the new key. A TestNet deployed before this runs the old expression until its claim order is rotated (`rotate-claim-signer.sh`), which also changes its deploy record.
 
+## [0.7.1] - 2026-10-18
+
+### Fixed
+
+- bridge-orchestrator leaves a withdrawal parked with no coupon when it holds a unit besides HOT, names another vault, or names a recipient that fails its EIP-55 checksum, and pays the rest of the batch.
+- bridge-orchestrator lowers the bridging agent's credit limit by each withdrawal it pays, and `in-transit` lists each one it is still taking off.
+
+## [0.7.0] - 2026-10-15
+
+### Added
+
+- the Lock page turns Lock off for more than $1,000 worth of HOT, and while it cannot read the HOT price.
+
+### Changed
+
+- bridge-orchestrator credits deposits through a credit limit adjustment that requires a `call_method`.
+- bridge-orchestrator runs against a Holochain 0.7.1 conductor and a unyt DNA built on rave_engine 0.14.0.
+
 ## [0.6.0] - 2026-10-15
 
 ### Added

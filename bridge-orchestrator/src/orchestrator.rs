@@ -2,7 +2,7 @@ use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::format_amount;
 use crate::screening::Screener;
 use crate::signer::{CouponSigner, Payout};
-use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
+use crate::state::{StateStore, WithdrawalPayload, WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
 use crate::stop::{ensure_running, is_stopped, Stopped};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use alloy::primitives::Address;
@@ -16,24 +16,28 @@ use holo_hash::{ActionHash, ActionHashB64, AgentPubKey, AgentPubKeyB64, AnyDhtHa
 use holochain_zome_types::prelude::{ActionData, GetOptions, GetStrategy, Record};
 use rave_engine::types::{
     CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, History, LaneDefinition,
-    LaneExt, Ledger, Pagination, ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs,
-    RAVEInput, Transaction, TransactionDetails, UnitFee, UnitMap, RAVE,
+    LaneExt, Ledger, Pagination, ParkedData, ParkedLinkType, ParkedSpendData, PaymentSource,
+    RAVEExecuteInputs, RAVEInput, ReceiptInput, Transaction, TransactionDetails, UnitFee, UnitMap,
+    RAVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
 
 pub mod in_transit;
 mod screening;
+mod withdrawal;
 
 use screening::{WithdrawalGate, LOCKS_SCREENED, WITHDRAWALS_SCREENED};
 
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const WITHDRAWER_ROLE: &str = "withdrawer";
 const ORACLE_ROLE: &str = "oracle";
+const WITHDRAW_METHOD: &str = "withdraw";
+const FLOWS: [&str; 2] = ["lock", WITHDRAWAL_FLOW];
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -120,7 +124,7 @@ struct BridgingSelection {
 }
 
 async fn select_bridging_links(
-    signer: Option<&CouponSigner>,
+    ethereum: Option<(&CouponSigner, Address)>,
     gate: &WithdrawalGate<'_>,
     bridging_agent: &AgentPubKeyB64,
     bridging_links: &[Transaction],
@@ -138,33 +142,34 @@ async fn select_bridging_links(
         unsigned: Vec::new(),
     };
     let mut withdrawal_capped = false;
+    let vault = ethereum.map(|(_, vault)| vault_key(vault));
     // One selection is one cycle's signing: an owner of a Safe signer that
     // timed out in the last is asked again.
-    if let Some(signer) = signer {
+    if let Some((signer, _)) = ethereum {
         signer.new_cycle();
     }
 
     for tx in bridging_links {
-        let withdraw_to = match bridging_spend(tx, bridging_agent) {
+        let withdraw_to = match bridging_spend(tx, bridging_agent, vault.as_deref()) {
             None => continue,
             Some(BridgingSpend::Deposit) => {
                 selection.deposits.push(tx.clone());
                 continue;
             }
-            Some(BridgingSpend::Other(_) | BridgingSpend::Withdrawal(None)) => continue,
+            Some(
+                BridgingSpend::OtherRole(_)
+                | BridgingSpend::OtherVault { .. }
+                | BridgingSpend::Withdrawal(None),
+            ) => continue,
             Some(BridgingSpend::Withdrawal(Some(withdraw_to))) => withdraw_to,
         };
         selection.withdrawals_found += 1;
-        let Some(signer) = signer else {
+        let Some((signer, _)) = ethereum else {
             continue;
         };
 
-        let amount = tx
-            .amount
-            .get(&hot_unit_index.to_string())
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        let terms = match Payout::new(withdraw_to, &amount) {
+        let amount = hot_amount(tx, hot_unit_index);
+        let terms = match withdrawal_terms(tx, withdraw_to, hot_unit_index) {
             Ok(terms) => terms,
             Err(e) => {
                 selection.unpayable.push((tx.clone(), e));
@@ -208,7 +213,7 @@ async fn select_bridging_links(
         }
 
         selection.coupon_bytes += entry_bytes;
-        selection.coupons.insert(key, Value::String(coupon));
+        selection.coupons.insert(key.clone(), Value::String(coupon));
         selection.withdrawals.push(tx.clone());
 
         info!(
@@ -223,12 +228,14 @@ async fn select_bridging_links(
 enum BridgingSpend<'a> {
     Deposit,
     Withdrawal(Option<&'a str>),
-    Other(&'a str),
+    OtherVault { to: Option<&'a str>, why: String },
+    OtherRole(&'a str),
 }
 
 fn bridging_spend<'a>(
     tx: &'a Transaction,
     bridging_agent: &AgentPubKeyB64,
+    vault: Option<&str>,
 ) -> Option<BridgingSpend<'a>> {
     let TransactionDetails::ParkedSpend {
         attached_payload,
@@ -242,17 +249,57 @@ fn bridging_spend<'a>(
         if own_deposit(tx, bridging_agent) && ct_role_id == BRIDGING_AGENT_ROLE {
             BridgingSpend::Deposit
         } else if ct_role_id == WITHDRAWER_ROLE {
-            // The template pays a withdrawal from a `withdrawer` link alone, so a
-            // coupon for any other role would be claimable with no spend taken.
-            BridgingSpend::Withdrawal(
-                attached_payload
-                    .get("withdraw_to_address")
-                    .and_then(Value::as_str),
-            )
+            // The template debits the vault only for a `withdrawer` link naming it in
+            // exact lowercase, so a coupon for any other role or vault would be
+            // claimable with nothing debited from it.
+            let to = attached_payload
+                .get("withdraw_to_address")
+                .and_then(Value::as_str);
+            let named = attached_payload
+                .get("withdraw_contract_address")
+                .and_then(Value::as_str);
+            match vault {
+                Some(vault) if named != Some(vault) => BridgingSpend::OtherVault {
+                    to,
+                    why: other_vault_reason(named, vault),
+                },
+                _ => BridgingSpend::Withdrawal(to),
+            }
         } else {
-            BridgingSpend::Other(ct_role_id)
+            BridgingSpend::OtherRole(ct_role_id)
         },
     )
+}
+
+fn vault_key(vault: Address) -> String {
+    format!("{vault:#x}")
+}
+
+fn hot_amount(tx: &Transaction, hot_unit_index: u32) -> String {
+    tx.amount
+        .get(&hot_unit_index.to_string())
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+fn withdrawal_terms(tx: &Transaction, withdraw_to: &str, hot_unit_index: u32) -> Result<Payout> {
+    let hot_unit = hot_unit_index.to_string();
+    // The template pays the executor every unit in the spend, so a unit other
+    // than HOT can fail the one RAVE the whole batch shares.
+    if let Some((unit, _)) = tx.amount.iter().find(|(unit, _)| **unit != hot_unit) {
+        anyhow::bail!("the amount holds unit {unit}");
+    }
+    Payout::new(withdraw_to, &hot_amount(tx, hot_unit_index))
+}
+
+fn other_vault_reason(named: Option<&str>, vault: &str) -> String {
+    match named {
+        Some(named) if named.eq_ignore_ascii_case(vault) => format!(
+            "names withdraw_contract_address {named:?}, which is vault {vault} in a letter case the template does not pay"
+        ),
+        Some(named) => format!("names withdraw_contract_address {named:?}, not vault {vault}"),
+        None => "names no withdraw_contract_address".to_string(),
+    }
 }
 
 fn own_deposit(tx: &Transaction, bridging_agent: &AgentPubKeyB64) -> bool {
@@ -263,7 +310,7 @@ impl BridgeOrchestrator {
     pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
         if let Some(side) = &ethereum {
-            db.bind_vault(&format!("{:#x}", side.chain.lock_vault_address))?;
+            db.bind_vault(&vault_key(side.chain.lock_vault_address))?;
             let screening = screening_at_start(&db, side.screener.as_deref())?;
             info!(event = "startup.screening", "{screening}");
         }
@@ -352,17 +399,27 @@ impl BridgeOrchestrator {
         }
     }
 
+    fn vault(&self) -> Option<String> {
+        let side = self.ethereum.as_ref()?;
+        Some(vault_key(side.chain.lock_vault_address))
+    }
+
     fn log_skipped_links(&self, bridging_links: &[Transaction]) {
+        let vault = self.vault();
         let skipped: Vec<(&Transaction, Option<&str>, String)> = bridging_links
             .iter()
             .filter_map(|tx| {
-                let (role, why) = match bridging_spend(tx, &self.cfg.bridging_agent_pubkey) {
+                let spend = bridging_spend(tx, &self.cfg.bridging_agent_pubkey, vault.as_deref());
+                let (role, why) = match spend {
                     None => (None, "is no spend".to_string()),
                     Some(BridgingSpend::Withdrawal(None)) => (
                         Some(WITHDRAWER_ROLE),
                         format!("in role {WITHDRAWER_ROLE} names no withdraw_to_address"),
                     ),
-                    Some(BridgingSpend::Other(role)) => (
+                    Some(BridgingSpend::OtherVault { why, .. }) => {
+                        (Some(WITHDRAWER_ROLE), format!("in role {WITHDRAWER_ROLE} {why}"))
+                    }
+                    Some(BridgingSpend::OtherRole(role)) => (
                         Some(role),
                         format!("in role {role} is neither the bridging agent's deposit nor a withdrawal"),
                     ),
@@ -863,35 +920,31 @@ impl BridgeOrchestrator {
             h.last_error = Some(err_str.clone());
             h.last_error_at_ms = Some(Self::now_ms());
         });
-        if let Err(reset_err) = self.db.reset_in_flight_to_queued("lock", &err_str) {
-            error!("[bridge] failed to reset in_flight locks: {}", reset_err);
+        if let Err(reset_err) = self.db.reset_in_flight_to_queued(&err_str) {
+            error!("[bridge] failed to reset in_flight rows: {}", reset_err);
         }
         Some(classify_cycle_failure(e))
     }
 
-    /// Single unified bridge cycle built as a four-stage pipeline.
-    ///
-    /// Each lock row's `step` column (see [`WorkStep`]) tracks which zome calls
-    /// have been proven to land on-chain. A stage advances a row only on
-    /// evidence in a freshly-fetched live-link set, never by walking past RAVE
-    /// history: `execute_rave` is invoked with the just-read live set, so a
-    /// silently-committed RAVE drops the consumed links out of the next fetch
-    /// and the rows behind them advance on their own.
+    /// Single unified bridge cycle built as a five-stage pipeline.
     ///
     /// 1. Resolve context.
     /// 2. Reconcile: settle each row against the chain before any new write
     ///    ([`Self::reconcile_pipeline`]).
-    /// 3. S1: `create_parked_link` (CL EA) packing proofs from rows at
-    ///    `step='new'` up to the link-tag cap.
+    /// 3. S1: `create_parked_link` (CL EA) packing proofs up to the link-tag
+    ///    cap: one link of `deposit` proofs from lock rows at `step='new'`,
+    ///    and one of `withdraw` proofs from withdrawal rows at `collected`.
     /// 4. S2: `execute_rave` (CL EA) over the refetched live set; advances
     ///    each row at `cl_link_created` whose own proof was in a link the
-    ///    RAVE took off the agreement.
+    ///    RAVE took off the agreement, which ends a withdrawal row.
     /// 5. S3: `create_parked_spend` (bridging EA) packing proofs from rows
     ///    at `step='cl_rave_executed'` up to the tag cap.
     /// 6. S4: `execute_rave` (bridging EA) over the refetched live set
     ///    plus withdrawal coupons; advances to `state='succeeded'` each row
     ///    at `br_spend_created` whose own proof was in a link the RAVE took
-    ///    off the agreement.
+    ///    off the agreement, and records each withdrawal it took at `paid`.
+    /// 7. S5: `create_receipt_from_rave` once for each RAVE whose withdrawal
+    ///    rows wait at `paid`, which moves them to `collected`.
     async fn run_bridge_cycle<C: ConductorReads + ConductorWrites>(
         &self,
         conductor: &C,
@@ -921,12 +974,17 @@ impl BridgeOrchestrator {
             .reconcile_pipeline(conductor, &mut live, &context)
             .await?;
 
-        let promoted = self.db.fail_exhausted_queued("lock")?;
-        if promoted > 0 {
-            warn!(
-                "[bridge] promoted {} queued lock(s) to failed (attempts >= max_attempts)",
-                promoted
-            );
+        for flow in FLOWS {
+            let failed = self.db.fail_exhausted_queued(flow)?;
+            if !failed.is_empty() {
+                error!(
+                    event = "bridge.rows_exhausted",
+                    flow,
+                    "[bridge] {} {flow} row(s) failed after max_attempts, for a person to resolve: {}",
+                    failed.len(),
+                    failed.join(", ")
+                );
+            }
         }
         let cl_parked_live = live.on(conductor, &credit_limit_ea_id).await?.len();
         let br_parked_live = live.on(conductor, &bridging_ea_id).await?.len();
@@ -942,9 +1000,18 @@ impl BridgeOrchestrator {
         let br_spend_pending_initial =
             self.db
                 .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
+        let collected_rows =
+            self.db
+                .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Collected, 5000)?;
+        let paid_initial = self
+            .db
+            .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Paid, 5000)?
+            .len();
         if s1_rows.is_empty()
             && s3_rows_initial.is_empty()
             && br_spend_pending_initial.is_empty()
+            && collected_rows.is_empty()
+            && paid_initial == 0
             && cl_parked_live == 0
             && br_parked_live == 0
         {
@@ -957,11 +1024,13 @@ impl BridgeOrchestrator {
         }
 
         info!(
-            "[bridge/cycle] started on {} s1_pending={} s3_pending={} br_spend_pending={} cl_parked_live={} br_parked_live={} tag_cap={}",
+            "[bridge/cycle] started on {} s1_pending={} s1_withdrawals_pending={} s3_pending={} br_spend_pending={} s5_pending={} cl_parked_live={} br_parked_live={} tag_cap={}",
             context.lane,
             s1_rows.len(),
+            collected_rows.len(),
             s3_rows_initial.len(),
             br_spend_pending_initial.len(),
+            paid_initial,
             cl_parked_live,
             br_parked_live,
             tag_cap,
@@ -970,45 +1039,20 @@ impl BridgeOrchestrator {
         // ---------------------------------------------------------------
         // S1: create_parked_link on credit-limit EA
         // ---------------------------------------------------------------
-        let s1_batch = match vault {
-            Some(vault) => self.build_cl_batch(vault, &s1_rows, tag_cap)?,
-            None => ProofBatch::default(),
-        };
-        let s1_attempted = !s1_batch.ids.is_empty();
-        if s1_attempted {
-            for id in &s1_batch.ids {
-                self.db.mark_in_flight(*id)?;
-            }
-            let total_cl = UnitMap::sum_vec(s1_batch.amounts.clone())?;
-            let parked_data = parked_data(
-                &total_cl,
-                &json!({ "proof_of_deposit": s1_batch.proofs.clone() }),
-            );
-            let (cl_link_hash, s1_elapsed_ms) = timed_call(
-                "s1",
-                "create_parked_link",
-                conductor.create_parked_link(&CreateParkedLinkInput {
-                    ea_id: credit_limit_ea_id.clone(),
-                    executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-                    parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
-                }),
-            )
-            .await?;
-            let cl_link_hash = cl_link_hash.to_string();
-            info!(
-                "[bridge/s1] create_parked_link: {} proofs, action_hash={}",
-                s1_batch.proofs.len(),
-                cl_link_hash
-            );
-            // One ActionHash for the whole batch; every contributing row
-            // stores it for future reconcile comparisons.
-            for id in &s1_batch.ids {
-                self.record_cl_link(*id, &cl_link_hash, &context)?;
-            }
-            if self.ends_cycle("s1", "create_parked_link", s1_elapsed_ms, stop)? {
-                return Ok(());
+        let mut s1_batches = [ProofBatch::default(), ProofBatch::default()];
+        if let Some(vault) = vault {
+            for (batch, rows) in s1_batches.iter_mut().zip([&s1_rows, &collected_rows]) {
+                *batch = self.build_cl_batch(vault, rows, tag_cap)?;
+                if !batch.ids.is_empty()
+                    && self
+                        .park_on_credit_limit(conductor, batch, &context, stop)
+                        .await?
+                {
+                    return Ok(());
+                }
             }
         }
+        let s1_attempted = s1_batches.iter().any(|batch| !batch.ids.is_empty());
 
         // ---------------------------------------------------------------
         // S2: execute_rave on credit-limit EA
@@ -1044,14 +1088,12 @@ impl BridgeOrchestrator {
             let (cl_rave, s2_elapsed_ms) = timed_call(
                 "s2",
                 "execute_rave",
-                conductor.execute_rave(&RAVEExecuteInputs {
-                    ea_id: credit_limit_ea_id.clone(),
-                    executor_inputs: Value::Null,
-                    links: cl_links.clone(),
-                    global_definition: global_definition.id.clone().into(),
-                    lane_definitions: context.lane_definitions.clone(),
-                    strategy: GetStrategy::Local,
-                }),
+                conductor.execute_rave(&credit_limit_rave(
+                    credit_limit_ea_id.clone(),
+                    cl_links.clone(),
+                    global_definition.id.clone().into(),
+                    context.lane_definitions.clone(),
+                )),
             )
             .await?;
             let cl_rave_hash = cl_rave.hash.to_string();
@@ -1059,11 +1101,11 @@ impl BridgeOrchestrator {
             let outcome = self.rave_outcome("s2", &credit_limit_ea_id, &cl_rave, &cl_links);
             cl_rave_advanced = self.advance_consumed(
                 WorkStep::ClLinkCreated,
-                &self.links_by_lock(&outcome.taken),
+                &self.links_by_proof(&outcome.taken),
                 |id| self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash)),
             )?;
             info!(
-                "[bridge/s2] RAVE executed: {} lock(s) advanced cl_link_created → cl_rave_executed",
+                "[bridge/s2] RAVE executed: {} row(s) advanced cl_link_created → cl_rave_executed",
                 cl_rave_advanced
             );
             if self.ends_cycle("s2", "execute_rave", s2_elapsed_ms, stop)? {
@@ -1163,10 +1205,12 @@ impl BridgeOrchestrator {
             held: held_withdrawals,
             unsigned,
         } = select_bridging_links(
-            self.ethereum.as_ref().map(|side| &side.signer),
+            self.ethereum
+                .as_ref()
+                .map(|side| (&side.signer, side.chain.lock_vault_address)),
             &gate,
             &self.cfg.bridging_agent_pubkey,
-            &bridging_links,
+            &self.without_settled_withdrawals(&bridging_links)?,
             coupons_budget,
             self.cfg.hot_unit_index,
         )
@@ -1260,13 +1304,26 @@ impl BridgeOrchestrator {
         );
 
         let mut succeeded_locks = 0usize;
+        let mut paid_withdrawals = 0usize;
+        let mut fresh_rave = None;
         if !rave_links.is_empty() {
             info!(
                 "[bridge/s4] RAVE: {} deposit + {} withdrawal links",
                 retained_deposit_count, withdrawal_count
             );
+            for spend in rave_links
+                .iter()
+                .filter(|t| retained_withdrawal_ids.contains(&t.id.to_string()))
+            {
+                self.db.send_withdrawal(&WithdrawalPayload {
+                    amount: hot_amount(spend, self.cfg.hot_unit_index),
+                    spend: spend.id.to_string(),
+                    agreement: context.bridging_agreement.to_string(),
+                    withdrawer: spend.creator.to_string(),
+                })?;
+            }
 
-            let (br_rave, _s4_elapsed_ms) = timed_call(
+            let (br_rave, s4_elapsed_ms) = timed_call(
                 "s4",
                 "execute_rave",
                 conductor.execute_rave(&RAVEExecuteInputs {
@@ -1286,31 +1343,49 @@ impl BridgeOrchestrator {
             let outcome = self.rave_outcome("s4", &bridging_ea_id, &br_rave, &rave_links);
             succeeded_locks = self.advance_consumed(
                 WorkStep::BrSpendCreated,
-                &self.links_by_lock(&outcome.taken),
+                &self.links_by_proof(&outcome.taken),
                 |id| self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash)),
             )?;
+            paid_withdrawals =
+                self.record_paid(&outcome, &retained_withdrawal_ids, &br_rave_hash)?;
             info!(
-                "[bridge/s4] RAVE executed: {} lock(s) advanced br_spend_created → br_rave_executed (succeeded)",
-                succeeded_locks
+                "[bridge/s4] RAVE executed: {} lock(s) advanced br_spend_created → br_rave_executed (succeeded), {} withdrawal(s) paid",
+                succeeded_locks, paid_withdrawals
             );
+            fresh_rave = Some(br_rave.hash);
+            if self.ends_cycle("s4", "execute_rave", s4_elapsed_ms, stop)? {
+                return Ok(());
+            }
         } else if !s1_attempted && !s3_attempted {
             debug!("[bridge] cycle no-op: no pending links on bridging EA");
         }
 
+        // ---------------------------------------------------------------
+        // S5: create_receipt_from_rave for each RAVE that paid withdrawals
+        // ---------------------------------------------------------------
+        let collected = self
+            .collect_withdrawals(conductor, &mut live, fresh_rave.as_ref(), stop)
+            .await?;
+
         let duration_ms = started.elapsed().as_millis() as u64;
+        let [lock_s1, withdrawal_s1] = &s1_batches;
         info!(
-            "[bridge/cycle] completed duration={}ms reconcile=(s1={} s2={} s3={} s4={}) s1_written={} s2_advanced={} s3_written={} s4_succeeded={} withdrawals={} capped_cl={} capped_spend={} deferred_cl={} deferred_br_rave={}",
+            "[bridge/cycle] completed duration={}ms reconcile=(s1={} s2={} s3={} s4={} s5={}) s1_written={} s1_withdrawals_written={} s2_advanced={} s3_written={} s4_succeeded={} withdrawals={} withdrawals_paid={} s5_collected={} capped_cl={} capped_spend={} deferred_cl={} deferred_br_rave={}",
             duration_ms,
             reconcile.s1_advanced,
             reconcile.s2_advanced,
             reconcile.s3_advanced,
             reconcile.s4_advanced,
-            s1_batch.ids.len(),
+            reconcile.s5_advanced,
+            lock_s1.ids.len(),
+            withdrawal_s1.ids.len(),
             cl_rave_advanced,
             s3_written,
             succeeded_locks,
             withdrawal_count,
-            s1_batch.capped,
+            paid_withdrawals,
+            collected,
+            lock_s1.capped || withdrawal_s1.capped,
             s3_batch.capped,
             deferred_cl_links,
             deferred_br_rave,
@@ -1319,8 +1394,7 @@ impl BridgeOrchestrator {
         Ok(())
     }
 
-    /// Reconcile each lock against live chain truth before running the
-    /// pipeline's write stages, never walking past RAVE history.
+    /// Settles each row against the chain before the cycle's writes.
     ///
     /// Rules, applied in step-order (a single row that already has chain
     /// evidence at multiple steps gets cascaded forward each time we
@@ -1335,6 +1409,11 @@ impl BridgeOrchestrator {
     ///   spend's ActionHash.
     /// * `step='br_spend_created'` and [`Self::link_consumed`] → advance to
     ///   `br_rave_executed` (simultaneously `state='succeeded'`).
+    ///
+    /// A withdrawal row moves `sent` → `paid` once its spend is gone and a RAVE
+    /// of the bridging agent's records it consumed, `paid` → `collected` once
+    /// the chain holds a receipt of that RAVE, and on from `collected` by the
+    /// first two rules, as a lock row at `new`.
     async fn reconcile_pipeline(
         &self,
         conductor: &impl ConductorReads,
@@ -1346,31 +1425,37 @@ impl BridgeOrchestrator {
         let cl_live = live.on(conductor, &credit_limit).await?;
         let mut parked: HashSet<String> = cl_live.iter().map(|tx| tx.id.to_string()).collect();
         self.log_foreign_proofs("proof_foreign/credit_limit", cl_live);
-        let cl_by_lock = self.links_by_lock(cl_live);
+        let cl_by_proof = self.links_by_proof(cl_live);
         let br_live = live.on(conductor, &bridging).await?;
         parked.extend(br_live.iter().map(|tx| tx.id.to_string()));
         self.forget_unparked(&parked);
         self.log_foreign_proofs("proof_foreign/bridging", br_live);
         self.log_skipped_links(br_live);
-        let br_by_lock = self.links_by_lock(br_live);
+        let br_by_proof = self.links_by_proof(br_live);
         let mut counts = ReconcileCounts::default();
 
-        for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
-            let Some(link_id) = self.lock_key(&row).and_then(|lock| cl_by_lock.get(&lock)) else {
+        self.reconcile_withdrawals(conductor, live, &bridging, &mut counts)
+            .await?;
+
+        for row in self.pending_at(&[
+            ("lock", WorkStep::New),
+            (WITHDRAWAL_FLOW, WorkStep::Collected),
+        ])? {
+            let Some(link_id) = self.proof_key(&row).and_then(|key| cl_by_proof.get(&key)) else {
                 continue;
             };
             debug!(
-                "[bridge/reconcile] lock={} new → cl_link_created (its proof is in live CL link {})",
-                row.item_id, link_id
+                "[bridge/reconcile] {} {} → cl_link_created (its proof is in live CL link {})",
+                row.item_id, row.step, link_id
             );
             self.record_cl_link(row.id, link_id, context)?;
             counts.s1_advanced += 1;
         }
 
-        for row in self
-            .db
-            .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?
-        {
+        for row in self.pending_at(&[
+            ("lock", WorkStep::ClLinkCreated),
+            (WITHDRAWAL_FLOW, WorkStep::ClLinkCreated),
+        ])? {
             if let Some(rave) = self
                 .link_consumed(conductor, live, &row, &credit_limit)
                 .await?
@@ -1385,7 +1470,7 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?
         {
-            let Some(spend_id) = self.lock_key(&row).and_then(|lock| br_by_lock.get(&lock)) else {
+            let Some(spend_id) = self.proof_key(&row).and_then(|key| br_by_proof.get(&key)) else {
                 continue;
             };
             debug!(
@@ -1413,6 +1498,7 @@ impl BridgeOrchestrator {
             s2 = counts.s2_advanced,
             s3 = counts.s3_advanced,
             s4 = counts.s4_advanced,
+            s5 = counts.s5_advanced,
             "[bridge/reconcile] cycle summary"
         );
 
@@ -1427,6 +1513,41 @@ impl BridgeOrchestrator {
     fn record_br_spend(&self, id: i64, spend: &str, context: &DepositContext) -> Result<()> {
         let agreement = context.bridging_agreement.to_string();
         self.db.advance_to_br_spend_created(id, spend, &agreement)
+    }
+
+    /// `true` when the cycle ends after the write.
+    async fn park_on_credit_limit(
+        &self,
+        conductor: &impl ConductorWrites,
+        batch: &ProofBatch,
+        context: &DepositContext,
+        stop: &ShutdownRx,
+    ) -> Result<bool> {
+        for id in &batch.ids {
+            self.db.mark_in_flight(*id)?;
+        }
+        let total = UnitMap::sum_vec(batch.amounts.clone())?;
+        let parked_data = parked_data(&total, &json!({ "proof_of_deposit": batch.proofs }));
+        let (link, elapsed_ms) = timed_call(
+            "s1",
+            "create_parked_link",
+            conductor.create_parked_link(&CreateParkedLinkInput {
+                ea_id: context.credit_limit_adjustment.clone().into(),
+                executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
+                parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
+            }),
+        )
+        .await?;
+        let link = link.to_string();
+        info!(
+            "[bridge/s1] create_parked_link: {} proofs, action_hash={}",
+            batch.proofs.len(),
+            link
+        );
+        for id in &batch.ids {
+            self.record_cl_link(*id, &link, context)?;
+        }
+        self.ends_cycle("s1", "create_parked_link", elapsed_ms, stop)
     }
 
     /// Whether a RAVE consumed the link a row waits on: it has left the
@@ -1446,12 +1567,14 @@ impl BridgeOrchestrator {
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
-            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e).map(|()| None),
+            Err(e) if recorded.is_some() => {
+                return Self::unresolved_link(row, link, e).map(|()| None)
+            }
             Err(e) => {
                 return match held_link(conductor, live, link).await {
                     Ok(None) => self.lost(row, link),
-                    Ok(Some(_)) => Self::unresolved(row, link, e),
-                    Err(held) => Self::unresolved(row, link, held),
+                    Ok(Some(_)) => Self::unresolved_link(row, link, e),
+                    Err(held) => Self::unresolved_link(row, link, held),
                 }
                 .map(|()| None)
             }
@@ -1461,7 +1584,7 @@ impl BridgeOrchestrator {
                 .record_parked_agreement(row.id, &agreement.to_string())?;
             info!(
                 event = "bridge.reconcile.agreement_recorded",
-                "[bridge/reconcile] lock={} link {} was parked on agreement {}",
+                "[bridge/reconcile] {} link {} was parked on agreement {}",
                 row.item_id,
                 link,
                 agreement
@@ -1472,30 +1595,32 @@ impl BridgeOrchestrator {
                 Ok(Some(record)) => {
                     let link_seq = record.action().action_seq();
                     let consumer = match self.recorded_write(record, row) {
-                        RecordedWrite::Own => match live.consumer(conductor, link, link_seq).await {
-                            Ok(Some(rave)) => {
-                                info!(
-                                    event = "bridge.reconcile.consumed",
+                        RecordedWrite::Own => {
+                            match live.consumer(conductor, link, link_seq).await {
+                                Ok(Some(rave)) => {
+                                    info!(
+                                        event = "bridge.reconcile.consumed",
+                                        link,
+                                        rave = %rave,
+                                        "[bridge/reconcile] {} at {}: RAVE {} consumed link {} off agreement {}",
+                                        row.item_id,
+                                        row.step,
+                                        rave,
+                                        link,
+                                        agreement
+                                    );
+                                    return Ok(Some(rave));
+                                }
+                                Ok(None) => self.link_for_a_person(
+                                    row,
+                                    "bridge.reconcile.link_not_consumed",
                                     link,
-                                    rave = %rave,
-                                    "[bridge/reconcile] lock={} at {}: RAVE {} consumed link {} off agreement {}",
-                                    row.item_id,
-                                    row.step,
-                                    rave,
-                                    link,
-                                    agreement
-                                );
-                                return Ok(Some(rave));
+                                    &untaken(&agreement),
+                                ),
+                                Err(e) => Self::unresolved_link(row, link, e),
                             }
-                            Ok(None) => self.for_a_person(
-                                row,
-                                "bridge.reconcile.link_not_consumed",
-                                link,
-                                &format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed"),
-                            ),
-                            Err(e) => Self::unresolved(row, link, e),
-                        },
-                        RecordedWrite::Unreadable(e) => self.for_a_person(
+                        }
+                        RecordedWrite::Unreadable(e) => self.link_for_a_person(
                             row,
                             "bridge.reconcile.tag_unreadable",
                             link,
@@ -1504,25 +1629,35 @@ impl BridgeOrchestrator {
                         // Whether the deposit was credited is unknowable here, so its row is
                         // neither advanced nor written again.
                         RecordedWrite::Misrecorded(why) => {
-                            self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
+                            self.link_for_a_person(row, "bridge.rave.proof_missing", link, &why)
                         }
                     };
                     return consumer.map(|()| None);
                 }
                 Ok(None) => return self.lost(row, link).map(|()| None),
-                Err(e) => return Self::unresolved(row, link, e).map(|()| None),
+                Err(e) => return Self::unresolved_link(row, link, e).map(|()| None),
             }
         }
         if agreement != *in_force {
-            error!(
-                event = "bridge.reconcile.superseded_agreement",
-                "[bridge/reconcile] lock={} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
-                row.item_id,
-                agreement,
-                link
-            );
+            Self::superseded(row, &agreement, &format!("consume link {link}"));
         }
         Ok(None)
+    }
+
+    fn superseded(row: &WorkItem, agreement: &ActionHash, what: &str) {
+        error!(
+            event = "bridge.reconcile.superseded_agreement",
+            "[bridge/reconcile] {} waits on agreement {agreement}, no longer in force: only a RAVE on it can {what}",
+            row.item_id
+        );
+    }
+
+    fn pending_at(&self, steps: &[(&str, WorkStep)]) -> Result<Vec<WorkItem>> {
+        let mut rows = Vec::new();
+        for (flow, step) in steps {
+            rows.extend(self.db.list_pending_by_step(flow, step.clone(), 5000)?);
+        }
+        Ok(rows)
     }
 
     fn recorded_write(&self, record: &Record, row: &WorkItem) -> RecordedWrite {
@@ -1530,10 +1665,15 @@ impl BridgeOrchestrator {
         if author != self.cfg.bridging_agent_pubkey {
             return RecordedWrite::Misrecorded(format!("was signed by {author}"));
         }
-        let Some(lock) = self.lock_key(row) else {
-            return RecordedWrite::Misrecorded(
-                "cannot be checked: the row's payload names no lock".to_string(),
-            );
+        let Some(key) = self.proof_key(row) else {
+            return RecordedWrite::Misrecorded(format!(
+                "cannot be checked: the row's payload names no {}",
+                if row.flow == WITHDRAWAL_FLOW {
+                    "spend"
+                } else {
+                    "lock"
+                }
+            ));
         };
         let proofs = match tag_proofs(record, &row.step) {
             Ok(proofs) => proofs,
@@ -1545,20 +1685,20 @@ impl BridgeOrchestrator {
                 other => format!("carries a proof_of_deposit that is not a list: {other}"),
             });
         };
-        let locks: Vec<LockKey> = proofs.iter().filter_map(LockKey::of_proof).collect();
-        if locks.contains(&lock) {
+        let keys: Vec<ProofKey> = proofs.iter().filter_map(ProofKey::of_proof).collect();
+        if keys.contains(&key) {
             return RecordedWrite::Own;
         }
-        let unnamed = proofs.len() - locks.len();
+        let unnamed = proofs.len() - keys.len();
         RecordedWrite::Misrecorded(if unnamed == 0 {
             "does not carry its proof".to_string()
         } else {
-            format!("does not carry its proof, and {unnamed} of its proofs name no lock")
+            format!("does not carry its proof, and {unnamed} of its proofs name no lock or spend")
         })
     }
 
     fn lost(&self, row: &WorkItem, link: &str) -> Result<()> {
-        self.for_a_person(
+        self.link_for_a_person(
             row,
             "bridge.reconcile.link_not_held",
             link,
@@ -1566,42 +1706,48 @@ impl BridgeOrchestrator {
         )
     }
 
-    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
-        let lock = self.lock_key(row);
+    fn link_for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
+        self.fail_for_a_person(row, event, &format!("its recorded link {link} {why}"))
+    }
+
+    fn fail_for_a_person(&self, row: &WorkItem, event: &str, reason: &str) -> Result<()> {
+        let key = self.proof_key(row);
+        let lock = key.as_ref().and_then(ProofKey::lock);
         error!(
             event,
-            lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
-            tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
-            link,
-            "[bridge] lock={} at {} is failed for manual resolution: its recorded link {} {}",
+            lock_id = lock.map(|lock| lock.lock_id.as_str()),
+            tx_hash = lock.map(|lock| lock.tx_hash.as_str()),
+            spend = key.as_ref().and_then(ProofKey::spend),
+            "[bridge] {} at {} is failed for manual resolution: {}",
             row.item_id,
             row.step,
-            link,
-            why
+            reason
         );
-        self.db.mark_failed_permanent(
-            row.id,
-            &format!("its recorded link {link} {why}; resolve by hand"),
-        )?;
+        self.db
+            .mark_failed_permanent(row.id, &format!("{reason}; resolve by hand"))?;
         Ok(())
     }
 
-    fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<()> {
+    fn unresolved_link(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<()> {
+        Self::unresolved(row, &format!("its link {link}"), e)
+    }
+
+    fn unresolved(row: &WorkItem, what: &str, e: anyhow::Error) -> Result<()> {
         if is_stopped(&e) {
             return Err(e);
         }
         if classify_cycle_failure(&e) != CycleFailureAction::UnclassifiedCooldown {
             return Err(e.context(format!(
-                "lock {} at {}: its link {} could not be checked",
-                row.item_id, row.step, link
+                "{} at {}: {} could not be checked",
+                row.item_id, row.step, what
             )));
         }
         error!(
             event = "bridge.reconcile.unresolved",
-            "[bridge/reconcile] lock={} at {} stays pending, its link {} could not be checked: {:#}",
+            "[bridge/reconcile] {} at {} stays pending, {} could not be checked: {:#}",
             row.item_id,
             row.step,
-            link,
+            what,
             e
         );
         Ok(())
@@ -1613,61 +1759,62 @@ impl BridgeOrchestrator {
     fn advance_consumed(
         &self,
         step: WorkStep,
-        taken: &HashMap<LockKey, String>,
+        taken: &HashMap<ProofKey, String>,
         advance: impl Fn(i64) -> Result<()>,
     ) -> Result<usize> {
         let taken_links: HashSet<&str> = taken.values().map(String::as_str).collect();
-        let mut unadvanced: HashMap<&LockKey, &String> = taken.iter().collect();
+        let mut unadvanced: HashMap<&ProofKey, &String> = taken.iter().collect();
         let mut advanced = 0;
-        for row in self.db.list_pending_by_step("lock", step.clone(), 5000)? {
-            let (Some((link, _)), Some(lock)) = (row.parked_link(), self.lock_key(&row)) else {
+        for row in self.pending_at(&FLOWS.map(|flow| (flow, step.clone())))? {
+            let (Some((link, _)), Some(key)) = (row.parked_link(), self.proof_key(&row)) else {
                 continue;
             };
-            if taken.contains_key(&lock) {
+            if taken.contains_key(&key) {
                 advance(row.id)?;
-                unadvanced.remove(&lock);
+                unadvanced.remove(&key);
                 advanced += 1;
             } else if taken_links.contains(link) {
                 error!(
                     event = "bridge.rave.proof_missing",
-                    lock_id = lock.lock_id,
-                    tx_hash = lock.tx_hash,
+                    lock_id = key.lock().map(|lock| lock.lock_id.as_str()),
+                    tx_hash = key.lock().map(|lock| lock.tx_hash.as_str()),
+                    spend = key.spend(),
                     link,
-                    "[bridge/rave] lock={} at {}: its recorded link {} went to the RAVE without its proof",
+                    "[bridge/rave] {} at {}: its recorded link {} went to the RAVE without its proof",
                     row.item_id,
                     row.step,
                     link
                 );
             }
         }
-        for (lock, link) in unadvanced {
+        for (key, link) in unadvanced {
             error!(
                 event = "bridge.rave.took_unpending_row",
-                lock_id = lock.lock_id,
-                tx_hash = lock.tx_hash,
+                lock_id = key.lock().map(|lock| lock.lock_id.as_str()),
+                tx_hash = key.lock().map(|lock| lock.tx_hash.as_str()),
+                spend = key.spend(),
                 link,
-                "[bridge/rave] a RAVE took link {link} carrying lock {}, whose row is not pending at {step}",
-                lock.lock_id
+                "[bridge/rave] a RAVE took link {link} carrying {key}, whose row is not pending at {step}"
             );
         }
         Ok(advanced)
     }
 
-    fn links_by_lock(&self, parked: &[Transaction]) -> HashMap<LockKey, String> {
-        links_by_lock(parked, &self.cfg.bridging_agent_pubkey)
+    fn links_by_proof(&self, parked: &[Transaction]) -> HashMap<ProofKey, String> {
+        links_by_proof(parked, &self.cfg.bridging_agent_pubkey)
     }
 
-    /// `links` without each deposit link its rows do not account for: every
-    /// lock it carries has a row that records exactly that link at this stage,
-    /// whatever the row's step or state.
+    /// `links` without each proof link its rows do not account for: every
+    /// lock or withdrawal it carries has a row, not failed, that records
+    /// exactly that link at this stage.
     fn accounted_links(
         &self,
         stage: &'static str,
         links: Vec<Transaction>,
         recorded: impl Fn(&WorkItem) -> Option<&str>,
     ) -> Result<Vec<Transaction>> {
-        let rows = self.db.list_flow("lock")?;
-        let by_lock: HashMap<LockKey, RowLink> = rows
+        let rows = self.db.list_all()?;
+        let by_key: HashMap<ProofKey, RowLink> = rows
             .iter()
             .filter_map(|row| {
                 let link = match (&row.state, recorded(row)) {
@@ -1675,7 +1822,7 @@ impl BridgeOrchestrator {
                     (_, Some(link)) => RowLink::Records(link),
                     (_, None) => RowLink::RecordsNone,
                 };
-                Some((self.lock_key(row)?, link))
+                Some((self.proof_key(row)?, link))
             })
             .collect();
         let mut deferred = self.deferred.lock().expect("deferred mutex poisoned");
@@ -1686,7 +1833,7 @@ impl BridgeOrchestrator {
         let mut foreign = Vec::new();
         for link in links {
             let id = link.id.to_string();
-            match unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock) {
+            match unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_key) {
                 None => accounted.push(link),
                 Some(Gap::Foreign(why)) => foreign.push((id, why)),
                 Some(Gap::Unrecorded(why)) => {
@@ -1738,14 +1885,14 @@ impl BridgeOrchestrator {
             .iter()
             .filter(|row| recorded(row) == Some(link) && row.state != WorkState::Failed)
         {
-            self.for_a_person(row, "bridge.rave.link_withheld", link, why)?;
+            self.link_for_a_person(row, "bridge.rave.link_withheld", link, why)?;
         }
         Ok(())
     }
 
     /// The links among `sent` that the RAVE on `agreement` consumed, as its own
     /// record names them. One it was given and did not record was refused,
-    /// redacted, or left for a later run.
+    /// redacted, no longer parked, or left for a later run.
     fn rave_outcome(
         &self,
         stage: &str,
@@ -1762,9 +1909,9 @@ impl BridgeOrchestrator {
         let outcome = RaveOutcome { taken, left };
         for link in &outcome.left {
             let locks: Vec<String> = self
-                .links_by_lock(std::slice::from_ref(link))
+                .links_by_proof(std::slice::from_ref(link))
                 .into_keys()
-                .map(|lock| lock.lock_id)
+                .map(|key| key.to_string())
                 .collect();
             if locks.is_empty() {
                 warn!(
@@ -1775,13 +1922,30 @@ impl BridgeOrchestrator {
             } else {
                 error!(
                     event = "bridge.rave.link_refused",
-                    "[bridge/{stage}] the RAVE {rave} on agreement {agreement} did not consume link {}, nor with it lock(s) {}",
+                    "[bridge/{stage}] the RAVE {rave} on agreement {agreement} did not consume link {}, nor with it {}",
                     link.id,
                     locks.join(", ")
                 );
             }
         }
         outcome
+    }
+
+    /// What the row's proof stands for, as [`Self::extract_proof`] writes it.
+    fn proof_key(&self, item: &WorkItem) -> Option<ProofKey> {
+        if item.flow != WITHDRAWAL_FLOW {
+            return self.lock_key(item).map(ProofKey::Lock);
+        }
+        match item.withdrawal() {
+            Ok(withdrawal) => Some(ProofKey::Withdrawal(withdrawal.spend)),
+            Err(e) => {
+                error!(
+                    event = "bridge.payload_unreadable",
+                    "[bridge] {} has an unreadable withdrawal payload: {}", item.item_id, e
+                );
+                None
+            }
+        }
     }
 
     /// The lock [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
@@ -1798,10 +1962,10 @@ impl BridgeOrchestrator {
         }
     }
 
-    /// Build the S1 `create_parked_link` batch from rows at `step='new'`,
-    /// respecting the link-tag cap. A row whose payload cannot be read,
-    /// encoded, or written at any cap is marked permanently failed and
-    /// excluded; a row the cap alone cannot take waits for the next cycle.
+    /// Build the S1 `create_parked_link` batch from `rows`, respecting the
+    /// link-tag cap. A row whose payload cannot be read, encoded, or written at
+    /// any cap is marked permanently failed and excluded; a row the cap alone
+    /// cannot take waits for the next cycle.
     fn build_cl_batch(
         &self,
         vault: Address,
@@ -1810,11 +1974,11 @@ impl BridgeOrchestrator {
     ) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
-            let (proof, amount) = match self.extract_lock_proof(vault, item) {
+            let (proof, amount) = match self.extract_proof(vault, item) {
                 Ok(v) => v,
                 Err(e) => {
                     error!(
-                        "[bridge/s1] proof extraction failed id={} error={}, abandoning the deposit",
+                        "[bridge/s1] proof extraction failed id={} error={}, abandoning it",
                         item.item_id, e
                     );
                     if let Err(db_err) = self
@@ -1841,7 +2005,7 @@ impl BridgeOrchestrator {
                 Ok(n) => n,
                 Err(e) => {
                     error!(
-                        "[bridge/s1] failed to estimate cl tag size id={} error={}, abandoning the deposit",
+                        "[bridge/s1] failed to estimate cl tag size id={} error={}, abandoning it",
                         item.item_id, e
                     );
                     if let Err(db_err) = self.db.mark_failed_permanent(
@@ -2013,7 +2177,7 @@ impl BridgeOrchestrator {
             return UnfittableHead::Deferred;
         }
         error!(
-            "[bridge/{}] proof id={} cannot be written at any cap (size={} > ceiling={}), abandoning the deposit",
+            "[bridge/{}] proof id={} cannot be written at any cap (size={} > ceiling={}), abandoning it",
             stage, item.item_id, alone, LINK_TAG_BYTES_CEILING
         );
         if let Err(db_err) = self.db.mark_failed_permanent(
@@ -2030,9 +2194,30 @@ impl BridgeOrchestrator {
         UnfittableHead::Abandoned
     }
 
+    fn extract_proof(&self, vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
+        if item.flow != WITHDRAWAL_FLOW {
+            return self.extract_lock_proof(vault, item);
+        }
+        let payload = item.withdrawal()?;
+        let hot: ZFuel = payload
+            .amount
+            .parse()
+            .map_err(|e| anyhow::anyhow!("amount {:?} does not read: {e:?}", payload.amount))?;
+        let proof = json!({
+            "method": WITHDRAW_METHOD,
+            "contract_address": vault_key(vault),
+            "amount": payload.amount,
+            "depositor_wallet_address": payload.withdrawer,
+            "spend": payload.spend,
+        });
+        Ok((
+            proof,
+            UnitMap::load(BTreeMap::from([(self.cfg.hot_unit_index.to_string(), hot)])),
+        ))
+    }
+
     fn extract_lock_proof(&self, vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
         let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let contract_hex = format!("{vault:x}");
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
@@ -2040,7 +2225,7 @@ impl BridgeOrchestrator {
 
         let proof = json!({
             "method": "deposit",
-            "contract_address": format!("0x{}", contract_hex.to_lowercase()),
+            "contract_address": vault_key(vault),
             "amount": amount,
             "depositor_wallet_address": depositor,
             "lock_id": lock.lock_id,
@@ -2140,7 +2325,9 @@ struct CandidateLane {
 }
 
 impl CandidateLane {
-    /// Mirrors `adjustment_refusal` in the alliance DNA's RAVE validation.
+    /// Mirrors `adjustment_refusal` in the alliance DNA's RAVE validation, except
+    /// that the DNA also accepts the lane's `reserver`: the bridge works only on
+    /// the lane `author` bridges.
     fn accepts_adjustment(&self, author: &AgentPubKeyB64, credit_limit: &UnitMap) -> bool {
         let is_global_lane = self.version.is_none();
         self.definition.special_agents.bridging_agent.pub_key == *author
@@ -2169,6 +2356,8 @@ trait ConductorReads {
 
 struct ChainPage {
     raves: Vec<RaveRun>,
+    /// Each RAVE a receipt on the page names, with that receipt.
+    receipts: Vec<(ActionHash, ActionHash)>,
     next: ChainRead,
 }
 
@@ -2177,6 +2366,7 @@ trait ConductorWrites {
     async fn create_parked_link(&self, input: &CreateParkedLinkInput) -> Result<ActionHashB64>;
     async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<RaveRun>;
     async fn create_parked_spend(&self, input: &CreateParkedSpendInput) -> Result<ActionHashB64>;
+    async fn create_receipt_from_rave(&self, input: &ReceiptInput) -> Result<ActionHashB64>;
 }
 
 /// Each agreement's parked links, and each link's agreement, as reconcile
@@ -2192,8 +2382,16 @@ struct LiveLinks {
 #[derive(Default)]
 struct RavesRead {
     consumers: HashMap<String, ActionHash>,
+    seen: HashSet<ActionHash>,
+    receipts: HashMap<ActionHash, ActionHash>,
     next: ChainRead,
     failed: Option<String>,
+}
+
+enum Receipt {
+    Written(ActionHash),
+    Due,
+    NoRave,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -2240,45 +2438,74 @@ impl LiveLinks {
         link: &str,
         link_seq: u32,
     ) -> Result<Option<ActionHash>> {
-        let read = &mut self.raves;
         loop {
+            let read = &self.raves;
             if let Some(rave) = read.consumers.get(link) {
                 return Ok(Some(rave.clone()));
             }
-            let from = read.next;
-            match from {
+            match read.next {
                 ChainRead::From(seq) if seq <= link_seq => return Ok(None),
                 ChainRead::Done => return Ok(None),
                 _ => {}
             }
-            if let Some(failed) = &read.failed {
-                anyhow::bail!("{failed}");
-            }
-            let page = match conductor.raves(from).await {
-                Ok(page) => page,
-                Err(e) if is_stopped(&e) => return Err(e),
-                Err(e) => {
-                    read.failed = Some(format!("{e:#}"));
-                    return Err(e);
-                }
-            };
-            for rave in page.raves {
-                for consumed in rave.consumed {
-                    read.consumers
-                        .insert(consumed.to_string(), rave.hash.clone());
-                }
-            }
-            if let (ChainRead::From(seq), ChainRead::From(next)) = (from, page.next) {
-                if next >= seq {
-                    let failed = format!(
-                        "the read of the bridging agent's chain from action {seq} moved no further back"
-                    );
-                    read.failed = Some(failed.clone());
-                    anyhow::bail!(failed);
-                }
-            }
-            read.next = page.next;
+            self.read_back(conductor).await?;
         }
+    }
+
+    /// Read back no further than `rave` itself, as a receipt of it is newer.
+    async fn receipt(
+        &mut self,
+        conductor: &impl ConductorReads,
+        rave: &ActionHash,
+    ) -> Result<Receipt> {
+        loop {
+            let read = &self.raves;
+            if let Some(receipt) = read.receipts.get(rave) {
+                return Ok(Receipt::Written(receipt.clone()));
+            }
+            if read.seen.contains(rave) {
+                return Ok(Receipt::Due);
+            }
+            if read.next == ChainRead::Done {
+                return Ok(Receipt::NoRave);
+            }
+            self.read_back(conductor).await?;
+        }
+    }
+
+    async fn read_back(&mut self, conductor: &impl ConductorReads) -> Result<()> {
+        let read = &mut self.raves;
+        if let Some(failed) = &read.failed {
+            anyhow::bail!("{failed}");
+        }
+        let from = read.next;
+        let page = match conductor.raves(from).await {
+            Ok(page) => page,
+            Err(e) if is_stopped(&e) => return Err(e),
+            Err(e) => {
+                read.failed = Some(format!("{e:#}"));
+                return Err(e);
+            }
+        };
+        for rave in page.raves {
+            for consumed in rave.consumed {
+                read.consumers
+                    .insert(consumed.to_string(), rave.hash.clone());
+            }
+            read.seen.insert(rave.hash);
+        }
+        read.receipts.extend(page.receipts);
+        if let (ChainRead::From(seq), ChainRead::From(next)) = (from, page.next) {
+            if next >= seq {
+                let failed = format!(
+                    "the read of the bridging agent's chain from action {seq} moved no further back"
+                );
+                read.failed = Some(failed.clone());
+                anyhow::bail!(failed);
+            }
+        }
+        read.next = page.next;
+        Ok(())
     }
 }
 
@@ -2363,6 +2590,11 @@ impl<C: ConductorWrites> ConductorWrites for Gated<'_, C> {
     async fn create_parked_spend(&self, input: &CreateParkedSpendInput) -> Result<ActionHashB64> {
         ensure_running(self.stop)?;
         self.conductor.create_parked_spend(input).await
+    }
+
+    async fn create_receipt_from_rave(&self, input: &ReceiptInput) -> Result<ActionHashB64> {
+        ensure_running(self.stop)?;
+        self.conductor.create_receipt_from_rave(input).await
     }
 }
 
@@ -2514,8 +2746,20 @@ fn chain_page(history: History) -> Result<ChainPage> {
             })
         })
         .collect::<Result<_>>()?;
+    let receipts = history
+        .items
+        .iter()
+        .filter_map(|tx| match &tx.details {
+            TransactionDetails::Receipt {
+                source: PaymentSource::ExecutionInstance(rave),
+                ..
+            } => Some((rave.clone().into(), tx.id.clone().into())),
+            _ => None,
+        })
+        .collect();
     Ok(ChainPage {
         raves,
+        receipts,
         next: match history.end_of_chain {
             true => ChainRead::Done,
             false => ChainRead::From(history.low_boundary),
@@ -2589,6 +2833,18 @@ impl ConductorWrites for Conductor<'_> {
             .call_zome(self.role_name, "transactor", "create_parked_spend", input)
             .await
             .context("create_parked_spend failed")
+    }
+
+    async fn create_receipt_from_rave(&self, input: &ReceiptInput) -> Result<ActionHashB64> {
+        self.ham
+            .call_zome(
+                self.role_name,
+                "transactor",
+                "create_receipt_from_rave",
+                input,
+            )
+            .await
+            .context("create_receipt_from_rave failed")
     }
 }
 
@@ -2669,21 +2925,15 @@ struct ProofBatch {
     capped: bool,
 }
 
-/// Per-cycle summary of reconciler advancements. One counter per
-/// pipeline step transition (S1 → S4), incremented once per row
-/// advanced by the reconciler in this cycle.
-///
-/// Returned from [`BridgeOrchestrator::reconcile_pipeline`] so tests
-/// can assert advancement exactly, and emitted as a single structured
-/// `info!` line so operators can see recovery activity at a glance.
-/// A non-zero count is the canonical signal that a prior cycle
-/// crashed mid-call.
+/// Per stage, S1 to S5, how many rows reconcile found that stage had moved. A
+/// nonzero count means an earlier cycle ended before it recorded a write.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReconcileCounts {
     s1_advanced: usize,
     s2_advanced: usize,
     s3_advanced: usize,
     s4_advanced: usize,
+    s5_advanced: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2879,6 +3129,22 @@ fn parked_data(total_amount: &UnitMap, payload: &Value) -> ParkedData {
     }
 }
 
+fn credit_limit_rave(
+    ea_id: ActionHash,
+    links: Vec<Transaction>,
+    global_definition: ActionHash,
+    lane_definitions: Vec<ActionHash>,
+) -> RAVEExecuteInputs {
+    RAVEExecuteInputs {
+        ea_id,
+        executor_inputs: json!({ "call_method": "bridge" }),
+        links,
+        global_definition,
+        lane_definitions,
+        strategy: GetStrategy::Local,
+    }
+}
+
 /// Estimate the msgpack link-tag size a `ParkedData` write with the given
 /// aggregate proofs payload would produce. Used to cap the
 /// `create_parked_link` batch against Holochain's link tag size limit.
@@ -3000,6 +3266,46 @@ impl LockKey {
     }
 }
 
+/// What a proof on one of the bridging agent's own links stands for. A
+/// withdrawal is keyed by its spend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProofKey {
+    Lock(LockKey),
+    Withdrawal(String),
+}
+
+impl ProofKey {
+    fn of_proof(proof: &Value) -> Option<Self> {
+        if proof.get("method").and_then(Value::as_str) == Some(WITHDRAW_METHOD) {
+            return Some(Self::Withdrawal(proof.get("spend")?.as_str()?.to_string()));
+        }
+        LockKey::of_proof(proof).map(Self::Lock)
+    }
+
+    fn lock(&self) -> Option<&LockKey> {
+        match self {
+            Self::Lock(lock) => Some(lock),
+            Self::Withdrawal(_) => None,
+        }
+    }
+
+    fn spend(&self) -> Option<&str> {
+        match self {
+            Self::Lock(_) => None,
+            Self::Withdrawal(spend) => Some(spend),
+        }
+    }
+}
+
+impl std::fmt::Display for ProofKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lock(lock) => write!(f, "lock {}", lock.lock_id),
+            Self::Withdrawal(spend) => write!(f, "withdrawal {spend}"),
+        }
+    }
+}
+
 fn deposit_proofs(tx: &Transaction) -> Option<&Value> {
     match &tx.details {
         TransactionDetails::Parked {
@@ -3028,7 +3334,7 @@ fn unaccounted(
     link: &Transaction,
     id: &str,
     bridging_agent: &AgentPubKeyB64,
-    recorded: &HashMap<LockKey, RowLink>,
+    recorded: &HashMap<ProofKey, RowLink>,
 ) -> Option<Gap> {
     let conflict = |why: String| Some(Gap::Conflict(why));
     if link.creator != *bridging_agent {
@@ -3037,36 +3343,28 @@ fn unaccounted(
     let Some(proofs) = deposit_proofs(link).and_then(Value::as_array) else {
         return conflict("it carries no list of deposit proofs".to_string());
     };
-    let Some(locks) = proofs
+    let Some(keys) = proofs
         .iter()
-        .map(LockKey::of_proof)
+        .map(ProofKey::of_proof)
         .collect::<Option<Vec<_>>>()
     else {
-        return conflict("a deposit proof it carries names no lock".to_string());
+        return conflict("a proof it carries names no lock or spend".to_string());
     };
-    if locks.is_empty() {
+    if keys.is_empty() {
         return conflict("it carries no deposit proof".to_string());
     }
     let mut unrecorded = None;
-    for lock in &locks {
-        match recorded.get(lock) {
-            None => return conflict(format!("lock {} has no row", lock.lock_id)),
+    for key in &keys {
+        match recorded.get(key) {
+            None => return conflict(format!("{key} has no row")),
             Some(RowLink::Failed) => {
-                return conflict(format!(
-                    "the row of lock {} is failed for a person",
-                    lock.lock_id
-                ))
+                return conflict(format!("the row of {key} is failed for a person"))
             }
             Some(RowLink::Records(other)) if *other != id => {
-                return conflict(format!(
-                    "the row of lock {} records link {other}",
-                    lock.lock_id
-                ))
+                return conflict(format!("the row of {key} records link {other}"))
             }
             Some(RowLink::RecordsNone) => {
-                unrecorded.get_or_insert_with(|| {
-                    format!("the row of lock {} records no link", lock.lock_id)
-                });
+                unrecorded.get_or_insert_with(|| format!("the row of {key} records no link"));
             }
             Some(RowLink::Records(_)) => {}
         }
@@ -3074,14 +3372,18 @@ fn unaccounted(
     unrecorded.map(Gap::Unrecorded)
 }
 
-/// Each deposit proof the bridging agent's own parked links carry, by its
-/// lock, with the ActionHash of the link carrying it. Anyone can park a spend
+fn untaken(agreement: &ActionHash) -> String {
+    format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed")
+}
+
+/// Each proof the bridging agent's own parked links carry, by what it stands
+/// for, with the ActionHash of the link carrying it. Anyone can park a spend
 /// carrying a copy of a proof, so a link the agent did not sign counts for
 /// nothing.
-fn links_by_lock(
+fn links_by_proof(
     parked: &[Transaction],
     bridging_agent: &AgentPubKeyB64,
-) -> HashMap<LockKey, String> {
+) -> HashMap<ProofKey, String> {
     let mut out = HashMap::new();
     for tx in parked.iter().filter(|tx| tx.creator == *bridging_agent) {
         let Some(proofs) = deposit_proofs(tx) else {
@@ -3096,22 +3398,21 @@ fn links_by_lock(
             continue;
         };
         for (index, proof) in proofs.iter().enumerate() {
-            let Some(lock) = LockKey::of_proof(proof) else {
+            let Some(key) = ProofKey::of_proof(proof) else {
                 error!(
                     event = "bridge.proof_unreadable",
-                    link, "[bridge] proof {index} in link {link} names no lock: {proof}"
+                    link, "[bridge] proof {index} in link {link} names no lock or spend: {proof}"
                 );
                 continue;
             };
-            if let Some(other) = out.insert(lock.clone(), link.clone()) {
+            if let Some(other) = out.insert(key.clone(), link.clone()) {
                 if other != link {
                     error!(
                         event = "bridge.proof_duplicated",
-                        lock_id = lock.lock_id,
-                        tx_hash = lock.tx_hash,
-                        "[bridge] lock {} in {} is carried by two live links, {other} and {link}: a RAVE taking both acts on it twice",
-                        lock.lock_id,
-                        lock.tx_hash
+                        lock_id = key.lock().map(|lock| lock.lock_id.as_str()),
+                        tx_hash = key.lock().map(|lock| lock.tx_hash.as_str()),
+                        spend = key.spend(),
+                        "[bridge] {key} is carried by two live links, {other} and {link}: a RAVE taking both acts on it twice"
                     );
                 }
             }
@@ -3193,6 +3494,7 @@ mod tests {
 
     mod in_transit;
     mod screening;
+    mod withdrawal;
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
@@ -3248,16 +3550,20 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
-            ethereum: Some(EthereumSide {
-                chain: Ethereum {
-                    network: Network::BaseSepolia,
-                    rpc_url: "http://localhost:0".to_string(),
-                    lock_vault_address: VAULT,
-                    confirmations: 5,
-                },
-                signer: CouponSigner::with_key(PrivateKeySigner::random()),
-                screener: None,
-            }),
+            ethereum: Some(test_ethereum(VAULT)),
+        }
+    }
+
+    fn test_ethereum(vault: Address) -> EthereumSide {
+        EthereumSide {
+            chain: Ethereum {
+                network: Network::BaseSepolia,
+                rpc_url: "http://localhost:0".to_string(),
+                lock_vault_address: vault,
+                confirmations: 5,
+            },
+            signer: CouponSigner::with_key(PrivateKeySigner::random()),
+            screener: None,
         }
     }
 
@@ -3292,27 +3598,17 @@ mod tests {
     #[test]
     fn the_orchestrator_binds_its_database_to_its_vault_and_refuses_another() {
         let path = test_db_path("bind-vault");
-        let side = |vault: Address| EthereumSide {
-            chain: Ethereum {
-                network: Network::BaseSepolia,
-                rpc_url: "http://localhost:0".to_string(),
-                lock_vault_address: vault,
-                confirmations: 5,
-            },
-            signer: CouponSigner::with_key(PrivateKeySigner::random()),
-            screener: None,
-        };
         BridgeOrchestrator::new(test_config(path.clone()), None)
             .expect("NETWORK=none binds nothing");
         BridgeOrchestrator::new(
             test_config(path.clone()),
-            Some(side(Address::repeat_byte(0xA1))),
+            Some(test_ethereum(Address::repeat_byte(0xA1))),
         )
         .expect("the first vault binds the database");
 
         let Err(e) = BridgeOrchestrator::new(
             test_config(path.clone()),
-            Some(side(Address::repeat_byte(0xB2))),
+            Some(test_ethereum(Address::repeat_byte(0xB2))),
         ) else {
             panic!("a database bound to one vault started with another");
         };
@@ -4149,13 +4445,15 @@ mod tests {
     fn global_definition() -> GlobalDefinitionExt {
         let hash = ActionHashB64::from(action_hash(1)).to_string();
         let agent = AgentPubKeyB64::from(AgentPubKey::from_raw_32(vec![2u8; 32])).to_string();
-        serde_json::from_value(json!({
+        let reserver = AgentPubKeyB64::from(AgentPubKey::from_raw_32(vec![3u8; 32])).to_string();
+        off_the_wire(&json!({
             "id": hash,
             "lane_def": {
                 "effective_start_date": 0,
                 "expiration_date": 9_223_372_036_854_775_807i64,
                 "special_agents": {
-                    "bridging_agent": { "pub_key": agent, "address_book_data": null }
+                    "bridging_agent": { "pub_key": agent, "address_book_data": null },
+                    "reserver": { "pub_key": reserver, "address_book_data": null }
                 },
                 "rave_agreements": {
                     "credit_limit_adjustment": hash,
@@ -4185,7 +4483,6 @@ mod tests {
                 "opening_predecessors": []
             }
         }))
-        .expect("a per-unit-fee global definition must decode")
     }
 
     #[test]
@@ -4247,6 +4544,7 @@ mod tests {
                     pub_key: agent_key(bridging_agent),
                     address_book_data: Value::Null,
                 },
+                reserver: None,
                 ops_accounts: vec![],
                 service_infrastructure_account: None,
                 unit_issuers: Default::default(),
@@ -4284,11 +4582,36 @@ mod tests {
         parked_reads: RefCell<Vec<ActionHash>>,
         link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
-        raves: RefCell<Vec<(ActionHash, Vec<ActionHashB64>)>>,
+        chain: RefCell<Vec<Chained>>,
+        parked_writes: RefCell<Vec<CreateParkedLinkInput>>,
+        loses_reply_to: Option<u8>,
+        /// The write whose RAVE lands only as the next `execute_rave` starts,
+        /// its reply lost.
+        lands_late: Option<u8>,
+        landing: RefCell<Option<Landing>>,
+        executor_inputs: RefCell<HashMap<ActionHash, Value>>,
         chain_reads: RefCell<Vec<ChainRead>>,
         chain_stalls: bool,
         chain_fails_below: Option<u32>,
         seqs: HashMap<ActionHash, u32>,
+        refuses_receipts: HashMap<ActionHash, &'static str>,
+        receipt_delay_ms: u64,
+    }
+
+    struct Landing {
+        agreement: ActionHash,
+        deleted: HashSet<ActionHash>,
+        rave: ActionHash,
+        consumed: Vec<ActionHashB64>,
+    }
+
+    /// The bridging agent's RAVEs and receipts, oldest first.
+    enum Chained {
+        Rave(ActionHash, Vec<ActionHashB64>),
+        Receipt {
+            rave: ActionHash,
+            receipt: ActionHash,
+        },
     }
 
     const LINK_SEQ: u32 = 5;
@@ -4344,8 +4667,8 @@ mod tests {
 
         fn taken(self, links: &[Transaction]) -> Self {
             let consumed = links.iter().map(|link| link.id.clone()).collect();
-            let rave = action_hash(0xE8 + self.raves.borrow().len() as u8);
-            self.raves.borrow_mut().push((rave, consumed));
+            let rave = action_hash(0xE8 + self.chain.borrow().len() as u8);
+            self.chain.borrow_mut().push(Chained::Rave(rave, consumed));
             self
         }
 
@@ -4422,6 +4745,40 @@ mod tests {
             let seed = 0xC0 + self.written.get();
             self.written.set(self.written.get() + 1);
             action_hash(seed)
+        }
+
+        /// `answer` to the call that wrote `written`, unless the reply to it
+        /// is lost after the write landed, which fails with the text `ham`'s
+        /// `is_request_timeout` matches.
+        fn reply<T>(&self, written: &ActionHash, answer: T) -> Result<T> {
+            match self.loses_reply_to {
+                Some(write) if written.get_raw_32()[0] == 0xC0 + write => {
+                    anyhow::bail!(
+                        "Websocket error: Timeout, as the reply to write {write} was lost"
+                    )
+                }
+                _ => Ok(answer),
+            }
+        }
+
+        fn land(&self, run: Landing) {
+            if let Some(links) = self.parked.borrow_mut().get_mut(&run.agreement) {
+                links.retain(|link| !run.deleted.contains(&link.id.clone().into()));
+            }
+            self.chain
+                .borrow_mut()
+                .push(Chained::Rave(run.rave, run.consumed));
+        }
+
+        fn receipts(&self) -> Vec<(ActionHash, ActionHash)> {
+            self.chain
+                .borrow()
+                .iter()
+                .filter_map(|chained| match chained {
+                    Chained::Receipt { rave, receipt } => Some((rave.clone(), receipt.clone())),
+                    Chained::Rave(..) => None,
+                })
+                .collect()
         }
 
         fn park(&self, agreement: &ActionHash, link: Transaction) -> ActionHashB64 {
@@ -4581,24 +4938,32 @@ mod tests {
             if self.chain_stalls {
                 return Ok(ChainPage {
                     raves: vec![],
+                    receipts: vec![],
                     next: ChainRead::From(FIRST_RAVE_SEQ),
                 });
             }
-            let raves = self.raves.borrow();
+            let chain = self.chain.borrow();
             let newest = (FIRST_RAVE_SEQ..)
-                .zip(raves.iter())
+                .zip(chain.iter())
                 .filter(|(seq, _)| !matches!(from, ChainRead::From(high) if *seq > high))
                 .last();
             Ok(match newest {
-                Some((seq, (hash, consumed))) => ChainPage {
+                Some((seq, Chained::Rave(hash, consumed))) => ChainPage {
                     raves: vec![RaveRun {
                         hash: hash.clone(),
                         consumed: consumed.clone(),
                     }],
+                    receipts: vec![],
+                    next: ChainRead::From(seq - 1),
+                },
+                Some((seq, Chained::Receipt { rave, receipt })) => ChainPage {
+                    raves: vec![],
+                    receipts: vec![(rave.clone(), receipt.clone())],
                     next: ChainRead::From(seq - 1),
                 },
                 None => ChainPage {
                     raves: vec![],
+                    receipts: vec![],
                     next: ChainRead::Done,
                 },
             })
@@ -4610,14 +4975,34 @@ mod tests {
             let ParkedLinkType::ParkedData((data, _)) = &input.parked_link_type else {
                 anyhow::bail!("the bridge parks only data on the CL EA");
             };
-            let seed = self.write("create_parked_link").get_raw_32()[0];
-            Ok(self.park(&input.ea_id, parked_tx(seed, &proofs_in(&data.payload))))
+            let written = self.write("create_parked_link");
+            self.parked_writes.borrow_mut().push(input.clone());
+            let seed = written.get_raw_32()[0];
+            let link = self.park(&input.ea_id, parked_tx(seed, &proofs_in(&data.payload)));
+            self.reply(&written, link)
         }
 
+        /// Drops a handed link no longer parked, as the DNA's `run_rave` does.
         async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<RaveRun> {
+            if let Some(late) = self.landing.borrow_mut().take() {
+                self.land(late);
+            }
             let hash = self.write("execute_rave");
+            self.executor_inputs
+                .borrow_mut()
+                .insert(input.ea_id.clone(), input.executor_inputs.clone());
             tokio::time::sleep(Duration::from_millis(self.rave_delay_ms)).await;
-            let given = || input.links.iter().map(|t| ActionHash::from(t.id.clone()));
+            let parked: HashSet<ActionHash> = self.parked.borrow()[&input.ea_id]
+                .iter()
+                .map(|link| link.id.clone().into())
+                .collect();
+            let given = || {
+                input
+                    .links
+                    .iter()
+                    .map(|t| ActionHash::from(t.id.clone()))
+                    .filter(|link| parked.contains(link))
+            };
             let consumed: HashSet<ActionHash> = given()
                 .filter(|link| {
                     !self.rave_leaves.contains(link) && !self.rave_redacts.contains(link)
@@ -4626,14 +5011,19 @@ mod tests {
             let deleted: HashSet<ActionHash> = given()
                 .filter(|link| consumed.contains(link) || self.rave_redacts.contains(link))
                 .collect();
-            if let Some(links) = self.parked.borrow_mut().get_mut(&input.ea_id) {
-                links.retain(|link| !deleted.contains(&link.id.clone().into()));
-            }
             let consumed: Vec<ActionHashB64> = consumed.into_iter().map(Into::into).collect();
-            self.raves
-                .borrow_mut()
-                .push((hash.clone(), consumed.clone()));
-            Ok(RaveRun { hash, consumed })
+            let run = Landing {
+                agreement: input.ea_id.clone(),
+                deleted,
+                rave: hash.clone(),
+                consumed: consumed.clone(),
+            };
+            if self.lands_late == Some(hash.get_raw_32()[0] - 0xC0) {
+                *self.landing.borrow_mut() = Some(run);
+                anyhow::bail!("the conductor's reply to RAVE {hash} was lost before it landed");
+            }
+            self.land(run);
+            self.reply(&hash.clone(), RaveRun { hash, consumed })
         }
 
         async fn create_parked_spend(
@@ -4644,6 +5034,38 @@ mod tests {
             let mut spend = parked_spend_tx(seed, &proofs_in(&input.spender_payload));
             spend.amount = input.amount.clone();
             Ok(self.park(&input.ea_id, spend))
+        }
+
+        /// Refuses a RAVE it does not hold, and one it already receipted, as
+        /// the DNA's receipt validation does.
+        async fn create_receipt_from_rave(&self, input: &ReceiptInput) -> Result<ActionHashB64> {
+            let rave: ActionHash = input.hash.clone().into();
+            tokio::time::sleep(Duration::from_millis(self.receipt_delay_ms)).await;
+            if let Some(refusal) = self.refuses_receipts.get(&rave) {
+                self.call("create_receipt_from_rave");
+                anyhow::bail!("{refusal}");
+            }
+            let receipt = self.write("create_receipt_from_rave");
+            let chain = self.chain.borrow();
+            anyhow::ensure!(
+                chain
+                    .iter()
+                    .any(|chained| matches!(chained, Chained::Rave(hash, _) if *hash == rave)),
+                r#"External API wire error: InternalError("Source chain error: InvalidCommit error: Validation failed while committing: no RAVE {rave}")"#
+            );
+            anyhow::ensure!(
+                !self
+                    .receipts()
+                    .iter()
+                    .any(|(receipted, _)| *receipted == rave),
+                r#"External API wire error: InternalError("Source chain error: InvalidCommit error: Validation failed while committing: The accept {rave} is already used")"#
+            );
+            drop(chain);
+            self.chain.borrow_mut().push(Chained::Receipt {
+                rave,
+                receipt: receipt.clone(),
+            });
+            self.reply(&receipt, receipt.clone().into())
         }
     }
 
@@ -5283,12 +5705,12 @@ mod tests {
     }
 
     #[test]
-    fn links_by_lock_lowercases_mixed_case_hashes() {
+    fn links_by_proof_lowercases_mixed_case_hashes() {
         let tx = parked_tx(0x11, &[proof("7", "0xABCDEF0123456789")]);
         let expected_id = tx.id.to_string();
-        let map = links_by_lock(&[tx], &bridging_agent());
+        let map = links_by_proof(&[tx], &bridging_agent());
         assert_eq!(
-            map.get(&LockKey::new("7", "0xabcdef0123456789"))
+            map.get(&ProofKey::Lock(LockKey::new("7", "0xabcdef0123456789")))
                 .map(String::as_str),
             Some(expected_id.as_str()),
             "uppercase tx_hash in the live parked payload must be normalised to lowercase"
@@ -5296,34 +5718,34 @@ mod tests {
     }
 
     #[test]
-    fn links_by_lock_indexes_parked_spend_payloads_too() {
+    fn links_by_proof_indexes_parked_spend_payloads_too() {
         let tx_spend = parked_spend_tx(0x22, &[proof("8", "0xdeadbeef")]);
         let expected = tx_spend.id.to_string();
-        let map = links_by_lock(&[tx_spend], &bridging_agent());
+        let map = links_by_proof(&[tx_spend], &bridging_agent());
         assert_eq!(
-            map.get(&LockKey::new("8", "0xdeadbeef"))
+            map.get(&ProofKey::Lock(LockKey::new("8", "0xdeadbeef")))
                 .map(String::as_str),
             Some(expected.as_str())
         );
     }
 
     #[test]
-    fn links_by_lock_keys_each_proof_by_its_lock_id_as_well_as_its_transaction() {
+    fn links_by_proof_keys_each_proof_by_its_lock_id_as_well_as_its_transaction() {
         let tx = parked_tx(0x23, &[proof("1", "0xab"), proof("2", "0xab")]);
-        let map = links_by_lock(std::slice::from_ref(&tx), &bridging_agent());
+        let map = links_by_proof(std::slice::from_ref(&tx), &bridging_agent());
         assert_eq!(map.len(), 2);
         for lock_id in ["1", "2"] {
             assert_eq!(
-                map.get(&LockKey::new(lock_id, "0xab")),
+                map.get(&ProofKey::Lock(LockKey::new(lock_id, "0xab"))),
                 Some(&tx.id.to_string())
             );
         }
-        assert_eq!(map.get(&LockKey::new("3", "0xab")), None);
-        assert_eq!(map.get(&LockKey::new("1", "0xcd")), None);
+        assert_eq!(map.get(&ProofKey::Lock(LockKey::new("3", "0xab"))), None);
+        assert_eq!(map.get(&ProofKey::Lock(LockKey::new("1", "0xcd"))), None);
     }
 
     #[test]
-    fn links_by_lock_skips_non_parked_and_missing_hashes() {
+    fn links_by_proof_skips_non_parked_and_missing_hashes() {
         let mut rave_tx = parked_tx(0x33, &[]);
         rave_tx.tx_type = TransactionType::RAVE;
         rave_tx.details = TransactionDetails::Parked {
@@ -5335,7 +5757,7 @@ mod tests {
             attached_payload: json!({ "something_else": [] }),
             consumed_link: false,
         };
-        let map = links_by_lock(&[rave_tx], &bridging_agent());
+        let map = links_by_proof(&[rave_tx], &bridging_agent());
         assert!(
             map.is_empty(),
             "payloads missing proof_of_deposit must not be indexed"
@@ -5648,6 +6070,7 @@ mod tests {
                 s2_advanced: 1,
                 s3_advanced: 1,
                 s4_advanced: 1,
+                s5_advanced: 0,
             }
         );
 
@@ -5802,7 +6225,7 @@ mod tests {
     fn s4_consumes(orch: &BridgeOrchestrator, spends: &[Transaction]) -> usize {
         orch.advance_consumed(
             WorkStep::BrSpendCreated,
-            &links_by_lock(spends, &bridging_agent()),
+            &links_by_proof(spends, &bridging_agent()),
             |id| orch.db.advance_to_br_rave_executed(id, Some("s4")),
         )
         .unwrap()
@@ -5925,7 +6348,7 @@ mod tests {
         let advanced = orch
             .advance_consumed(
                 WorkStep::ClLinkCreated,
-                &links_by_lock(&[link, other_link], &bridging_agent()),
+                &links_by_proof(&[link, other_link], &bridging_agent()),
                 |id| orch.db.advance_to_cl_rave_executed(id, Some("s2")),
             )
             .unwrap();
@@ -6074,7 +6497,7 @@ mod tests {
         let copy = withdrawal_carrying(0xAD, proof("lock:copied:3", "0x8c"));
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             std::slice::from_ref(&copy),
@@ -6155,7 +6578,7 @@ mod tests {
 
         for _ in 0..2 {
             select_bridging_links(
-                Some(&signer),
+                Some((&signer, VAULT)),
                 &screening_off(&unscreened()),
                 &bridging_agent(),
                 &[],
@@ -6184,7 +6607,7 @@ mod tests {
         }
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &[forged],
@@ -6236,7 +6659,25 @@ mod tests {
         if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut audited.details {
             *ct_role_id = "auditor".to_string();
         }
-        let skipped = [audited, unaddressed_withdrawal(0xBB), non_spend(0xBC)];
+        let to = format!("{:#x}", Address::repeat_byte(0xBD));
+        let other_vault = with_payload(
+            parked_withdrawal_tx(0xBD),
+            json!({
+                "withdraw_contract_address": "0x2222222222222222222222222222222222222222",
+                "withdraw_to_address": to,
+            }),
+        );
+        let no_vault = with_payload(
+            parked_withdrawal_tx(0xBE),
+            json!({ "withdraw_to_address": to }),
+        );
+        let skipped = [
+            audited,
+            unaddressed_withdrawal(0xBB),
+            non_spend(0xBC),
+            other_vault,
+            no_vault,
+        ];
         let parked = [
             &[
                 parked_spend_tx(0xB9, &[proof("lock:own:6", "0x92")]),
@@ -6253,16 +6694,21 @@ mod tests {
             ids(&skipped)
         );
         for why in [
-            "in role auditor is neither the bridging agent's deposit nor a withdrawal",
-            "in role withdrawer names no withdraw_to_address",
-            "is no spend",
+            "in role auditor is neither the bridging agent's deposit nor a withdrawal".to_string(),
+            "in role withdrawer names no withdraw_to_address".to_string(),
+            "is no spend".to_string(),
+            format!("in role withdrawer names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {VAULT:#x}"),
+            "in role withdrawer names no withdraw_contract_address".to_string(),
         ] {
-            assert!(logged.contains(why), "{logged}");
+            assert!(logged.contains(&why), "{why}: {logged}");
         }
     }
 
     fn unaddressed_withdrawal(seed: u8) -> Transaction {
-        with_payload(parked_withdrawal_tx(seed), json!({}))
+        with_payload(
+            parked_withdrawal_tx(seed),
+            json!({ "withdraw_contract_address": format!("{VAULT:#x}") }),
+        )
     }
 
     fn with_payload(mut spend: Transaction, payload: Value) -> Transaction {
@@ -6440,7 +6886,7 @@ mod tests {
         let advanced = orch
             .advance_consumed(
                 WorkStep::ClLinkCreated,
-                &links_by_lock(&[link], &bridging_agent()),
+                &links_by_proof(&[link], &bridging_agent()),
                 |id| orch.db.advance_to_cl_rave_executed(id, Some("s2")),
             )
             .unwrap();
@@ -6483,6 +6929,25 @@ mod tests {
         for agreement in [CL_EA, BR_EA] {
             assert!(conductor.parked.borrow()[&action_hash(agreement)].is_empty());
         }
+        assert_eq!(
+            conductor.executor_inputs.borrow()[&action_hash(CL_EA)],
+            json!({ "call_method": "bridge" })
+        );
+    }
+
+    fn sent(orch: &BridgeOrchestrator, spend: &Transaction) {
+        orch.db
+            .send_withdrawal(&WithdrawalPayload {
+                spend: spend.id.to_string(),
+                agreement: ea(BR_EA),
+                amount: "5".to_string(),
+                withdrawer: spend.creator.to_string(),
+            })
+            .unwrap();
+    }
+
+    fn withdrawal_row(orch: &BridgeOrchestrator, spend: &Transaction) -> WorkItem {
+        orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap()
     }
 
     /// Two deposits at `step`, each recorded on its own live link.
@@ -6801,10 +7266,24 @@ mod tests {
             };
             tx
         };
+        let receipt_tx = |seed: u8, source: PaymentSource| {
+            let mut tx = parked_tx(seed, &[]);
+            tx.details = TransactionDetails::Receipt {
+                source,
+                payload: rave_engine::types::Payload::None,
+                ledger: Ledger::empty(),
+            };
+            tx
+        };
         let history = |end_of_chain| History {
             items: vec![
+                receipt_tx(
+                    0xD5,
+                    PaymentSource::ExecutionInstance(action_hash(0xD1).into()),
+                ),
                 rave_tx(0xD1, &[0xD2]),
                 parked_tx(0xD3, &[]),
+                receipt_tx(0xD6, PaymentSource::Accept(action_hash(0xD7).into())),
                 rave_tx(0xD4, &[]),
             ],
             low_boundary: 7,
@@ -6824,6 +7303,11 @@ mod tests {
                 (action_hash(0xD1), vec![action_hash(0xD2).into()]),
                 (action_hash(0xD4), vec![])
             ]
+        );
+        assert_eq!(
+            page.receipts,
+            [(action_hash(0xD1), action_hash(0xD5))],
+            "a receipt of an accept names no RAVE"
         );
         assert_eq!(page.next, ChainRead::From(7));
         assert_eq!(
@@ -6848,6 +7332,21 @@ mod tests {
         for id in rows {
             assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
         }
+
+        let mut orch = test_orchestrator("rave-slow-s4");
+        orch.cfg.slow_call_threshold_ms = 5;
+        let withdrawal = parked_withdrawal_tx(0xAA);
+        let conductor = FakeConductor {
+            rave_delay_ms: 20,
+            ..bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&withdrawal))
+        };
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        let calls = conductor.calls.take();
+        assert_eq!(calls.last(), Some(&"execute_rave"));
+        assert!(!calls.contains(&"create_receipt_from_rave"));
+        assert_eq!(withdrawal_row(&orch, &withdrawal).step, WorkStep::Paid);
     }
 
     fn running() -> ShutdownRx {
@@ -7120,9 +7619,15 @@ mod tests {
         };
         let own = parked_tx(0x4E, &[lock()]);
         let id = own.id.to_string();
-        let lock_key = LockKey::of_proof(&lock()).unwrap();
+        let lock_key = ProofKey::of_proof(&lock()).unwrap();
         let recording = |link| HashMap::from([(lock_key.clone(), link)]);
-        let why = |link: &Transaction, recorded: &HashMap<LockKey, RowLink>| {
+        let withdrawn = parked_tx(
+            0x4E,
+            &[json!({ "method": "withdraw", "spend": "uhCkkSPEND" })],
+        );
+        let withdrawal =
+            |link| HashMap::from([(ProofKey::Withdrawal("uhCkkSPEND".to_string()), link)]);
+        let why = |link: &Transaction, recorded: &HashMap<ProofKey, RowLink>| {
             unaccounted(link, &id, &bridging_agent(), recorded).map(|gap| match gap {
                 Gap::Foreign(why) => format!("foreign: {why}"),
                 Gap::Unrecorded(why) => format!("unrecorded: {why}"),
@@ -7131,7 +7636,26 @@ mod tests {
         };
 
         assert_eq!(why(&own, &recording(RowLink::Records(id.as_str()))), None);
+        assert_eq!(
+            why(&withdrawn, &withdrawal(RowLink::Records(id.as_str()))),
+            None
+        );
         for (link, recorded, reason) in [
+            (
+                with_proofs(json!([{ "method": "withdraw" }])),
+                withdrawal(RowLink::Records(id.as_str())),
+                "conflict: a proof it carries names no lock or spend",
+            ),
+            (
+                withdrawn.clone(),
+                recording(RowLink::Records(id.as_str())),
+                "conflict: withdrawal uhCkkSPEND has no row",
+            ),
+            (
+                withdrawn.clone(),
+                withdrawal(RowLink::RecordsNone),
+                "unrecorded: the row of withdrawal uhCkkSPEND records no link",
+            ),
             (
                 signed_by_another(own.clone()),
                 recording(RowLink::Records(id.as_str())),
@@ -7145,7 +7669,7 @@ mod tests {
             (
                 with_proofs(json!([{}])),
                 recording(RowLink::Records(id.as_str())),
-                "conflict: a deposit proof it carries names no lock",
+                "conflict: a proof it carries names no lock or spend",
             ),
             (
                 with_proofs(json!([])),
@@ -7709,22 +8233,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_whose_payload_names_no_lock_is_left_for_a_person() {
+    async fn a_row_whose_payload_does_not_read_is_left_for_a_person() {
         let orch = test_orchestrator("payload-unreadable");
-        let ([unreadable, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
-        rusqlite::Connection::open(&orch.cfg.db_path)
-            .unwrap()
-            .execute(
+        let ([lock, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let spend = parked_withdrawal_tx(0x6A);
+        sent(&orch, &spend);
+        let withdrawal = withdrawal_row(&orch, &spend).id;
+        let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
+        for id in [lock, withdrawal] {
+            db.execute(
                 "UPDATE work_items SET payload_json = '{}' WHERE id = ?1",
-                [unreadable],
+                [id],
             )
             .unwrap();
+        }
         let conductor = bridging_conductor().holding(&links);
 
-        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+        let logged = logged_at(
+            tracing::Level::ERROR,
+            reconcile_in_force(&orch, &conductor, CL_EA, BR_EA),
+        )
+        .await;
 
-        let reason = failed_row(&orch, unreadable).last_error.unwrap();
+        let reason = failed_row(&orch, lock).last_error.unwrap();
         assert!(reason.contains("names no lock"), "{reason}");
+        let row = withdrawal_row(&orch, &spend);
+        assert_eq!(row.state, WorkState::Failed);
+        let reason = row.last_error.unwrap();
+        assert!(reason.contains("its payload does not read"), "{reason}");
+        let unreadable = format!("{} has an unreadable withdrawal payload", row.item_id);
+        assert!(logged.contains(&unreadable), "{logged}");
     }
 
     #[tokio::test]
@@ -8506,14 +9044,12 @@ mod tests {
 
     /// Encoded the way `Ham::call_zome` puts it on the wire.
     fn encoded_execute_rave_payload() -> Vec<u8> {
-        let payload = RAVEExecuteInputs {
-            ea_id: action_hash(0xEA),
-            executor_inputs: Value::Null,
-            links: vec![parked_tx(1, &[])],
-            global_definition: action_hash(0xAA),
-            lane_definitions: vec![action_hash(0xAB)],
-            strategy: GetStrategy::Local,
-        };
+        let payload = credit_limit_rave(
+            action_hash(0xEA),
+            vec![parked_tx(1, &[])],
+            action_hash(0xAA),
+            vec![action_hash(0xAB)],
+        );
         ExternIO::encode(&payload)
             .expect("the S2 payload must encode")
             .0
@@ -8525,6 +9061,10 @@ mod tests {
 
     #[test]
     fn the_payload_names_every_input_field_the_dna_decodes() {
+        #[derive(Deserialize)]
+        struct Payload {
+            executor_inputs: Value,
+        }
         let decoded: BTreeMap<String, IgnoredAny> =
             rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
         assert_eq!(
@@ -8538,6 +9078,9 @@ mod tests {
                 "strategy",
             ])
         );
+
+        let decoded: Payload = rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
+        assert_eq!(decoded.executor_inputs, json!({ "call_method": "bridge" }));
     }
 
     #[test]
@@ -8601,8 +9144,10 @@ mod tests {
             ..
         } = &mut tx.details
         {
-            *attached_payload =
-                json!({ "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)) });
+            *attached_payload = json!({
+                "withdraw_contract_address": format!("{VAULT:#x}"),
+                "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
+            });
             *ct_role_id = WITHDRAWER_ROLE.to_string();
         }
         tx
@@ -8658,7 +9203,7 @@ mod tests {
         ];
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8720,7 +9265,7 @@ mod tests {
         ];
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8751,7 +9296,7 @@ mod tests {
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &withdrawals,
@@ -8770,10 +9315,10 @@ mod tests {
     async fn a_withdrawal_is_paid_from_the_hot_unit_index() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let mut withdrawal = parked_withdrawal_tx(0x61);
-        withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
+        withdrawal.amount = UnitMap::from(vec![(3, "5")]);
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &[withdrawal.clone()],
@@ -8798,27 +9343,66 @@ mod tests {
     #[tokio::test]
     async fn a_withdrawal_no_coupon_can_pay_stays_parked_and_the_rest_go() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
-        let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
-            let mut tx = with_payload(
-                parked_withdrawal_tx(seed),
-                json!({ "withdraw_to_address": recipient }),
-            );
+        let to = "0x1111111111111111111111111111111111111111";
+        let vault = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
+        let spend = |seed, payload: Value, amount: &[(u32, &str)]| {
+            let mut tx = with_payload(parked_withdrawal_tx(seed), payload);
             tx.amount = UnitMap::from(amount.to_vec());
             tx
         };
-        let to = "0x1111111111111111111111111111111111111111";
-        let payable = paid_to(0x60, to, &[(1, "5")]);
+        let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
+            let payload =
+                json!({ "withdraw_contract_address": vault, "withdraw_to_address": recipient });
+            spend(seed, payload, amount)
+        };
+        let from_vault = |seed, named: &str| {
+            let payload = json!({ "withdraw_contract_address": named, "withdraw_to_address": to });
+            spend(seed, payload, &[(1, "5")])
+        };
+        let checksummed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        let payable = [
+            paid_to(0x60, to, &[(1, "5")]),
+            paid_to(0x6E, checksummed, &[(1, "5")]),
+            paid_to(0x6F, &checksummed.to_ascii_lowercase(), &[(1, "5")]),
+            paid_to(
+                0x70,
+                &format!("0x{}", checksummed[2..].to_ascii_uppercase()),
+                &[(1, "5")],
+            ),
+            paid_to(0x72, &checksummed[2..], &[(1, "5")]),
+        ];
         let deposit = parked_spend_tx(0x61, &[proof("lock:d", "0xd0")]);
         let unpayable = [
             paid_to(0x62, to, &[(2, "5")]),
             paid_to(0x63, to, &[(1, "0")]),
             paid_to(0x64, to, &[(1, "-5")]),
             paid_to(0x65, "0xdead", &[(1, "5")]),
+            paid_to(0x66, to, &[(1, "5"), (0, "-3")]),
+            paid_to(0x67, to, &[(1, "5"), (2, "5")]),
+            paid_to(0x68, to, &[(1, "5"), (0, "0")]),
+            paid_to(
+                0x71,
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD",
+                &[(1, "5")],
+            ),
         ];
-        let links = [&unpayable[..], &[payable.clone(), deposit.clone()]].concat();
+        let other_vaults = [
+            from_vault(0x69, "0x2222222222222222222222222222222222222222"),
+            from_vault(0x6A, "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
+            from_vault(0x6B, ""),
+            from_vault(0x6C, &format!(" {vault}")),
+            spend(0x6D, json!({ "withdraw_to_address": to }), &[(1, "5")]),
+        ];
+        let links = [
+            &unpayable[..],
+            &other_vaults,
+            &payable,
+            std::slice::from_ref(&deposit),
+        ]
+        .concat();
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, vault.parse().unwrap())),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8828,11 +9412,48 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
+        assert_eq!(ids(&selection.withdrawals), ids(&payable));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
-        assert_eq!(selection.coupons.len(), 1);
-        assert_eq!(selection.withdrawals_found, 5);
+        assert_eq!(selection.coupons.len(), payable.len());
+        assert_eq!(selection.withdrawals_found, unpayable.len() + payable.len());
         assert_eq!(unpayable_ids(&selection), ids(&unpayable));
+        let reasons: Vec<String> = selection
+            .unpayable
+            .iter()
+            .map(|(_, e)| e.to_string())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "the amount holds unit 2",
+                "the amount is zero",
+                "the amount \"-5\" is not a HOT amount",
+                "the recipient \"0xdead\" is not an address",
+                "the amount holds unit 0",
+                "the amount holds unit 2",
+                "the amount holds unit 0",
+                "the recipient \"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD\" fails its EIP-55 checksum",
+            ]
+        );
+        let why_parked: Vec<String> = other_vaults
+            .iter()
+            .map(
+                |tx| match bridging_spend(tx, &bridging_agent(), Some(vault)) {
+                    Some(BridgingSpend::OtherVault { why, .. }) => why,
+                    _ => panic!("{} is not refused for its vault", tx.id),
+                },
+            )
+            .collect();
+        assert_eq!(
+            why_parked,
+            [
+                format!("names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {vault}"),
+                format!("names withdraw_contract_address \"0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6\", which is vault {vault} in a letter case the template does not pay"),
+                format!("names withdraw_contract_address \"\", not vault {vault}"),
+                format!("names withdraw_contract_address \" {vault}\", not vault {vault}"),
+                "names no withdraw_contract_address".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -8847,7 +9468,7 @@ mod tests {
         .concat();
 
         let selection = select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &links,
@@ -8934,6 +9555,7 @@ mod tests {
                 s2_advanced: 1,
                 s3_advanced: 1,
                 s4_advanced: 1,
+                s5_advanced: 0,
             }
         );
         let at = |step| {

@@ -1,13 +1,12 @@
 use super::{
-    bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
-    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
-    WITHDRAWALS_SCREENED,
+    bridging_spend, connect_ham, deposit_proofs, hot_amount, normalize_tx_hash, own_deposit,
+    vault_key, withdrawal_terms, BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads,
+    LockKey, WithdrawalGate, WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
-use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
+use crate::state::{StateStore, WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
 use crate::watchtower_reporter::ReporterState;
-use alloy::primitives::Address;
 use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
@@ -17,8 +16,30 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use tracing::info;
 
-const PAID_BY_HAND: &str =
-    "in transit at the old network's close; it is paid by hand on the new network";
+const IN_TRANSIT: &str = "in transit at the old network's close";
+const TAKEN_WITH_ITS_RAVE: &str = "its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done";
+
+fn settled_by_hand(row: &WorkItem) -> String {
+    let left = if row.flow != WITHDRAWAL_FLOW {
+        "it is paid by hand on the new network"
+    } else {
+        match row.step {
+            WorkStep::Sent => {
+                return format!("{IN_TRANSIT}; if a RAVE took its spend, {TAKEN_WITH_ITS_RAVE}")
+            }
+            WorkStep::Paid => TAKEN_WITH_ITS_RAVE,
+            WorkStep::Collected => "its HOT is taken off the credit limit by hand",
+            WorkStep::ClLinkCreated
+            | WorkStep::New
+            | WorkStep::ClRaveExecuted
+            | WorkStep::BrSpendCreated
+            | WorkStep::BrRaveExecuted => {
+                "if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand"
+            }
+        }
+    };
+    format!("{IN_TRANSIT}; {left}")
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -44,6 +65,10 @@ enum InTransit {
         /// Not cleared by screening, so not to be paid by hand.
         #[serde(skip_serializing_if = "Option::is_none")]
         screening: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stranded: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unpayable: Option<String>,
     },
 }
 
@@ -84,12 +109,16 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let rows: Vec<&WorkItem> = self.rows.values().collect();
-        db.mark_all_failed_permanent(&rows, PAID_BY_HAND)?;
-        let items: Vec<&str> = rows.iter().map(|row| row.item_id.as_str()).collect();
+        let rows: Vec<(&WorkItem, String)> = self
+            .rows
+            .values()
+            .map(|row| (row, settled_by_hand(row)))
+            .collect();
+        db.mark_all_failed_permanent(&rows)?;
+        let items: Vec<&str> = rows.iter().map(|(row, _)| row.item_id.as_str()).collect();
         info!(
             event = "bridge.in_transit.marked_failed",
-            "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network: {}",
+            "[bridge/in-transit] marked {} row(s) failed, to be settled by hand: {}",
             items.len(),
             items.join(", ")
         );
@@ -103,8 +132,8 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         Some(chain) => crate::config::screener_from_env(chain.network)?,
         None => None,
     };
-    if let Some(chain) = ethereum {
-        let configured = format!("{:#x}", chain.lock_vault_address);
+    let vault = ethereum.map(|chain| vault_key(chain.lock_vault_address));
+    if let Some(configured) = &vault {
         let served = db.vault()?;
         anyhow::ensure!(
             served.as_deref() == Some(configured.as_str()),
@@ -129,17 +158,19 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
                 role_name: &orchestrator.cfg.role_name,
             },
             screener.as_deref(),
+            vault.as_deref(),
         )
         .await?;
     found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
-    /// Holds a listed withdrawal, as S4 would.
+    /// Holds a listed withdrawal.
     pub(super) async fn in_transit(
         &self,
         conductor: &impl ConductorReads,
         screener: Option<&dyn Screener>,
+        vault: Option<&str>,
     ) -> Result<Found> {
         let agent = &self.cfg.bridging_agent_pubkey;
         let global_definition = conductor.global_definition().await?;
@@ -163,26 +194,29 @@ impl BridgeOrchestrator {
                 bridging_links
                     .iter()
                     .filter(|spend| {
-                        matches!(bridging_spend(spend, agent), Some(BridgingSpend::Deposit))
+                        matches!(
+                            bridging_spend(spend, agent, vault),
+                            Some(BridgingSpend::Deposit)
+                        )
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
-        let unreadable = self.db.unreadable_rows("lock")?;
+        let unreadable = self.db.unreadable_rows()?;
         anyhow::ensure!(
             unreadable.is_empty(),
             "rows whose state or step cannot be read: {}",
             unreadable.join(", ")
         );
-        let pending: Vec<(WorkItem, Option<LockKey>)> = self
-            .db
-            .list_flow("lock")?
-            .into_iter()
-            .filter(|row| !matches!(row.state, WorkState::Succeeded | WorkState::Failed))
-            .map(|row| {
-                let lock = self.lock_key(&row);
-                (row, lock)
-            })
-            .collect();
+        let mut pending: Vec<(WorkItem, Option<LockKey>)> = Vec::new();
+        for row in self.db.list_all()? {
+            if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
+                continue;
+            }
+            let lock = (row.flow != WITHDRAWAL_FLOW)
+                .then(|| self.lock_key(&row))
+                .flatten();
+            pending.push((row, lock));
+        }
 
         let mut links = Vec::new();
         let mut carried = HashSet::new();
@@ -214,17 +248,19 @@ impl BridgeOrchestrator {
         let gate = WithdrawalGate::new(&self.db, screener);
         let mut withdrawals = Vec::new();
         for spend in &bridging_links {
-            let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
-                continue;
+            let (withdraw_to, stranded) = match bridging_spend(spend, agent, vault) {
+                Some(BridgingSpend::Withdrawal(to)) => (to, None),
+                Some(BridgingSpend::OtherVault { to, why }) => (to, Some(why)),
+                _ => continue,
             };
             let id = spend.id.to_string();
-            let hot = spend
-                .amount
-                .get(&self.cfg.hot_unit_index.to_string())
-                .map(|amount| amount.to_string())
-                .unwrap_or_default();
-            let pays = match withdraw_to.map(str::parse::<Address>) {
-                Some(Ok(to)) => gate.pays(&id, to, &hot).await?,
+            let hot_unit_index = self.cfg.hot_unit_index;
+            let terms = withdraw_to.map(|to| withdrawal_terms(spend, to, hot_unit_index));
+            let pays = match &terms {
+                Some(Ok(terms)) => {
+                    let hot = hot_amount(spend, hot_unit_index);
+                    gate.pays(&id, terms.recipient(), &hot).await?
+                }
                 Some(Err(_)) => false,
                 None => true,
             };
@@ -244,6 +280,8 @@ impl BridgeOrchestrator {
                 amount: spend.amount.clone(),
                 withdraw_to_address: withdraw_to.map(str::to_string),
                 screening,
+                stranded,
+                unpayable: terms.and_then(Result::err).map(|e| format!("{e:#}")),
             });
         }
         self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
@@ -253,7 +291,8 @@ impl BridgeOrchestrator {
         let mut unmarked = Vec::new();
         let mut unmatchable = Vec::new();
         for (row, lock) in pending {
-            let in_transit = matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
+            let in_transit = row.flow == WITHDRAWAL_FLOW
+                || matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
                 || matches!(row.state, WorkState::InFlight | WorkState::Claimed);
             if in_transit {
                 listed.push(InTransit::Row {
