@@ -40,6 +40,7 @@ import {
 } from './coupon-signing.mjs'
 import {
 	collectSafeSignature,
+	noOwnersGiven,
 	ownerKeysFrom,
 	servicesFrom,
 	testWithdrawal,
@@ -179,7 +180,7 @@ if (isTestSigner && safeMode)
 	fail("the claim order takes the test signer's coupons: it has no Safe owners to sign")
 if (!isTestSigner && !safeMode) {
 	fail(
-		`the claim order takes coupons from ${signer}, not the test signer ${TEST_SIGNER}. For a Safe, give its owners: keys in SAFE_OWNER_KEYS or --owner-keys-file, signer services in SAFE_OWNER_SERVICES`
+		`the claim order takes coupons from ${signer}, not the test signer ${TEST_SIGNER}. ${noOwnersGiven(process.env)}`
 	)
 }
 if (args.withdrawal && services.length === 0)

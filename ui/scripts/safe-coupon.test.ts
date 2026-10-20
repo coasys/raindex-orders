@@ -6,6 +6,7 @@ import { couponWords, HOLO_VAULT_ID } from './coupon-signing.mjs'
 import { couponDigest, safeMessageHash } from './safe-message.mjs'
 import {
 	collectSafeSignature,
+	noOwnersGiven,
 	ownerKeysFrom,
 	ownerSignatureSigner,
 	servicesFrom,
@@ -65,6 +66,18 @@ describe('owner keys and services, as make-coupon reads them', () => {
 		])
 		expect(() => servicesFrom('http://127.0.0.1:1')).toThrow('not <owner address>=<URL>')
 		expect(() => servicesFrom(`${OWNERS[0]}=127.0.0.1:1`)).toThrow('not an http(s) URL')
+	})
+
+	it('names an owner variable that is set but empty, as SAFE_OWNER_SERVICES=$SERVICES leaves it in a new terminal', () => {
+		const give =
+			'For a Safe, give its owners: keys in SAFE_OWNER_KEYS or --owner-keys-file, signer services in SAFE_OWNER_SERVICES'
+		expect(noOwnersGiven({})).toBe(give)
+		expect(noOwnersGiven({ SAFE_OWNER_SERVICES: '' })).toBe(
+			`SAFE_OWNER_SERVICES is set but empty, so no owner was asked: in a new terminal, a variable such as $SERVICES is empty until it is set again. ${give}`
+		)
+		expect(noOwnersGiven({ SAFE_OWNER_SERVICES: ' , ', SAFE_OWNER_KEYS: '# none\n' })).toBe(
+			`SAFE_OWNER_SERVICES and SAFE_OWNER_KEYS are set but empty, so no owner was asked: in a new terminal, a variable such as $SERVICES is empty until it is set again. ${give}`
+		)
 	})
 
 	it('makes a withdrawal ID of 39 bytes whose keccak256 is the nonce, and reads one back', () => {

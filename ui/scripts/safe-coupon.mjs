@@ -58,6 +58,21 @@ export function servicesFrom(raw) {
 }
 
 /**
+ * Why make-coupon has no Safe owner to ask, for a claim order that does not take the
+ * test signer. `SAFE_OWNER_SERVICES=$SERVICES` in a terminal where SERVICES was never
+ * set passes an empty value, so a variable that is set but holds no owner is named.
+ */
+export function noOwnersGiven(env) {
+	const blank = ['SAFE_OWNER_SERVICES', 'SAFE_OWNER_KEYS'].filter(
+		name => name in env && !env[name].replace(/#.*/g, '').replace(/[\s,]/g, '')
+	)
+	const why = blank.length
+		? `${blank.join(' and ')} ${blank.length > 1 ? 'are' : 'is'} set but empty, so no owner was asked: in a new terminal, a variable such as $SERVICES is empty until it is set again. `
+		: ''
+	return `${why}For a Safe, give its owners: keys in SAFE_OWNER_KEYS or --owner-keys-file, signer services in SAFE_OWNER_SERVICES`
+}
+
+/**
  * A withdrawal ID as the signer service API carries it, `u` then base64url of a
  * Holochain action hash's 39 bytes, and the coupon nonce it gives: keccak256 of those
  * bytes. Random, as no Holochain spend stands behind a test coupon.

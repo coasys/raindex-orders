@@ -252,6 +252,13 @@ token transfer. Check that the coupon still works: the valid link claims afterwa
 because a reverted claim uses no nonce. Go back with
 `git checkout --detach origin/safe-admin-and-signer`.
 
+**Result 10-20, on chain from MetaMask on `mofn-onchain-test`:** the coupons with fewer
+than two valid owner signatures were mined and reverted; the coupon with two valid
+signatures and a third, broken one claimed. MetaMask sent the failing claims. An earlier
+"signature does not match" in the console was the dev server still running the PR
+branch from another worktree: check `git log --oneline -1` in the worktree that runs
+`npm run dev`.
+
 ## 10. The Safe in the Safe app
 
 Import owner 1's and owner 2's keys into MetaMask (Add account, Import account,
