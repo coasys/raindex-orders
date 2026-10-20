@@ -55,6 +55,19 @@ describe('owner keys and services, as make-coupon reads them', () => {
 			'owner key 2 is not 0x and 64 hex digits'
 		)
 		expect(() => ownerKeysFrom(almost)).not.toThrow(almost)
+		for (const outOfRange of [
+			`0x${'0'.repeat(64)}`,
+			'0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
+			`0x${'f'.repeat(64)}`
+		]) {
+			expect(() => ownerKeysFrom(`${KEYS[0]}\n${outOfRange}`)).toThrow(
+				'owner key 2 is not a secp256k1 private key'
+			)
+			expect(() => ownerKeysFrom(outOfRange)).not.toThrow(BigInt(outOfRange).toString())
+		}
+		expect(
+			ownerKeysFrom('0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140')
+		).toHaveLength(1)
 	})
 
 	it('takes SAFE_OWNER_SERVICES as the orchestrator does', () => {

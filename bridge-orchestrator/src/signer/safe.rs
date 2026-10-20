@@ -184,8 +184,8 @@ pub struct OwnerSignature {
 /// startup check leaves out, until the first cycle, an owner whose service did
 /// not answer `GET /signer`.
 ///
-/// A Safe whose threshold is half its owners or fewer signs nothing, unless
-/// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes (`disjoint_quorums`).
+/// A Safe whose threshold is half its owners or fewer signs nothing
+/// (`disjoint_quorums`), UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes or not.
 pub struct SafeOwners {
     safe: Address,
     chain_id: u64,
@@ -193,8 +193,7 @@ pub struct SafeOwners {
     rpc_url: String,
     /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes: on mainnet, start even when this
     /// process alone can sign as the Safe, or holds owner keys of a Safe that is
-    /// also the vault admin; on any network, sign for a Safe whose threshold is
-    /// half its owners or fewer.
+    /// also the vault admin.
     one_party_allowed: bool,
     /// The owners left out this cycle, each with why: it did not answer within
     /// `sign_timeout`, or its service did not answer `GET /signer` at startup.

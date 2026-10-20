@@ -17,6 +17,8 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { couponDigest, safeMessageHash, signAsOwner } from './safe-message.mjs'
 
 const KEY = /^0x[0-9a-fA-F]{64}$/
+// secp256k1's group order: a private key is above 0 and below it.
+const CURVE_ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 const SIGN_TIMEOUT_MS = 20_000
 const MAX_ANSWER_BYTES = 64 * 1024
 
@@ -33,6 +35,9 @@ export function ownerKeysFrom(text) {
 		.filter(Boolean)
 	keys.forEach((key, i) => {
 		if (!KEY.test(key)) throw new Error(`owner key ${i + 1} is not 0x and 64 hex digits`)
+		const value = BigInt(key)
+		if (value === 0n || value >= CURVE_ORDER)
+			throw new Error(`owner key ${i + 1} is not a secp256k1 private key`)
 	})
 	return keys
 }
