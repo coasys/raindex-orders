@@ -1215,8 +1215,24 @@ async fn a_safe_whose_quorums_can_be_disjoint_signs_no_coupon() {
         .expect_err("C and D signed W for O2");
     assert_eq!(
         format!("{err:#}"),
-        format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal). No owner was asked. To sign regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+        format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal). No owner was asked")
     );
+    for service in &services[2..] {
+        assert!(service.requests.lock().unwrap().is_empty());
+    }
+    let one_party = safe_owners(
+        vec![
+            service_owner(&owner_key(2), &services[2]),
+            service_owner(&owner_key(3), &services[3]),
+        ],
+        &url,
+    )
+    .allowing_one_party(true);
+    let overridden = one_party
+        .sign_request(&o2)
+        .await
+        .expect_err("C and D signed W for O2 with UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes");
+    assert_eq!(format!("{overridden:#}"), format!("{err:#}"));
     for service in &services[2..] {
         assert!(service.requests.lock().unwrap().is_empty());
     }

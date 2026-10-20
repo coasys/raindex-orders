@@ -3,7 +3,7 @@
 //! services, and the Safe's EIP-1271 `isValidSignature` checks M of them
 //! (docs/signer-service.md).
 
-use super::{SignRequest, Signing, ONE_PARTY_OVERRIDE, SIGN_TIMEOUT};
+use super::{SignRequest, Signing, SIGN_TIMEOUT};
 use crate::config::Network;
 use crate::preflight::RPC_TIMEOUT;
 use alloy::primitives::{keccak256, Address, Bytes, PrimitiveSignature, B256, U256};
@@ -13,7 +13,7 @@ use alloy::signers::Signer;
 use alloy::sol;
 use alloy::sol_types::SolValue;
 use alloy::transports::http::{Client, Http};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use holo_hash::ActionHashB64;
 use serde::Deserialize;
@@ -423,17 +423,15 @@ impl SafeOwners {
     /// every owner, so that each refusal is logged.
     ///
     /// A Safe whose threshold is half its owners or fewer is refused before any
-    /// owner is asked, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
+    /// owner is asked. UNSAFE_ALLOW_ONE_PARTY_SIGNER does not lift this: it is
+    /// about who holds the keys, and this is about paying one withdrawal twice.
     pub async fn collect(
         &self,
         request: &SignRequest,
     ) -> Result<(SafeState, Vec<(Address, Result<OwnerSignature>)>)> {
         let state = self.state().await?;
         if let Some(fault) = disjoint_quorums(self.safe, state.threshold, state.owners.len()) {
-            anyhow::ensure!(
-                self.one_party_allowed,
-                "{fault}. No owner was asked. To sign regardless, set {ONE_PARTY_OVERRIDE}=yes"
-            );
+            bail!("{fault}. No owner was asked");
         }
         let owner_request = OwnerRequest {
             safe: self.safe,

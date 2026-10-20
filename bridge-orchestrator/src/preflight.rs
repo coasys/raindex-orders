@@ -336,8 +336,8 @@ where
 /// CLAIM_SIGNER, a Safe, must be one on `network`'s chain whose EIP-712 domain
 /// is the one its owners sign under, or its `isValidSignature` refuses every
 /// coupon. Its threshold must be more than half its owners, so that every two
-/// sets of signers share an owner (`disjoint_quorums`), on any network unless
-/// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes. Each owner key held here must be one of
+/// sets of signers share an owner (`disjoint_quorums`), on any network and with
+/// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes too. Each owner key held here must be one of
 /// its owners, and no more of them than its threshold; each signer service must
 /// answer for its owner, this Safe and this chain. The services are asked at
 /// once, each within IDENTITY_TIMEOUT. A service that does not answer is
@@ -392,13 +392,7 @@ where
     }
     let threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
     if let Some(fault) = disjoint_quorums(safe, threshold, owners.len()) {
-        if !signer.one_party_allowed() {
-            bail!("{fault}. To start regardless, set {ONE_PARTY_OVERRIDE}=yes");
-        }
-        tracing::warn!(
-            event = "startup.disjoint_quorums",
-            "{fault}: {ONE_PARTY_OVERRIDE}=yes"
-        );
+        bail!("{fault}");
     }
     let listed = owners
         .iter()
@@ -1221,10 +1215,10 @@ mod tests {
     }
 
     /// A Safe of threshold 1 is one owner signing as the Safe, and two sets of
-    /// one owner share none: every network refuses it unless
-    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
+    /// one owner share none: every network refuses it, with
+    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes too.
     #[tokio::test]
-    async fn refuses_a_safe_of_threshold_1_without_the_override() {
+    async fn refuses_a_safe_of_threshold_1_even_with_the_override() {
         let services = [
             owner_service(owners()[0].clone()).await,
             owner_service(owners()[1].clone()).await,
@@ -1239,11 +1233,17 @@ mod tests {
 
         assert_eq!(
             safe_refusal(Network::Mainnet, chain.clone(), asked()).await,
-            format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 1 with 3 owners, so two sets of 1 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal). To start regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes")
+            format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 1 with 3 owners, so two sets of 1 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal)")
         );
-        safe_check_allowing(Network::Mainnet, chain, order, asked(), 1, true)
+        let err = safe_check_allowing(Network::Mainnet, chain, order, asked(), 1, true)
             .await
-            .unwrap();
+            .expect_err("the override took a Safe of threshold 1");
+        assert!(format!("{err:#}").starts_with(&format!(
+            "CLAIM_SIGNER {SAFE} is a Safe of threshold 1 with 3 owners"
+        )));
+        for service in &services {
+            assert!(service.requests.lock().unwrap().is_empty());
+        }
 
         let (chain, _) = safe_setup(Network::BaseSepolia, 1);
         assert!(safe_refusal(Network::BaseSepolia, chain, held(&[0, 1]))
@@ -1566,12 +1566,13 @@ mod tests {
     /// A Safe of 2 of 4 has two sets of 2 owners that share none, so after a
     /// claim order rotation two owners that never signed a withdrawal could
     /// sign it again for the new order (Lal's review of PR #2). Every network
-    /// refuses it, before any signer service is asked, unless
-    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes.
+    /// refuses it, before any signer service is asked, with
+    /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes too: the override is about who holds
+    /// the keys, not about paying one withdrawal twice.
     #[tokio::test]
     async fn refuses_a_safe_whose_threshold_is_half_its_owners_or_fewer() {
         let four = [owners(), vec![FOURTH_OWNER_KEY.parse().unwrap()]].concat();
-        let refused = format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal). To start regardless, set UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes");
+        let refused = format!("CLAIM_SIGNER {SAFE} is a Safe of threshold 2 with 4 owners, so two sets of 2 of its owners can share none: after a claim order rotation, owners that never signed a withdrawal could sign it again for the new order. Its threshold must be more than half its owners (docs/signer-service.md#one-order-per-withdrawal)");
 
         let (chain, order) = safe_setup(Network::Mainnet, 2);
         let chain = chain.with_safe(2, &four);
@@ -1592,9 +1593,13 @@ mod tests {
         for service in &services {
             assert!(service.requests.lock().unwrap().is_empty());
         }
-        safe_check_allowing(Network::Mainnet, chain, order, asked(), 1, true)
+        let err = safe_check_allowing(Network::Mainnet, chain, order, asked(), 1, true)
             .await
-            .unwrap();
+            .expect_err("the override took a Safe of 2 of 4 on mainnet");
+        assert_eq!(format!("{err:#}"), refused);
+        for service in &services {
+            assert!(service.requests.lock().unwrap().is_empty());
+        }
 
         let (chain, order) = safe_setup(Network::BaseSepolia, 2);
         let chain = chain.with_safe(2, &four);
@@ -1608,7 +1613,7 @@ mod tests {
         .await
         .expect_err("base-sepolia took a Safe of 2 of 4");
         assert_eq!(format!("{err:#}"), refused);
-        safe_check_allowing(
+        let err = safe_check_allowing(
             Network::BaseSepolia,
             chain,
             order,
@@ -1617,7 +1622,8 @@ mod tests {
             true,
         )
         .await
-        .unwrap();
+        .expect_err("the override took a Safe of 2 of 4 on base-sepolia");
+        assert_eq!(format!("{err:#}"), refused);
     }
 
     #[tokio::test]
