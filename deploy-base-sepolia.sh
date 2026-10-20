@@ -116,6 +116,7 @@ deploy_token() {
 
     if [ -n "$TOKEN_ADDR" ]; then
         echo -e "${GREEN}MockHOT deployed at: $TOKEN_ADDR${NC}"
+        wait_for_code "$TOKEN_ADDR" "$BASE_SEPOLIA_RPC_URL"
         set_env TOKEN_ADDRESS "$TOKEN_ADDR"
         echo -e "${GREEN}Updated $ENV_FILE with TOKEN_ADDRESS${NC}"
     else
@@ -220,6 +221,7 @@ create_safe() {
     SAFE_ADDR=$(echo "$OUTPUT" | grep -oP "^\s*SAFE=\K0x[a-fA-F0-9]{40}" | tail -1 || true)
     [ -n "$SAFE_ADDR" ] || die "Could not extract the Safe's address from output"
     echo -e "${GREEN}The bridge's Safe: $SAFE_ADDR${NC}"
+    wait_for_code "$SAFE_ADDR" "$BASE_SEPOLIA_RPC_URL"
     set_env ADMIN_ADDRESS "$SAFE_ADDR"
     set_env ADMIN_SAFE_THRESHOLD "$SAFE_THRESHOLD"
     set_env ADMIN_SAFE_OWNERS "$SAFE_OWNERS"
@@ -256,6 +258,7 @@ deploy_bridge() {
     block=$(first_block "$run_file")
     [[ $deployer =~ ^0x[0-9a-fA-F]{40}$ && $block =~ ^[1-9][0-9]*$ ]] ||
         die "The deploy landed. Read the HoloBridgeDeployer and its block from $run_file, then run: forge script $script --rpc-url \$BASE_SEPOLIA_RPC_URL --sig 'record(address,uint256)' <HoloBridgeDeployer> <block>"
+    wait_for_code "$deployer" "$BASE_SEPOLIA_RPC_URL"
     RECORD=$(forge script "$script" --rpc-url "$BASE_SEPOLIA_RPC_URL" --sig 'record(address,uint256)' "$deployer" "$block" 2>&1) || {
         echo "$RECORD"
         die "The deploy landed: HoloBridgeDeployer $deployer in block $block. Its record failed; fix the above and run the record again"
