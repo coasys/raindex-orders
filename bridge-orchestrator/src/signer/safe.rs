@@ -160,6 +160,20 @@ impl std::fmt::Display for TimedOut {
 
 impl std::error::Error for TimedOut {}
 
+/// An owner that was not asked this cycle, as one that timed out earlier in
+/// it. Named in a coupon's error like any other, but not warned about on each
+/// coupon: the timeout was warned about on the coupon it happened on.
+#[derive(Debug)]
+struct NotAsked(String);
+
+impl std::fmt::Display for NotAsked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotAsked {}
+
 /// One owner's signature, checked: it recovers to the owner over the coupon's
 /// SafeMessage hash, and the owner is one of the Safe's.
 #[derive(Debug, Clone, PartialEq)]
@@ -472,8 +486,8 @@ impl SafeOwners {
                 .map(|(i, owner)| async move {
                     let address = owner.address();
                     if let Some(why) = skipped.get(&address) {
-                        let err = anyhow!("{} was not asked: {why}", owner.name());
-                        return (i, address, Err(err), None);
+                        let err = NotAsked(format!("{} was not asked: {why}", owner.name()));
+                        return (i, address, Err(anyhow::Error::new(err)), None);
                     }
                     let (answer, timed_out) =
                         match tokio::time::timeout(self.sign_timeout, owner.sign(owner_request))
@@ -546,7 +560,9 @@ impl SafeOwners {
 
     /// The Safe's signature of `request`: M owner signatures, the M lowest owner
     /// addresses of those that signed, ascending, which the Safe has accepted.
-    /// Fewer than M is an error naming why each other owner did not sign.
+    /// Fewer than M is an error naming why each other owner did not sign. Each
+    /// owner that was asked and did not sign is warned about; one not asked
+    /// this cycle is not, as its timeout was.
     pub async fn sign_request(&self, request: &SignRequest) -> Result<Vec<u8>> {
         let (state, answers) = self.collect(request).await?;
         let threshold = state.threshold;
@@ -555,7 +571,10 @@ impl SafeOwners {
         for (_, answer) in answers {
             match answer {
                 Ok(signature) => signed.push(signature),
-                Err(err) => failures.push(format!("{err:#}")),
+                Err(err) => {
+                    let asked = err.downcast_ref::<NotAsked>().is_none();
+                    failures.push((asked, format!("{err:#}")));
+                }
             }
         }
         anyhow::ensure!(
@@ -564,9 +583,13 @@ impl SafeOwners {
             signed.len(),
             self.owners.len(),
             self.safe,
-            failures.join("; ")
+            failures
+                .iter()
+                .map(|(_, why)| why.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
         );
-        for failure in &failures {
+        for (_, failure) in failures.iter().filter(|(asked, _)| *asked) {
             tracing::warn!(
                 event = "coupon.owner_did_not_sign",
                 safe = %self.safe,

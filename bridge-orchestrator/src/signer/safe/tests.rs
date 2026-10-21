@@ -1389,3 +1389,80 @@ async fn after_an_rpc_timeout_the_other_coupons_of_the_cycle_are_not_read_until_
         started.elapsed()
     );
 }
+
+#[derive(Clone, Default)]
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What `run` logs at `level` or above. As orchestrator.rs's capture: every
+/// level is enabled and filtered at the writer, and a second dispatcher stays
+/// registered, so a callsite another test hit first is never left disabled.
+async fn logged_at(level: tracing::Level, run: impl std::future::Future) -> String {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    let lines = Lines::default();
+    let writer = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer((move || writer.clone()).with_max_level(level))
+        .finish();
+    run.with_subscriber(subscriber).await;
+    let text = lines.0.lock().unwrap().clone();
+    String::from_utf8(text).unwrap()
+}
+
+/// An owner that timed out is warned about once, on the coupon it timed out
+/// on. The coupons the others sign for the rest of the cycle, which do not ask
+/// it, do not warn about it again: a service down for hours would otherwise
+/// be warned about on every coupon of every cycle.
+#[tokio::test]
+async fn an_owner_not_asked_this_cycle_is_not_warned_about_on_each_coupon() {
+    let chain = FakeSafe::new(2, &[0, 1, 2]);
+    let url = chain.serve().await;
+    let silent = silent_service().await;
+    let owners = safe_owners(
+        vec![
+            Owner::Service(OwnerService::new(Network::Mainnet, owner(0), &silent).unwrap()),
+            Owner::Key(owner_key(1)),
+            Owner::Key(owner_key(2)),
+        ],
+        &url,
+    )
+    .with_sign_timeout(SHORT_SIGN_TIMEOUT);
+    let name = owners.owners()[0].name();
+    let request = request(Some(withdrawal()));
+
+    let first = logged_at(tracing::Level::WARN, async {
+        owners.sign_request(&request).await.unwrap();
+    })
+    .await;
+    assert!(
+        first.contains("coupon.owner_did_not_sign") && first.contains(&name),
+        "the coupon the owner timed out on did not warn about it: {first:?}"
+    );
+
+    let second = logged_at(tracing::Level::WARN, async {
+        owners.sign_request(&request).await.unwrap();
+    })
+    .await;
+    assert!(
+        !second.contains("coupon.owner_did_not_sign"),
+        "a coupon that did not ask the owner warned about it: {second:?}"
+    );
+    assert_eq!(
+        why_not(&owners, 0).await,
+        format!("{name} was not asked: it did not answer within 500ms earlier this cycle")
+    );
+}
