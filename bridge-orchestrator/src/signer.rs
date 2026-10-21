@@ -174,7 +174,7 @@ impl CouponSigner {
             setting("SAFE_OWNER_SERVICES"),
         ) {
             (None, None, None) => {
-                faults.push("SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS and SAFE_OWNER_SERVICES when CLAIM_SIGNER is a Safe".to_string());
+                faults.push("SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES, or both, when CLAIM_SIGNER is a Safe".to_string());
                 None
             }
             (Some(_), Some(_), _) => {
@@ -857,7 +857,7 @@ mod tests {
     }
 
     const NO_KEY: &str =
-        "SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS and SAFE_OWNER_SERVICES when CLAIM_SIGNER is a Safe";
+        "SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES, or both, when CLAIM_SIGNER is a Safe";
 
     #[test]
     fn mainnet_names_each_unset_signer_variable() {
