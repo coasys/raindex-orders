@@ -1346,3 +1346,46 @@ async fn an_rpc_that_never_answers_a_read_of_the_safe_parks_the_coupon_within_th
         );
     }
 }
+
+/// One RPC timeout is enough for a cycle: once a read of the Safe has not
+/// answered within `rpc_timeout`, the other coupons of the cycle are not read,
+/// and fail at once naming that read. Otherwise each parked withdrawal would
+/// cost the cycle an `rpc_timeout`, the deposits behind them waiting. A new
+/// cycle reads again.
+#[tokio::test]
+async fn after_an_rpc_timeout_the_other_coupons_of_the_cycle_are_not_read_until_a_new_cycle() {
+    let rpc = silent_service().await;
+    let owners = safe_owners(
+        vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
+        &rpc,
+    )
+    .with_rpc_timeout(Duration::from_millis(300));
+    let read = "getThreshold() and getOwners()";
+    let timed_out = format!("CLAIM_SIGNER {SAFE}: {read} did not answer within 300ms");
+    let request = request(Some(withdrawal()));
+
+    let first = owners.sign_request(&request).await.unwrap_err();
+    assert_eq!(format!("{first:#}"), timed_out);
+
+    let started = std::time::Instant::now();
+    let second = owners.sign_request(&request).await.unwrap_err();
+    assert_eq!(
+        format!("{second:#}"),
+        format!("CLAIM_SIGNER {SAFE}: {read} was not read: {read} did not answer within 300ms earlier this cycle")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "the second coupon waited {:?} on the RPC that had timed out",
+        started.elapsed()
+    );
+
+    owners.new_cycle();
+    let started = std::time::Instant::now();
+    let third = owners.sign_request(&request).await.unwrap_err();
+    assert_eq!(format!("{third:#}"), timed_out);
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "a new cycle did not read the Safe again: {:?}",
+        started.elapsed()
+    );
+}

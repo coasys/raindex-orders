@@ -205,6 +205,10 @@ pub struct SafeOwners {
     /// RPC that took one and never answered would hold the bridge cycle up for
     /// good, the deposits behind the withdrawal included.
     rpc_timeout: Duration,
+    /// The read of the Safe that did not answer within `rpc_timeout` this
+    /// cycle, if one did not. The other coupons of the cycle are not read: each
+    /// would cost the cycle another `rpc_timeout`. A new cycle reads again.
+    rpc_down: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for SafeOwners {
@@ -262,6 +266,7 @@ impl SafeOwners {
             left_out: Mutex::default(),
             sign_timeout: SIGN_TIMEOUT,
             rpc_timeout: RPC_TIMEOUT,
+            rpc_down: Mutex::default(),
         })
     }
 
@@ -291,9 +296,11 @@ impl SafeOwners {
         }
     }
 
-    /// A new cycle: every owner is asked again, those left out included.
+    /// A new cycle: every owner is asked again, those left out included, and
+    /// the Safe is read again after an RPC timeout.
     pub fn new_cycle(&self) {
         self.left_out.lock().unwrap().clear();
+        *self.rpc_down.lock().unwrap() = None;
     }
 
     /// Leaves `owner` out until the next cycle, as one that timed out, `why`
@@ -342,21 +349,25 @@ impl SafeOwners {
 
     /// `read`, a read of the Safe through the RPC, within `rpc_timeout`. The
     /// RPC not answering is an error like any other: the withdrawal stays
-    /// parked for the cycle, and the cycle goes on.
+    /// parked for the cycle, and the cycle goes on. It is also the cycle's one
+    /// RPC timeout: the reads for its other coupons fail at once, naming the
+    /// read that did not answer, until `new_cycle`.
     async fn within<T>(
         &self,
         what: &str,
         read: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
-        tokio::time::timeout(self.rpc_timeout, read)
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "CLAIM_SIGNER {}: {what} did not answer within {:?}",
-                    self.safe,
-                    self.rpc_timeout
-                )
-            })?
+        if let Some(down) = self.rpc_down.lock().unwrap().as_ref() {
+            bail!("CLAIM_SIGNER {}: {what} was not read: {down}", self.safe);
+        }
+        match tokio::time::timeout(self.rpc_timeout, read).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let timed_out = format!("{what} did not answer within {:?}", self.rpc_timeout);
+                *self.rpc_down.lock().unwrap() = Some(format!("{timed_out} earlier this cycle"));
+                bail!("CLAIM_SIGNER {}: {timed_out}", self.safe)
+            }
+        }
     }
 
     /// The Safe's threshold and owners, as it answers them now.
