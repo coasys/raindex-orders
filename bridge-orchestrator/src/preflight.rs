@@ -4,9 +4,10 @@ use crate::signer::{
     SignedCoupon, ONE_PARTY_OVERRIDE,
 };
 use alloy::primitives::{keccak256, Address, Bytes, B256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::sol;
 use alloy::sol_types::{Revert, SolCall, SolError, SolValue};
+use alloy::transports::http::{Client, Http};
 use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use anyhow::{anyhow, bail, Result};
 use std::error::Error;
@@ -104,6 +105,13 @@ pub async fn check(
     check_within(RPC_TIMEOUT, network, rpc_url, vault, signer).await
 }
 
+/// The check, each run of chain reads within `timeout`: the reads of the
+/// chain, the vault, the claim order and the Safe, and then the probe's
+/// simulations. The signer's own waits between them are not charged to the
+/// RPC: each service's `GET /signer` (IDENTITY_TIMEOUT), the probe's
+/// signatures (SIGN_TIMEOUT) and the Safe's reads for them (the signer's own
+/// RPC_TIMEOUT each), so a slow signer service is not reported as the RPC not
+/// answering.
 async fn check_within(
     timeout: Duration,
     network: Network,
@@ -111,22 +119,59 @@ async fn check_within(
     vault: Address,
     signer: &CouponSigner,
 ) -> Result<()> {
-    tokio::time::timeout(timeout, read_and_compare(network, rpc_url, vault, signer))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "{} did not answer within {timeout:?}",
-                network.rpc_url_var()
-            )
-        })?
+    let rpc_var = network.rpc_url_var();
+    let (provider, safe) = rpc_within(
+        timeout,
+        rpc_var,
+        read_and_compare(network, rpc_url, vault, signer),
+    )
+    .await?;
+    if let (Some(owners), Some(safe)) = (signer.safe(), safe) {
+        check_safe_owners(network, owners, &safe).await?;
+    }
+    let probe = signer.probe_coupon().await?;
+    rpc_within(
+        timeout,
+        rpc_var,
+        simulate_probe(
+            &provider,
+            signer.order(),
+            probe,
+            signer.safe().is_some(),
+            rpc_var,
+        ),
+    )
+    .await
 }
 
+/// `read`, chain reads through the RPC, within `timeout`.
+async fn rpc_within<T>(
+    timeout: Duration,
+    rpc_var: &str,
+    read: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(timeout, read)
+        .await
+        .map_err(|_| anyhow!("{rpc_var} did not answer within {timeout:?}"))?
+}
+
+/// What the chain answered about CLAIM_SIGNER, a Safe: its threshold and
+/// owners, and the vault's admin.
+struct SafeRead {
+    threshold: usize,
+    owners: Vec<Address>,
+    admin: Address,
+}
+
+/// The chain reads: the RPC's chain, the vault and the claim order compared
+/// with the configuration, and, for a Safe signer, the Safe's state. Answers
+/// the provider they went through, for the probe's simulations.
 async fn read_and_compare(
     network: Network,
     rpc_url: &str,
     vault: Address,
     signer: &CouponSigner,
-) -> Result<()> {
+) -> Result<(RootProvider<Http<Client>>, Option<SafeRead>)> {
     let order = signer.order();
     let rpc_var = network.rpc_url_var();
     let vault_var = network.lock_vault_var();
@@ -238,7 +283,7 @@ async fn read_and_compare(
             order.signer
         );
     }
-    match signer.safe() {
+    let safe = match signer.safe() {
         None => {
             if !signer_code.is_empty() {
                 bail!(
@@ -253,6 +298,7 @@ async fn read_and_compare(
                     order.signer
                 );
             }
+            None
         }
         Some(safe) => {
             if signer_code.is_empty() {
@@ -267,21 +313,36 @@ async fn read_and_compare(
                 .await
                 .map_err(|e| call_failed("admin()", e))?
                 ._0;
-            check_safe(&provider, network, safe, admin, rpc_var).await?;
+            Some(check_safe(&provider, network, safe, admin, rpc_var).await?)
         }
-    }
+    };
+    Ok((provider, safe))
+}
 
-    let probe = signer.probe_coupon().await?;
-    let fewer = signer.safe().map(|_| {
+/// The probe, a one-wei coupon to the signer, simulated as the website sends
+/// it: the claim order must take it, and, for a Safe (`safe`), refuse it with
+/// one owner signature fewer than its threshold.
+async fn simulate_probe<T, P>(
+    provider: &P,
+    order: &ClaimOrder,
+    probe: SignedCoupon,
+    safe: bool,
+    rpc_var: &str,
+) -> Result<()>
+where
+    T: alloy::transports::Transport + Clone,
+    P: Provider<T>,
+{
+    let fewer = safe.then(|| {
         let mut fewer = probe.clone();
         fewer.signature.truncate(probe.signature.len() - 65);
         fewer
     });
-    let refused = simulate(&provider, order, probe, rpc_var).await?;
+    let refused = simulate(provider, order, probe, rpc_var).await?;
     accepts_signer(order.signer, refused)?;
     if let Some(fewer) = fewer {
         let owners = fewer.signature.len() / 65;
-        let Some(revert) = simulate(&provider, order, fewer, rpc_var).await? else {
+        let Some(revert) = simulate(provider, order, fewer, rpc_var).await? else {
             bail!(
                 "the claim order ORDER_HASH took a coupon carrying {owners} owner signatures for CLAIM_SIGNER {}, fewer than its threshold",
                 order.signer
@@ -338,24 +399,15 @@ where
 /// coupon. Its threshold must be more than half its owners, so that every two
 /// sets of signers share an owner (`disjoint_quorums`), on any network and with
 /// UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes too. Each owner key held here must be one of
-/// its owners, and no more of them than its threshold; each signer service must
-/// answer for its owner, this Safe and this chain. The services are asked at
-/// once, each within IDENTITY_TIMEOUT. A service that does not answer is
-/// logged and left out of the probe, and the check passes while the owners that
-/// can sign are at least the threshold: a withdrawal stays parked while fewer
-/// sign.
-///
-/// On mainnet it also refuses, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes, a Safe
-/// this process alone could sign as: one of threshold 1, or one whose threshold
-/// of owner keys it holds. And it refuses any owner key held here when the Safe
-/// is also the vault `admin`, as that key also approves `adminWithdraw`.
+/// its owners, and no more of them than its threshold. What it read, with the
+/// vault's `admin`, is for `check_safe_owners`, which asks the signer services.
 async fn check_safe<T, P>(
     provider: &P,
     network: Network,
     signer: &SafeOwners,
     admin: Address,
     rpc_var: &str,
-) -> Result<()>
+) -> Result<SafeRead>
 where
     T: alloy::transports::Transport + Clone,
     P: Provider<T>,
@@ -417,6 +469,37 @@ where
             );
         }
     }
+    Ok(SafeRead {
+        threshold,
+        owners,
+        admin,
+    })
+}
+
+/// Each signer service must answer for its owner, this Safe and this chain.
+/// The services are asked at once, each within IDENTITY_TIMEOUT. A service
+/// that does not answer is logged and left out of the probe, and the check
+/// passes while the owners that can sign are at least the threshold: a
+/// withdrawal stays parked while fewer sign. No RPC read: the Safe's state is
+/// `read`.
+///
+/// On mainnet it also refuses, unless UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes, a Safe
+/// this process alone could sign as: one of threshold 1, or one whose threshold
+/// of owner keys it holds. And it refuses any owner key held here when the Safe
+/// is also the vault `admin`, as that key also approves `adminWithdraw`.
+async fn check_safe_owners(network: Network, signer: &SafeOwners, read: &SafeRead) -> Result<()> {
+    let safe = signer.safe();
+    let chain_id = network.chain_id();
+    let SafeRead {
+        threshold, admin, ..
+    } = *read;
+    let listed = read
+        .owners
+        .iter()
+        .map(|owner| owner.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keys = signer.local_keys();
     // Every service at once: one that does not answer costs one
     // IDENTITY_TIMEOUT, not one for each service after it.
     let identities = futures::future::join_all(signer.owners().iter().map(|owner| async move {
@@ -684,7 +767,9 @@ fn causes(err: &reqwest::Error) -> String {
 mod tests {
     use super::*;
     use crate::fake_rpc::{read_request, serve};
-    use crate::signer::safe::tests::{fake_service, owner_service, service_owner};
+    use crate::signer::safe::tests::{
+        fake_service, own_hash, owner_service, service_owner, signature_json, typed_data_signature,
+    };
     use crate::signer::{
         amount_word, context_digest, safe_message_hash, OwnerService, SafeOwners, SIGN_TIMEOUT,
     };
@@ -1556,6 +1641,72 @@ mod tests {
             started.elapsed() < SIGN_TIMEOUT,
             "the probe waited {:?} for an owner it did not need",
             started.elapsed()
+        );
+    }
+
+    /// A signer service for `key` that answers GET /signer at once, and
+    /// POST /sign after `delay`.
+    async fn signs_after(key: PrivateKeySigner, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let mut head = [0u8; 64];
+                    let peeked = socket.peek(&mut head).await.unwrap();
+                    let identity = head[..peeked].starts_with(b"GET /signer ");
+                    let body = read_request(&mut socket).await;
+                    let reply = if identity {
+                        json!({"owner": key.address(), "safe": SAFE, "chainId": 1}).to_string()
+                    } else {
+                        tokio::time::sleep(delay).await;
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        signature_json(key.address(), &typed_data_signature(&own_hash(&body), &key))
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        url
+    }
+
+    /// A signer service's time to sign the probe is its own, SIGN_TIMEOUT, and
+    /// not the RPC's: the RPC deadline covers the chain reads, not the owners'
+    /// signatures. A needed service that signs after longer than the RPC
+    /// deadline starts the Safe, and is not reported as the RPC not answering.
+    #[tokio::test]
+    async fn a_signer_service_slow_to_sign_the_probe_is_not_the_rpc_not_answering() {
+        let (chain, order) = safe_setup(Network::Mainnet, 2);
+        let slow = signs_after(owners()[0].clone(), Duration::from_millis(600)).await;
+        let quick = owner_service(owners()[1].clone()).await;
+        let asked = vec![
+            Owner::Service(
+                OwnerService::new(Network::Mainnet, owners()[0].address(), &slow).unwrap(),
+            ),
+            service_owner(&owners()[1], &quick),
+        ];
+        let url =
+            serve(move |method, params| chain.answer(method, params).map(Value::String)).await;
+        let signer =
+            CouponSigner::for_order(SafeOwners::new(SAFE, 1, asked, url.clone()).unwrap(), order);
+
+        let result = check_within(
+            Duration::from_millis(300),
+            Network::Mainnet,
+            &url,
+            VAULT,
+            &signer,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a service signing the probe in 600ms, within SIGN_TIMEOUT, failed the check under an RPC deadline of 300ms: {result:?}"
         );
     }
 
