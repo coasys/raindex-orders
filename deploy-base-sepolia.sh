@@ -251,11 +251,21 @@ deploy_bridge() {
     echo "Coupon signer: $VALID_SIGNER"
     local script=script/DeployBridge.s.sol:DeployBaseSepoliaBridge
     local run_file="${FOUNDRY_BROADCAST:-broadcast}/DeployBridge.s.sol/84532/run-latest.json"
-    local started deployer block
+    local started deployer block forge_failed= sent=
     started=$(mktemp)
-    broadcast "$script"
-    sent_since "$started" "$run_file" || die "forge sent nothing"
+    # Not through broadcast: forge can fail after it sent, as when the receipt
+    # wait times out on the load-balanced sepolia.base.org. A second run would
+    # then deploy a second bridge, so what landed is read before anything stops.
+    OUTPUT=$(forge script "$script" --rpc-url "$BASE_SEPOLIA_RPC_URL" "${WALLET[@]}" --broadcast -vvv 2>&1) || forge_failed=1
+    echo "$OUTPUT"
+    sent_since "$started" "$run_file" && sent=1
     rm -f "$started"
+    [ -n "$sent" ] || die "forge sent nothing${forge_failed:+: forge script $script failed}"
+    if [ -n "$forge_failed" ]; then
+        echo "forge script $script failed after it sent. Do not run this again: a new run deploys a second bridge. It sent:" >&2
+        landed "$run_file" >&2
+        die "If HoloBridgeDeployer succeeded, read it and its block from $run_file, then run: forge script $script --rpc-url \$BASE_SEPOLIA_RPC_URL --sig 'record(address,uint256)' <HoloBridgeDeployer> <block>"
+    fi
     deployer=$(jq -r '[.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloBridgeDeployer")][0].contractAddress // empty' "$run_file")
     block=$(first_block "$run_file")
     [[ $deployer =~ ^0x[0-9a-fA-F]{40}$ && $block =~ ^[1-9][0-9]*$ ]] ||
